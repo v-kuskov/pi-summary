@@ -43,7 +43,7 @@ summary path="src/foo.ts"
 ```
 # src/foo.ts  (1420 lines, 48.2KB, sha 9f2c1ab4)
 cache: miss
-model: deepseek/deepseek-v4-flash
+model: routeai/deepseek/deepseek-v4.1-flash
 
 An HTTP client for the internal Orders API. Wraps node fetch with signed requests,
 retry with jitter, and a rate limiter shared per host. Exports FooClient and the
@@ -71,7 +71,7 @@ Add limit=200 and step offset, or read one region from the map below.
 Cached summary of this file (use these line ranges):
 
 # src/foo.ts  (1420 lines, 48.2KB, sha 9f2c1ab4)
-model: deepseek/deepseek-v4-flash
+model: routeai/deepseek/deepseek-v4.1-flash
 ...
 ```
 

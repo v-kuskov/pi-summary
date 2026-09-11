@@ -10,10 +10,7 @@ import { notifyUser } from "./error.ts";
 import { failureNotice } from "./fallback.ts";
 import { countLinesFrom, looksBinary } from "./hash.ts";
 import { isRegularFile, resolveFilePath } from "./paths.ts";
-import {
-	READ_LINE_LIMIT,
-	renderSummary,
-} from "./render.ts";
+import { READ_LINE_LIMIT, renderSummary } from "./render.ts";
 import { summarizeFile, type SummarizeOutcome } from "./summarize.ts";
 
 /** Notices raised for the current batch, keyed by tool call id, awaiting their result. */

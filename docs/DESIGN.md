@@ -56,7 +56,7 @@ CREATE TABLE file_summary (
   hash          TEXT NOT NULL,     -- sha256 of contents, first 16 hex chars
   lines         INTEGER NOT NULL,  -- line count at summarize time (drives the guard)
   bytes         INTEGER NOT NULL,
-  model         TEXT NOT NULL,     -- "deepseek/deepseek-v4-flash"
+  model         TEXT NOT NULL,     -- "routeai/deepseek/deepseek-v4.1-flash"
   mode          TEXT NOT NULL,     -- 'mapped' | 'blob'
   overview      TEXT NOT NULL,     -- prose: what the file does
   created_at    TEXT NOT NULL
@@ -117,7 +117,7 @@ of the current file.
 ```
 # src/foo.ts  (1420 lines, 48.2KB, sha 9f2c1ab4)
 cache: miss
-model: deepseek/deepseek-v4-flash
+model: routeai/deepseek/deepseek-v4.1-flash
 
 <overview prose>
 

@@ -313,10 +313,11 @@ function resolveNamedModel(ctx: ExtensionContext, explicit: string | undefined):
 	if (!parsed) {
 		throw new SummaryError(
 			`model "${explicit}" is not in provider/model form`,
-			"Pass model as provider/model, for example: deepseek/deepseek-v4-flash, or omit it to summarize with the current session model.",
+			"Pass model as provider/model, for example: routeai/deepseek/deepseek-v4.1-flash, or omit it to summarize with the current session model.",
 		);
 	}
-	const found = ctx.modelRegistry.find(parsed.provider, parsed.modelId);	if (!found) {
+	const found = ctx.modelRegistry.find(parsed.provider, parsed.modelId);
+	if (!found) {
 		throw new SummaryError(
 			`unknown model "${explicit}"`,
 			"Omit model to use the current session model.",
@@ -395,7 +396,7 @@ function sessionModel(ctx: ExtensionContext): AnyModel {
 	if (!current) {
 		throw new SummaryError(
 			"no current model available to summarize with",
-			'Pass model, for example: model="deepseek/deepseek-v4-flash", or set it with {"summary":{"model":"..."}} in settings.',
+			'Pass model, for example: model="routeai/deepseek/deepseek-v4.1-flash", or set it with {"summary":{"model":"..."}} in settings.',
 		);
 	}
 	if (!ctx.modelRegistry.hasConfiguredAuth(current)) {
