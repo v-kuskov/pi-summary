@@ -143,6 +143,13 @@ So `read(big-file)` is blocked, `read(big-file, offset=141, limit=200)` is allow
 A call already carrying a small `limit` is never blocked, so the guard does not fight a
 model that is reading properly.
 
+Verified against the built-in tool: `read(offset=1000, limit=200)` on a 3000-line file
+returns lines 1000-1199, followed by `[1802 more lines in file. Use offset=1200 to
+continue.]`. Content is returned from the requested offset; a guarded file is never
+replaced by the map. The guard's 200-line figure is its own limit, not the built-in
+tool's - the built-in caps at 2000 lines / 50KB, which is why an allowed read of a large
+file still comes back truncated (`G6`).
+
 `G2` Counting lines is bounded. The guard only needs to know whether more than 200
 lines remain from `offset`, so it streams the file in 64KB chunks and stops counting
 once it has passed `offset + 200`. It never reads a large file fully into memory, and
@@ -155,16 +162,26 @@ built-in byte cap and by `autoResizeImages`; a 200-line limit on a PNG is meanin
 The guard skips anything that is not a regular file, and skips content with a NUL byte
 in the first 8000.
 
-`G4` The block reason carries the cached summary when one is fresh, truncated to 4000
-chars so the error result stays small, and closes with a concrete suggested call. When
-there is no fresh summary the reason says to call `summary` first. Either way the reason
-names the exact span that triggered the block and the range to ask for instead.
+`G4` The block reason carries a fresh summary, truncated to 6000 chars so the error result
+stays small, and closes with a concrete suggested call. It names the exact span that
+triggered the block and the range to ask for instead, and it labels the map as cached or
+just generated.
 
 `G5` The guard is implemented with `pi.on("tool_call")`, not by overriding the `read`
 tool. A second `read` registration would replace the built-in renderer and any other
 extension's `read` override; the event handler composes with both. It also means the
 guard runs without patching args, so nothing about the model's own call is rewritten
 behind its back.
+
+`G6` A failed summary **allows the read through** instead of blocking it. Blocking a read
+because the summarizer broke would deny the model a file it is entitled to see, and the
+file is a better answer than nothing. The failure is reported as a notification and, since
+a notification does not exist in print or RPC runs, appended to the read result through a
+`tool_result` handler keyed by tool call id. The read keeps the built-in 2000-line cap, so
+a large file is returned truncated rather than in full.
+
+`G7` The guard never turns a failure into a raised error. `summary` failing is recoverable
+by definition - the file is still there - so the read path always produces a result.
 
 ## 8. Summarization call
 
@@ -300,3 +317,11 @@ or just generated.
 
 `D7` The summarizer model is configurable through a `summary.model` key in pi's settings
 file, project scope winning over global, defaulting to the session model.
+
+`D8` A failed `summary` call returns the whole file rather than raising an error, with the
+failure in a notification and in a `#` comment above the content. The caller asked for the
+file's contents and got them, so there is nothing to recover from. A path that cannot be
+read at all stays a hard error, because a fallback there would mean returning an empty
+body and hiding the real problem. The same rule applies to a bad `model` argument: it is a
+caller mistake, the file is still readable, so the model gets the file and the mistake is
+shown.

@@ -75,12 +75,11 @@ function makeHarness(options = {}) {
 		},
 	};
 
-	return { tools, handlers, calls, ctx };
+	return { tools, handlers, calls, ctx, notices: [] };
 }
 
 const runTool = (h, name, params) =>
 	h.tools.get(name).execute("id", params, undefined, undefined, h.ctx);
-
 /** Run every tool_call handler; the first block wins, exactly as pi does. */
 async function runGuard(h, input) {
 	for (const { event, handler } of h.handlers) {
@@ -90,6 +89,27 @@ async function runGuard(h, input) {
 			h.ctx,
 		);
 		if (out?.block) return out;
+	}
+	return undefined;
+}
+
+/** Run every tool_result handler, returning the replacement content if one was produced. */
+async function runResult(h, input, content) {
+	for (const { event, handler } of h.handlers) {
+		if (event !== "tool_result") continue;
+		const out = await handler(
+			{
+				type: "tool_result",
+				toolCallId: "t",
+				toolName: "read",
+				input,
+				content: content.map((text) => ({ type: "text", text })),
+				isError: false,
+				details: undefined,
+			},
+			h.ctx,
+		);
+		if (out?.content) return out.content;
 	}
 	return undefined;
 }
@@ -477,18 +497,52 @@ await check("a rejected JSON mode is retried without it, and stays within the ca
 	}
 });
 
-await check("a provider that rejects JSON mode every time fails loudly, not as a blob", async () => {
+await check("a provider that rejects JSON mode every time returns the file, not an error", async () => {
 	const root = tempProject();
 	try {
-		writeFileSync(join(root, "src", "a.ts"), numbered(10));
+		const file = join(root, "src", "a.ts");
+		writeFileSync(file, numbered(10));
 		const h = makeHarness({
 			cwd: root,
 			respond: () => errorResponse("upstream exploded"),
 		});
 
+		const result = await runTool(h, "summary", { path: "src/a.ts" });
+		assert.equal(result.details.status, "failed");
+		assert.equal(result.details.mode, "raw");
+		assert.match(result.content[0].text, /summary failed:/);
+		assert.match(result.content[0].text, /upstream exploded/);
+		assert.match(result.content[0].text, /Returning the whole file instead/);
+		assert.match(result.content[0].text, /line 1/, "the file body follows");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+await check("a failed summary notifies the user", async () => {
+	const root = tempProject();
+	try {
+		writeFileSync(join(root, "src", "a.ts"), numbered(10));
+		const h = makeHarness({ cwd: root, respond: () => errorResponse("no balance") });
+		h.ctx.hasUI = true;
+		h.ctx.ui = { notify: (message, type) => h.notices.push({ message, type }) };
+
+		await runTool(h, "summary", { path: "src/a.ts" });
+		assert.equal(h.notices.length, 1);
+		assert.equal(h.notices[0].type, "error");
+		assert.match(h.notices[0].message, /no balance/);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+await check("an unreadable file is still a real error", async () => {
+	const root = tempProject();
+	try {
+		const h = makeHarness({ cwd: root, respond: () => defaultAnswer() });
 		await assert.rejects(
-			() => runTool(h, "summary", { path: "src/a.ts" }),
-			/upstream exploded/,
+			() => runTool(h, "summary", { path: "src/missing.ts" }),
+			/not a regular file/,
 		);
 	} finally {
 		rmSync(root, { recursive: true, force: true });
@@ -563,27 +617,43 @@ await check("a truncated file tells the model what it cannot see", async () => {
 	}
 });
 
-await check("model selection: unknown, malformed, and missing auth read clearly", async () => {
+await check("a bad model argument falls back to the file, with the reason in the notice", async () => {
 	const root = tempProject();
 	try {
 		writeFileSync(join(root, "src", "a.ts"), numbered(10));
 		const h = makeHarness({ cwd: root });
 
-		await assert.rejects(
-			() => runTool(h, "summary", { path: "src/a.ts", model: "nope/missing" }),
-			/unknown model/,
-		);
-		await assert.rejects(
-			() => runTool(h, "summary", { path: "src/a.ts", model: "justmodel" }),
-			/provider\/model/,
-		);
-		await assert.rejects(() => runTool(h, "summary", { path: "src" }), /is not a regular file/);
-		await assert.rejects(() => runTool(h, "summary", { path: "src/gone.ts" }), /is not a regular file/);
+		// A model the registry does not know, and a model not in provider/model form, are
+		// both caller mistakes. The file is still readable, so the model gets the file and
+		// the mistake is shown rather than thrown - the caller can correct it from there.
+		const unknown = await runTool(h, "summary", { path: "src/a.ts", model: "nope/missing" });
+		assert.equal(unknown.details.status, "failed");
+		assert.match(unknown.content[0].text, /unknown model/);
+		assert.match(unknown.content[0].text, /line 1/, "the file body still follows");
+
+		const malformed = await runTool(h, "summary", { path: "src/a.ts", model: "justmodel" });
+		assert.match(malformed.content[0].text, /provider\/model/);
 
 		h.ctx.modelRegistry.hasConfiguredAuth = () => false;
+		const noAuth = await runTool(h, "summary", { path: "src/a.ts" });
+		assert.match(noAuth.content[0].text, /no credentials configured/);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+await check("an unreadable path is still an error, not a fallback", async () => {
+	const root = tempProject();
+	try {
+		writeFileSync(join(root, "src", "a.ts"), numbered(10));
+		const h = makeHarness({ cwd: root });
+
+		// Nothing to fall back to: a directory and a missing file cannot be read either, so
+		// these stay hard errors rather than returning an empty body.
+		await assert.rejects(() => runTool(h, "summary", { path: "src" }), /is not a regular file/);
 		await assert.rejects(
-			() => runTool(h, "summary", { path: "src/a.ts" }),
-			/no credentials configured/,
+			() => runTool(h, "summary", { path: "src/gone.ts" }),
+			/is not a regular file/,
 		);
 	} finally {
 		rmSync(root, { recursive: true, force: true });
@@ -708,7 +778,7 @@ await check("a cold oversized read is summarized by the guard and the map inline
 	}
 });
 
-await check("a failing summarizer does not break the read guard", async () => {
+await check("a failing summarizer lets the read through and notifies", async () => {
 	const root = tempProject();
 	try {
 		writeFileSync(join(root, "src", "a.ts"), numbered(500));
@@ -716,11 +786,27 @@ await check("a failing summarizer does not break the read guard", async () => {
 			cwd: root,
 			respond: () => errorResponse("upstream is down"),
 		});
+		h.ctx.hasUI = true;
+		h.ctx.ui = { notify: (message, type) => h.notices.push({ message, type }) };
 
-		const blocked = await runGuard(h, { path: "src/a.ts" });
-		assert.equal(blocked.block, true, "the read is still blocked");
-		assert.match(blocked.reason, /No summary is available for this file/);
-		assert.match(blocked.reason, /Call summary with path=/, "falls back to telling the model to ask");
+		const verdict = await runGuard(h, { path: "src/a.ts" });
+		assert.equal(verdict, undefined, "the read is not blocked when there is no map");
+		assert.equal(h.notices.length, 1, "the failure is surfaced");
+		assert.equal(h.notices[0].type, "error");
+		assert.match(h.notices[0].message, /upstream is down/);
+		assert.match(h.notices[0].message, /Reading the whole file instead/);
+
+		// Without a UI a notification reaches nobody, so the same notice rides the read
+		// result the model actually receives.
+		const replaced = await runResult(h, { path: "src/a.ts" }, ["LINE-1", "LINE-2"]);
+		assert.ok(replaced, "the read result is amended");
+		const appended = replaced.map((c) => c.text).join("");
+		assert.match(appended, /LINE-1/, "the original content is kept");
+		assert.match(appended, /upstream is down/);
+		assert.match(appended, /^\.*?# summary failed:/m, "and the notice is appended");
+
+		// The notice is consumed once, so a later read does not inherit it.
+		assert.equal(await runResult(h, { path: "src/a.ts" }, ["x"]), undefined);
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
