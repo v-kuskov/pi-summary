@@ -101,9 +101,12 @@ calls per file and cached afterwards.
 `<projectRoot>/.pi/summaries.db`, where the project root is the nearest ancestor
 containing `.git`. SQLite via `node:sqlite` — no native dependency, Node 24+ only.
 
-Validity is content-addressed (`sha256`). `mtime` and size are stored as a cheap
-pre-check, but a file rewritten within the same mtime tick still invalidates on hash, so
-a stale summary is never served. Delete the file to start over.
+Validity is content-addressed (`sha256`). Size is stored as a cheap pre-check: a size
+mismatch is conclusive, so it returns `stale` without reading the file, and the hash
+decides every other case. Nothing cheaper than the hash is trusted — no `mtime`, not even
+stored — because a same-length edit in the same millisecond, a `cp -p`, or a coarse-mtime
+volume all show an unchanged timestamp over changed content, which would serve a stale
+summary for a file you are about to edit. Delete the file to start over.
 
 The database stores the overview prose and one row per mapped region. The `## map` text
 is rendered from those rows on every read, so the prose and the line numbers cannot
@@ -163,8 +166,9 @@ npm run check     # tsc --noEmit && node smoke.mjs
 `smoke.mjs` drives the real tool and the real guard with a fake `ExtensionAPI` and a
 fake `ModelRegistry`, against a temp project directory. It covers cache hit/miss/stale/
 forced, the hash-over-mtime rule, the blob degradation, the repair loop and its cap,
-settings precedence, and the guard's allow/block boundaries — including that a cold
-oversized read summarizes and that a failing summarizer lets the read through and says so.
+the `mtime_ms` migration, settings precedence, and the guard's allow/block boundaries —
+including that a cold oversized read summarizes, that the block reason carries every row
+uncut, and that a failing summarizer lets the read through and says so.
 
 Nothing checks the map's *content*. Structure and schema are validated, and a
 contiguous, well-formed map can still name the wrong lines. The defence is in the prompt

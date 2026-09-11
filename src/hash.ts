@@ -11,7 +11,6 @@ export type FileFingerprint = {
 	hash: string;
 	lines: number;
 	bytes: number;
-	mtimeMs: number;
 };
 
 /**
@@ -30,7 +29,6 @@ export async function fingerprint(absPath: string): Promise<FileFingerprint> {
 		hash: createHash("sha256").update(buffer).digest("hex").slice(0, HASH_CHARS),
 		lines,
 		bytes: stats.size,
-		mtimeMs: Math.round(stats.mtimeMs),
 	};
 }
 

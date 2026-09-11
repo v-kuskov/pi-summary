@@ -1,8 +1,5 @@
 import type { CachedSummary, Freshness, Section } from "./store.ts";
 
-/** Char cap for anything embedded in a block reason or error message. */
-export const MAX_REASON_CHARS = 6000;
-
 /**
  * Hard limit on lines a single `read` may return. Larger spans must be split.
  *
@@ -16,11 +13,6 @@ export function formatBytes(bytes: number): string {
 	if (bytes < 1024) return `${bytes}B`;
 	if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
 	return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
-}
-
-export function truncateChars(text: string, max: number): string {
-	if (text.length <= max) return text;
-	return `${text.slice(0, max)}\n… [truncated ${text.length - max} chars]`;
 }
 
 /**
@@ -125,7 +117,4 @@ export function renderSummary(entry: CachedSummary, options: RenderOptions = {})
 	return parts.join("\n");
 }
 
-/** The compact form used inside a blocked-read reason. */
-export function renderSummaryForReason(entry: CachedSummary): string {
-	return truncateChars(renderSummary(entry, { header: true }), MAX_REASON_CHARS);
-}
+

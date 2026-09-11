@@ -27,7 +27,6 @@ export type CachedSummary = {
 	hash: string;
 	lines: number;
 	bytes: number;
-	mtimeMs: number;
 	model: string;
 	mode: SummaryMode;
 	overview: string;
@@ -55,7 +54,6 @@ CREATE TABLE IF NOT EXISTS file_summary (
   hash          TEXT NOT NULL,
   lines         INTEGER NOT NULL,
   bytes         INTEGER NOT NULL,
-  mtime_ms      INTEGER NOT NULL,
   model         TEXT NOT NULL,
   mode          TEXT NOT NULL,
   overview      TEXT NOT NULL,
@@ -89,9 +87,18 @@ export function openDb(cwd: string): OpenResult {
 	return { db, dbPath };
 }
 
-/** Create tables if absent. Cheap enough to run on every connection. */
+/** Create tables if absent, and drop columns that are no longer used. */
 export function ensureSchema(db: DatabaseSync): void {
 	db.exec(SCHEMA);
+
+	// `mtime_ms` was stored until the freshness check stopped looking at it. It is gone from
+	// SCHEMA above, but `CREATE TABLE IF NOT EXISTS` leaves it in place on a database created
+	// by an earlier version, where it is NOT NULL - so every insert that no longer supplies it
+	// would fail. Dropping it is the migration. SQLite has supported DROP COLUMN since 3.35.
+	const columns = db.prepare("PRAGMA table_info(file_summary)").all() as Array<{ name: string }>;
+	if (columns.some((c) => c.name === "mtime_ms")) {
+		db.exec("ALTER TABLE file_summary DROP COLUMN mtime_ms");
+	}
 }
 
 /**
@@ -118,7 +125,6 @@ export function readSummary(db: DatabaseSync, path: string): CachedSummary | und
 		hash: String(row.hash),
 		lines: Number(row.lines),
 		bytes: Number(row.bytes),
-		mtimeMs: Number(row.mtime_ms),
 		model: String(row.model),
 		mode: row.mode === "mapped" ? "mapped" : "blob",
 		overview: String(row.overview),
@@ -140,15 +146,15 @@ export function readSummary(db: DatabaseSync, path: string): CachedSummary | und
  * A size mismatch is conclusive - the file cannot be what was summarized - so it returns
  * `stale` without reading the file. Everything else is decided by hashing.
  *
- * `mtime` is deliberately **not** trusted. Treating a matching mtime as proof of an
- * unchanged file is wrong: an edit of the same length landing in the same millisecond, a
- * `cp -p`/`touch -r` that restores a timestamp, and volumes with coarse mtime resolution
- * all produce a matching mtime over different content, which would serve a stale line map
- * for a file the model is about to edit. Reading the file to hash it is cheap next to the
- * model call the shortcut was trying to avoid, so the hash is the only thing that decides.
+ * Nothing cheaper than the hash is trusted as proof of an unchanged file. An mtime
+ * comparison used to short-circuit here, which was wrong: an edit of the same length
+ * landing in the same millisecond, a `cp -p`/`touch -r` that restores a timestamp, and
+ * volumes with coarse mtime resolution all produce a matching mtime over different
+ * content, which would serve a stale line map for a file the model is about to edit.
+ * Hashing one file is cheap next to the model call the shortcut was trying to avoid.
  */
 export async function freshnessOf(
-	entry: Pick<CachedSummary, "hash" | "absPath" | "bytes" | "mtimeMs">,
+	entry: Pick<CachedSummary, "hash" | "absPath" | "bytes">,
 ): Promise<Freshness> {
 	let stats;
 	try {
@@ -174,14 +180,13 @@ export function writeSummary(db: DatabaseSync, input: SummaryInput): void {
 	try {
 		db.prepare(
 			`INSERT INTO file_summary
-			   (path, abs_path, hash, lines, bytes, mtime_ms, model, mode, overview, created_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			   (path, abs_path, hash, lines, bytes, model, mode, overview, created_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 			 ON CONFLICT(path) DO UPDATE SET
 			   abs_path = excluded.abs_path,
 			   hash = excluded.hash,
 			   lines = excluded.lines,
 			   bytes = excluded.bytes,
-			   mtime_ms = excluded.mtime_ms,
 			   model = excluded.model,
 			   mode = excluded.mode,
 			   overview = excluded.overview,
@@ -192,7 +197,6 @@ export function writeSummary(db: DatabaseSync, input: SummaryInput): void {
 			input.fp.hash,
 			input.fp.lines,
 			input.fp.bytes,
-			input.fp.mtimeMs,
 			input.model,
 			input.mode,
 			input.overview,

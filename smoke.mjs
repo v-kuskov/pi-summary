@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 import extensionFactory from "./index.ts";
 import { countLinesFrom } from "./src/hash.ts";
 import { MAX_ATTEMPTS } from "./src/summarize.ts";
-import { openDb } from "./src/store.ts";
+import { ensureSchema, openDb, writeSummary } from "./src/store.ts";
 import { readSummarySettings } from "./src/settings.ts";
 import { extractOverview, parseJsonAnswer } from "./src/prompt.ts";
 import { hasTopLevelShape, normalizeSections, MAX_NOTE_CHARS } from "./src/schema.ts";
@@ -348,6 +348,67 @@ await check("openDb sets busy_timeout before switching to WAL", async () => {
 	}
 });
 
+await check("the cached schema carries no mtime column, and an old database is migrated", async () => {
+	// `mtime_ms` was stored until the freshness check stopped consulting it. A database from
+	// an earlier version still has it, NOT NULL, so dropping it is a migration and not just a
+	// schema edit: without it every insert fails the constraint.
+	const root = tempProject();
+	try {
+		const dbPath = join(root, ".pi", "summaries.db");
+		mkdirSync(join(root, ".pi"), { recursive: true });
+		const old = new DatabaseSync(dbPath);
+		old.exec(`CREATE TABLE file_summary (
+		  path TEXT PRIMARY KEY, abs_path TEXT NOT NULL, hash TEXT NOT NULL,
+		  lines INTEGER NOT NULL, bytes INTEGER NOT NULL, mtime_ms INTEGER NOT NULL,
+		  model TEXT NOT NULL, mode TEXT NOT NULL, overview TEXT NOT NULL,
+		  created_at TEXT NOT NULL
+		)`);
+		old.prepare("INSERT INTO file_summary VALUES (?,?,?,?,?,?,?,?,?,?)").run(
+			"src/old.ts",
+			"/x/src/old.ts",
+			"deadbeef",
+			5,
+			10,
+			1,
+			"m",
+			"mapped",
+			"kept",
+			"2025-01-01T00:00:00.000Z",
+		);
+		old.close();
+
+		const { db } = openDb(root);
+		ensureSchema(db);
+		const columns = db.prepare("PRAGMA table_info(file_summary)").all().map((c) => c.name);
+		assert.ok(!columns.includes("mtime_ms"), "the stale column is dropped");
+		assert.equal(
+			db.prepare("SELECT overview FROM file_summary WHERE path = ?").get("src/old.ts").overview,
+			"kept",
+			"existing rows survive the migration",
+		);
+		// The insert shape the code now uses must work against the migrated table.
+		writeSummary(db, {
+			path: "src/new.ts",
+			absPath: "/x/src/new.ts",
+			fp: { hash: "h", lines: 5, bytes: 1 },
+			model: "m",
+			mode: "mapped",
+			overview: "o",
+			sections: [],
+		});
+		db.close();
+	} finally {
+		// Closing the SQLite handle does not release the directory the instant it returns on
+		// Windows; a retry rides that out, and failing to delete a temp dir after the assertions
+		// passed is not a test failure.
+		try {
+			rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
+		} catch {
+			// Left for the OS temp cleaner.
+		}
+	}
+});
+
 await check("concurrent writers to distinct paths all land in the cache", async () => {
 	// Each writer is its own child process, so busy_timeout is exercised for real rather
 	// than being satisfied by a single process's in-process lock. This is the end-to-end
@@ -362,7 +423,7 @@ await check("concurrent writers to distinct paths all land in the cache", async 
 			`try {`,
 			`  const { db } = openDb(${JSON.stringify(root)});`,
 			`  ensureSchema(db);`,
-			`  writeSummary(db, { path: name, absPath: "/x/" + name, fp: { hash: "h", lines: 5, bytes: 1, mtimeMs: 1 }, model: "m", mode: "mapped", overview: "o", sections: [{ seq: 0, startLine: 1, endLine: 5, kind: "other", name: "x", note: "" }] });`,
+			`  writeSummary(db, { path: name, absPath: "/x/" + name, fp: { hash: "h", lines: 5, bytes: 1 }, model: "m", mode: "mapped", overview: "o", sections: [{ seq: 0, startLine: 1, endLine: 5, kind: "other", name: "x", note: "" }] });`,
 			`  db.close();`,
 			`  console.log("ok");`,
 			`} catch (e) { console.log("err " + e.message); }`,
@@ -1010,6 +1071,41 @@ await check("the guard blocks a full read and says what to do", async () => {
 		assert.match(blocked.reason, /would return more than 200 lines, starting at line 1/);
 		assert.match(blocked.reason, /limit=200/);
 		assert.match(blocked.reason, /generated for this read/, "a cold block carries a fresh map");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+await check("the guard's reason carries the whole map, with nothing cut off", async () => {
+	// A cap here used to truncate the map to a fraction of its rows and drop the trailing
+	// read hint. The partial map was indistinguishable from a complete one because the rows
+	// it kept were contiguous, so a model blocked for needing a map got a plausible map with
+	// rows missing. The reason must now carry every row the summary has.
+	const root = tempProject();
+	try {
+		writeFileSync(join(root, "src", "big.ts"), numbered(2000));
+		// One row per two lines, each with a full note: enough rows that the old 6000-char cap
+		// would have cut the map and lost its tail.
+		const rows = Array.from({ length: 400 }, (_, i) => ({
+			start_line: i * 5 + 1,
+			end_line: i * 5 + 4,
+			kind: "function",
+			name: `handleThing${i}()`,
+			note: `Does the thing number ${i} and returns it. Second sentence of detail here.`,
+		}));
+		const h = makeHarness({
+			cwd: root,
+			respond: () => jsonResponse({ overview: "Many functions.", sections: rows }),
+		});
+
+		const blocked = await runGuard(h, { path: "src/big.ts" });
+		assert.equal(blocked.block, true);
+		assert.ok(!blocked.reason.includes("truncated"), "no truncation marker");
+		for (const index of [0, 199, 399]) {
+			assert.match(blocked.reason, new RegExp(`handleThing${index}\\(\\)`), `row ${index} is present`);
+		}
+		assert.match(blocked.reason, /# read src\/big\.ts with offset\/limit/, "the closing hint survives");
+		assert.match(blocked.reason, /1996-\s*1999\s+function/, "including the last row's range");
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}

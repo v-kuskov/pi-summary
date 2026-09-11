@@ -146,8 +146,8 @@ export function normalizeSections(raw: unknown, shownLines: number): Section[] |
 			endLine,
 			kind: String(row.kind ?? "other").trim().toLowerCase() || "other",
 			name: String(row.name ?? "").trim() || "(unnamed)",
-			// A runaway note is cut rather than trusted: one unbounded note can outweigh every
-			// other row in a map and crowd out the read-block reason.
+			// The prompt asks for two sentences; a note that ignores that is cut so one row
+			// cannot outweigh the rest of the map in the stored entry.
 			note: truncateNote(String(row.note ?? "").trim()),
 		});
 	}

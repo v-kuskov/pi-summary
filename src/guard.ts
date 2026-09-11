@@ -11,10 +11,8 @@ import { failureNotice } from "./fallback.ts";
 import { countLinesFrom, looksBinary } from "./hash.ts";
 import { isRegularFile, resolveFilePath } from "./paths.ts";
 import {
-	MAX_REASON_CHARS,
 	READ_LINE_LIMIT,
-	renderSummaryForReason,
-	truncateChars,
+	renderSummary,
 } from "./render.ts";
 import { summarizeFile, type SummarizeOutcome } from "./summarize.ts";
 
@@ -104,6 +102,12 @@ export function registerReadGuard(pi: ExtensionAPI): void {
  * defeat the cheap early exit - so the wording says "more than" rather than naming a
  * figure it does not know.
  *
+ * The summary is inlined whole, with no character cap. A cap here truncated the map to
+ * some fraction of its rows and cut the trailing read hint, so a model that was blocked
+ * precisely because it needed a map was handed a partial one - and the partial map is
+ * indistinguishable from a complete one, since the rows it kept are contiguous. A large
+ * reason is the honest answer: the alternative is a plausible map with rows missing.
+ *
  * Returns `undefined` to allow the read when there is no summary to justify blocking it.
  */
 async function buildBlockResult(
@@ -139,7 +143,7 @@ async function buildBlockResult(
 		summarized.text,
 	];
 
-	return { block: true, reason: truncateChars(head.join("\n"), MAX_REASON_CHARS) };
+	return { block: true, reason: head.join("\n") };
 }
 
 /** A summary for the block reason, or the reason there is none. */
@@ -157,7 +161,7 @@ type EnsureResult =
 async function ensureSummary(ctx: ExtensionContext, absPath: string): Promise<EnsureResult> {
 	try {
 		const peek = await peekFreshSummary(ctx, absPath);
-		if (peek) return { text: renderSummaryForReason(peek.entry), fromCache: true };
+		if (peek) return { text: renderSummary(peek.entry), fromCache: true };
 	} catch {
 		// Fall through to generating one; an unreadable cache is not fatal.
 	}
@@ -168,5 +172,5 @@ async function ensureSummary(ctx: ExtensionContext, absPath: string): Promise<En
 	} catch (error) {
 		return { fromCache: false, error };
 	}
-	return { text: renderSummaryForReason(outcome.entry), fromCache: false };
+	return { text: renderSummary(outcome.entry), fromCache: false };
 }

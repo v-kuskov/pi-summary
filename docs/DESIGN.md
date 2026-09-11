@@ -56,7 +56,6 @@ CREATE TABLE file_summary (
   hash          TEXT NOT NULL,     -- sha256 of contents, first 16 hex chars
   lines         INTEGER NOT NULL,  -- line count at summarize time (drives the guard)
   bytes         INTEGER NOT NULL,
-  mtime_ms      INTEGER NOT NULL,
   model         TEXT NOT NULL,     -- "deepseek/deepseek-v4-flash"
   mode          TEXT NOT NULL,     -- 'mapped' | 'blob'
   overview      TEXT NOT NULL,     -- prose: what the file does
@@ -99,12 +98,15 @@ rows instead of parsing prose.
 can only return `stale` early — a size mismatch is conclusive, and the hash decides every
 other case.
 
-`mtime` is stored but never used to decide freshness. An earlier version treated a matching
-`mtime` as proof of an unchanged file and skipped hashing; that is wrong, and it was
-reproduced serving a stale map: an edit of the same length landing in the same millisecond,
-a `cp -p`/`touch -r` restoring a timestamp, and volumes with coarse mtime resolution all
-produce a matching `mtime` over different content. Hashing one file is cheap next to the
-model call the shortcut was trying to avoid, so the shortcut is gone.
+Nothing cheaper than the hash is trusted, and nothing cheaper is stored: there is no `mtime`
+column. An earlier version stored one and treated a matching `mtime` as proof of an unchanged
+file, skipping the hash; that is wrong, and it was reproduced serving a stale map: an edit of
+the same length landing in the same millisecond, a `cp -p`/`touch -r` restoring a timestamp,
+and volumes with coarse mtime resolution all produce a matching `mtime` over different
+content. Hashing one file is cheap next to the model call the shortcut was trying to avoid,
+so both the shortcut and the column are gone. A database from that version is migrated by
+`ensureSchema`, which drops the column — `CREATE TABLE IF NOT EXISTS` would otherwise leave
+it in place as `NOT NULL` and fail every insert.
 
 `F5` `summary(path)` on a stale entry re-summarizes and replaces, and says so. The
 caller never has to know the difference; asking for a summary always returns a summary
@@ -176,11 +178,18 @@ built-in byte cap and by `autoResizeImages`; a 200-line limit on a PNG is meanin
 The guard skips anything that is not a regular file, and skips content with a NUL byte
 in the first 8000.
 
-`G4` The block reason carries a fresh summary, truncated to 6000 chars so the error result
-stays small, and closes with a concrete suggested call. Because the line counter stops
-early (`G2`), the reason can only say "more than 200 lines, starting at line N" — it never
-names an exact span, since computing one would mean counting a file the guard deliberately
-avoids counting. It labels the map as cached or just generated.
+`G4` The block reason carries the whole summary, uncapped, and closes with a concrete
+suggested call. Because the line counter stops early (`G2`), the reason can only say "more
+than 200 lines, starting at line N" — it never names an exact span, since computing one would
+mean counting a file the guard deliberately avoids counting. It labels the map as cached or
+just generated.
+
+The cap that used to be here — 6000 chars, applied twice, once inside the renderer and again
+over the composed reason — was worse than the problem it solved. Truncation kept the *first*
+rows of the map, so what the model received was contiguous and therefore indistinguishable
+from a complete map, while the trailing read hint was always dropped. It cut the map for a
+150-row file, and the 1396-line file in the benchmark produces 150 rows. A model blocked
+precisely because it needs a map should not be handed a plausible partial one.
 
 `G5` The guard is implemented with `pi.on("tool_call")`, not by overriding the `read`
 tool. A second `read` registration would replace the built-in renderer and any other

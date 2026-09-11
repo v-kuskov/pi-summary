@@ -114,7 +114,7 @@ function summarizeDetails(outcome: SummarizeOutcome): SummaryDetails {
 }
 
 /** Details for a call that could not be summarized, shaped like a normal result. */
-function failedDetails(absPath: string, error: unknown): SummaryDetails {
+function failedDetails(absPath: string): SummaryDetails {
 	return {
 		path: absPath,
 		status: "failed",
@@ -148,7 +148,7 @@ async function wholeFileFallback(
 	notifyUser(ctx, notice, "error");
 
 	let body: string;
-	let details = failedDetails(absPath, error);
+	let details = failedDetails(absPath);
 	try {
 		const file = await loadWholeFile(absPath);
 		body = file.text;
