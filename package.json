@@ -1,0 +1,52 @@
+{
+  "name": "pi-summary",
+  "version": "0.1.0",
+  "description": "Pi Coding Agent extension — summarizes a file once with a model, caches the result in local SQLite, and caps `read` at 200 lines per call so the model asks for the range it needs.",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "summary",
+    "summarize",
+    "sqlite",
+    "cache",
+    "tokens",
+    "context"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "check": "tsc --noEmit && node smoke.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "node smoke.mjs"
+  },
+  "dependencies": {
+    "typebox": "^1.3.30"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "^0.85.1",
+    "@earendil-works/pi-coding-agent": "^0.85.1",
+    "typescript": "^5.9.3"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "files": [
+    "index.ts",
+    "src/",
+    "docs/",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=24"
+  }
+}
