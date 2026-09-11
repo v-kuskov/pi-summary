@@ -13,6 +13,15 @@
     "context"
   ],
   "license": "MIT",
+  "author": "Vladimir Kuskov <v.kuskov@hotmail.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/v-kuskov/pi-summary.git"
+  },
+  "bugs": {
+    "url": "https://github.com/v-kuskov/pi-summary/issues"
+  },
+  "homepage": "https://github.com/v-kuskov/pi-summary#readme",
   "type": "module",
   "scripts": {
     "check": "tsc --noEmit && node smoke.mjs",

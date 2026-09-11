@@ -17,7 +17,7 @@ Two things, working together:
 As a pi package, from a checkout:
 
 ```bash
-pi install git:github.com/<you>/pi-summary     # or npm:pi-summary once published
+pi install git:github.com/v-kuskov/pi-summary    # or npm:pi-summary once published
 ```
 
 The summarizer is a plain completion with **no tools**: it is asked for JSON, the answer is
