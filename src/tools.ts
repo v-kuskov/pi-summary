@@ -37,12 +37,12 @@ export function registerSummaryTool(pi: ExtensionAPI): void {
 		name: "summary",
 		label: "Summarize file",
 		description:
-			`Get a structural summary of a text file: what it does, plus a complete map of which line ranges hold what. Use it to find the part of a file you need without reading the whole thing. \`read\` returns at most ${READ_LINE_LIMIT} lines per call, so on a longer file get the map here first and then read only the range you need. The file is summarized by a model the first time and served from a local cache afterwards, so only the first call on a file costs anything. Works on any text file, not just source code.`,
-		promptSnippet: "Summarize a file: its purpose and a complete map of its line ranges",
+			`Map a code file's line ranges without reading it. Returns what the file does plus every range that holds what. Call it before reading a source file you have not seen, then read one range instead of the whole file. \`read\` returns at most ${READ_LINE_LIMIT} lines per call, so a 1400-line file costs seven reads or one summary plus one read. The first call on a file runs a model; later calls on the same unchanged file are free from cache.`,
+		promptSnippet: "Map a code file's line ranges before reading it",
 		promptGuidelines: [
-			`Use summary before read on any file longer than ${READ_LINE_LIMIT} lines: read returns at most ${READ_LINE_LIMIT} lines per call, and summary gives you the complete map of ranges to choose from.`,
-			"After summary, read with offset and limit inside one range the map names, rather than reading the whole file.",
-			"Call summary on unfamiliar files of any kind, including prose, config, and data, since its map covers the whole file.",
+			`Before reading a source file you have not seen, call summary on it first. It returns the line ranges, so you read one region instead of the whole file.`,
+			`When a read comes back capped at ${READ_LINE_LIMIT} lines, the map of the whole file is appended to that result. Use it to pick the next range with offset and limit.`,
+			"Reach for summary on large or unfamiliar code, where reading the whole file costs many calls and still overflows.",
 		],
 		parameters: Type.Object({
 			path: Type.String({

@@ -1,5 +1,27 @@
 import { existsSync, statSync } from "node:fs";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
+
+/**
+ * Extensions the read guard leaves alone.
+ *
+ * Prose and notes are read whole - they are written to be read in order, and a 200-line cap
+ * on a README cuts it mid-section while the map of a README adds nothing a skim does not.
+ * The cap exists for source files, where a wrong guess about where a symbol lives costs a
+ * wasted call.
+ */
+const UNGUARDED_EXTENSIONS = new Set([".md", ".txt"]);
+
+/**
+ * True when the read guard should leave this path to the built-in `read` tool.
+ *
+ * A path with no extension is unguarded too: `Makefile`, `Dockerfile`, `.gitignore` and
+ * `LICENSE` are prose or build config, and `extname` reports `""` for all of them
+ * (including the dotfile, whose leading dot is the whole basename, not an extension).
+ */
+export function isUnguardedPath(absPath: string): boolean {
+	const ext = extname(absPath).toLowerCase();
+	return ext === "" || UNGUARDED_EXTENSIONS.has(ext);
+}
 
 /** Walk up from `start` looking for a project root (a directory containing `.git`). */
 export function findProjectRoot(start: string): string {

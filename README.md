@@ -7,10 +7,11 @@ Two things, working together:
 - **`summary` tool** — normally one model call per file, at most three. Returns what the
   file does and a map of which line ranges hold what. Cached in SQLite; asking again
   returns the cached result without a model call until the file's contents change.
-- **`read` guard** — `tool_call` handler that blocks any `read` that would return more
-  than 200 lines, and puts a summary of the file into the block reason. The block is not a
-  dead end: it is the map the model needed, plus a concrete `read(offset, limit)` to use.
-  A file with no summary yet is summarized on the spot and labelled as such.
+- **`read` guard** — `tool_call` handler that caps any `read` that would return more
+  than 200 lines to 200, and appends a summary of the file to the result. The cap is not a
+  dead end: the model keeps the lines it asked for plus the map it needed. A file with no
+  summary yet is summarized on the spot and labelled as such. Prose, notes and extensionless
+  files (`.md`, `.txt`, `Makefile`, `.gitignore`) are never touched — they read whole.
 
 ## Install
 
@@ -43,7 +44,6 @@ summary path="src/foo.ts"
 ```
 # src/foo.ts  (1420 lines, 48.2KB, sha 9f2c1ab4)
 cache: miss
-model: routeai/deepseek/deepseek-v4.1-flash
 
 An HTTP client for the internal Orders API. Wraps node fetch with signed requests,
 retry with jitter, and a rate limiter shared per host. Exports FooClient and the
@@ -53,7 +53,6 @@ every attempt, so a test that does not set it signs with an empty key.
 
 ## map
    1-  24  import   node/fs, node/path; module constants
-  25-  25  skipped  (nothing to map)
   26- 140  class    FooClient - HTTP transport with retry
  141- 620  method   FooClient.request() - builds, signs, sends
  621-1420  method   FooClient.retry() - backoff and jitter
@@ -61,34 +60,36 @@ every attempt, so a test that does not set it signs with an empty key.
 # read src/foo.ts with offset/limit inside one range (max 200 lines per call).
 ```
 
-A later `read path="src/foo.ts"` with no range is blocked:
+A later `read path="src/foo.ts"` with no range is capped, and the map is appended to
+the lines that did come back:
 
 ```
-read is limited to 200 lines per call.
-This call would return more than 200 lines, starting at line 1.
-Add limit=200 and step offset, or read one region from the map below.
+...lines 1-200 of src/foo.ts...
+
+# this call would have returned more than 200 lines, so it was capped at
+# limit=200: lines 1-200 are above. Use offset/limit to read
+# further, or read one region below.
 
 Cached summary of this file (use these line ranges):
 
-# src/foo.ts  (1420 lines, 48.2KB, sha 9f2c1ab4)
-model: routeai/deepseek/deepseek-v4.1-flash
-...
+## map
+   1-  24  import   node/fs, node/path; module constants
+  26- 140  class    FooClient - HTTP transport with retry
+ 141- 620  method   FooClient.request() - builds, signs, sends
+ 621-1420  method   FooClient.retry() - backoff and jitter
 ```
 
-`read path="src/foo.ts" offset=141 limit=200` is allowed.
+`read path="src/foo.ts" offset=141 limit=200` passes through untouched.
 
-A `read` that already carries a small `limit` is never blocked, so the guard does not
-fight a model that is reading properly. `read path="src/foo.ts" limit=2000` is blocked
-the same way a bare `read` is — the span that would come back is what counts, not
-whether `limit` was passed.
+A `read` that already carries a small `limit` is never modified, so the guard does not
+fight a model that is reading properly. `read path="src/foo.ts" limit=2000` is capped the
+same way a bare `read` is — the span that would come back is what counts, not whether
+`limit` was passed.
 
-If nothing is cached yet, the guard summarizes the file and says so instead of returning
-a dead end:
+If nothing is cached yet, the guard summarizes the file and says so:
 
 ```
 Summary of this file, generated for this read (use these line ranges):
-
-# src/foo.ts  (1420 lines, 48.2KB, sha 9f2c1ab4)
 ...
 ```
 
@@ -116,10 +117,10 @@ spanning the file.
 
 Rows may leave gaps: the summarizer is told to skip lines that do nothing, so a blank
 run, a license header, or generated boilerplate is deliberately unmapped rather than
-absorbed into a neighbour or covered by a region invented for the purpose. Gaps are
-rendered as `skipped (nothing to map)` rows, so the map still accounts for every line and
-you never have to notice a jump in the numbers. Rows may not overlap — two notes cannot
-describe the same line. Overlaps are trimmed locally, so they never cost a retry.
+absorbed into a neighbour or covered by a region invented for the purpose. A gap is a jump
+in the numbers and nothing more — the map shows only what was mapped, so a blank run does
+not get a line of its own. Rows may not overlap — two notes cannot describe the same line.
+Overlaps are trimmed locally, so they never cost a retry.
 
 ## Options
 
@@ -154,7 +155,9 @@ failing.
   which is unbounded model spend driven by a query string.
 - **No project-wide refresh.** Same reason.
 - **No `read` tool override.** The guard is a `tool_call` handler, so it composes with
-  the built-in renderer and with other extensions that already override `read`.
+  the built-in renderer and with other extensions that already override `read`. It clamps
+  `limit` on the input and appends to the result rather than blocking, because a blocked
+  call is an error result the extension cannot amend.
 
 ## Development
 
@@ -166,9 +169,10 @@ npm run check     # tsc --noEmit && node smoke.mjs
 `smoke.mjs` drives the real tool and the real guard with a fake `ExtensionAPI` and a
 fake `ModelRegistry`, against a temp project directory. It covers cache hit/miss/stale/
 forced, the hash-over-mtime rule, the blob degradation, the repair loop and its cap,
-the `mtime_ms` migration, settings precedence, and the guard's allow/block boundaries —
-including that a cold oversized read summarizes, that the block reason carries every row
-uncut, and that a failing summarizer lets the read through and says so.
+the `mtime_ms` migration, settings precedence, and the guard's cap boundaries —
+including that a cold oversized read summarizes, that the appended map carries every row
+uncut, that prose and extensionless files are left outside the cap, and that a failing
+summarizer leaves the read alone and says so.
 
 Nothing checks the map's *content*. Structure and schema are validated, and a
 contiguous, well-formed map can still name the wrong lines. The defence is in the prompt
