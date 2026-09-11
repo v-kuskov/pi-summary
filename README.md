@@ -8,8 +8,9 @@ Two things, working together:
   file does and a map of which line ranges hold what. Cached in SQLite; asking again
   returns the cached result without a model call until the file's contents change.
 - **`read` guard** — `tool_call` handler that blocks any `read` that would return more
-  than 200 lines, and puts the cached summary into the block reason. The block is not a
+  than 200 lines, and puts a summary of the file into the block reason. The block is not a
   dead end: it is the map the model needed, plus a concrete `read(offset, limit)` to use.
+  A file with no summary yet is summarized on the spot and labelled as such.
 
 ## Install
 
@@ -77,6 +78,20 @@ fight a model that is reading properly. `read path="src/foo.ts" limit=2000` is b
 the same way a bare `read` is — the span that would come back is what counts, not
 whether `limit` was passed.
 
+If nothing is cached yet, the guard summarizes the file and says so instead of returning
+a dead end:
+
+```
+Summary of this file, generated for this read (use these line ranges):
+
+# src/foo.ts  (1420 lines, 48.2KB, sha 9f2c1ab4)
+...
+```
+
+That makes an oversized `read` of an unfamiliar file cost model calls without you asking
+for them — the one place this extension spends unbounded-by-the-caller, capped at three
+calls per file and cached afterwards.
+
 ## Cache
 
 `<projectRoot>/.pi/summaries.db`, where the project root is the nearest ancestor
@@ -97,10 +112,26 @@ spanning the file.
 | Argument  | Meaning                                                              |
 | --------- | -------------------------------------------------------------------- |
 | `path`    | File to summarize. Relative to cwd, or absolute.                     |
-| `model`   | Summarizer as `provider/model`. Defaults to the current session model. |
+| `model`   | Summarizer as `provider/model`. Overrides the setting and the session model. |
 | `refresh` | Re-summarize even if the cached summary is still fresh.               |
 
 The guard takes no options: 200 lines is the limit.
+
+## Configuration
+
+The summarizer defaults to the current session model. To pin a cheaper or faster one, add
+it to pi's settings file — project scope wins over global:
+
+```json
+{ "summary": { "model": "routeai/deepseek/deepseek-v4.1-flash" } }
+```
+
+- Global: `<agentDir>/settings.json` (`~/.pi/agent/settings.json`)
+- Project: `<projectRoot>/.pi/settings.json`
+
+A bare string works too: `{ "summary": "routeai/deepseek/deepseek-v4.1-flash" }`. If the
+named model is unknown or the file cannot be parsed, the session model is used instead of
+failing.
 
 ## Deliberate non-goals
 
@@ -108,9 +139,6 @@ The guard takes no options: 200 lines is the limit.
   X handled?" by scanning every cached file pushes toward summarizing the whole project,
   which is unbounded model spend driven by a query string.
 - **No project-wide refresh.** Same reason.
-- **The guard never calls a model.** It reads the cache and, at most, counts lines. A
-  guard that summarized on block would turn one oversized `read` into an unannounced
-  model call.
 - **No `read` tool override.** The guard is a `tool_call` handler, so it composes with
   the built-in renderer and with other extensions that already override `read`.
 
@@ -123,8 +151,9 @@ npm run check     # tsc --noEmit && node smoke.mjs
 
 `smoke.mjs` drives the real tool and the real guard with a fake `ExtensionAPI` and a
 fake `ModelRegistry`, against a temp project directory. It covers cache hit/miss/stale/
-forced, the hash-over-mtime rule, the blob degradation, the guard's allow/block
-boundaries, and project-root keying from a subdirectory.
+forced, the hash-over-mtime rule, the blob degradation, the repair loop and its cap,
+settings precedence, and the guard's allow/block boundaries — including that a cold
+oversized read summarizes and that a failing summarizer still blocks cleanly.
 
 `docs/DESIGN.md` records the reasoning, including the cost filter and the rejected
 designs.

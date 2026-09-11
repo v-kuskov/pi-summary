@@ -7,6 +7,7 @@ import { peekFreshSummary } from "./cache.ts";
 import { countLinesFrom, looksBinary } from "./hash.ts";
 import { isRegularFile, resolveFilePath } from "./paths.ts";
 import { renderSummaryForReason, truncateChars } from "./render.ts";
+import { summarizeFile, type SummarizeOutcome } from "./summarize.ts";
 
 /** Hard limit on lines a single `read` may return. Larger spans must be split. */
 export const READ_LINE_LIMIT = 200;
@@ -15,11 +16,15 @@ export const READ_LINE_LIMIT = 200;
 const REASON_CHARS = 6000;
 
 /**
- * Block `read` calls that would return more than `READ_LINE_LIMIT` lines, and hand back
- * the cached summary so the model can pick a range instead.
+ * Block `read` calls that would return more than `READ_LINE_LIMIT` lines, and hand back a
+ * summary of the file so the model can pick a range instead.
  *
- * A blocked call is an error result, not a silent truncation: the model sees a reason it
- * can act on, and the reason always names a concrete next step.
+ * The summary is served from cache when one is fresh. When the file has never been
+ * summarized the guard summarizes it here and inlines the result, so an oversized `read`
+ * is answered with a map rather than a dead end. That means a cold oversized read costs
+ * model calls — this is the one place in the extension that spends them without the caller
+ * naming a file to `summary` — so the reason always states whether the summary came from
+ * cache or was just generated, and the work is bounded by `MAX_ATTEMPTS` in `summarize.ts`.
  */
 export function registerReadGuard(pi: ExtensionAPI): void {
 	pi.on("tool_call", async (event, ctx) => {
@@ -59,7 +64,7 @@ export function registerReadGuard(pi: ExtensionAPI): void {
 }
 
 /**
- * Compose the reason for a blocked read, including the cached summary when there is one.
+ * Compose the reason for a blocked read, summarizing the file if it has not been already.
  *
  * `remaining` is the counter's sentinel (`READ_LINE_LIMIT + 1`) meaning "more than the
  * limit", not an exact count — counting a huge file to print a precise number would
@@ -83,19 +88,18 @@ async function buildBlockReason(
 		`Add limit=${READ_LINE_LIMIT} and step offset, or read one region from the map below.`,
 	];
 
-	let summary: string | undefined;
-	try {
-		const peek = await peekFreshSummary(ctx, absPath);
-		summary = peek ? renderSummaryForReason(peek.entry) : undefined;
-	} catch {
-		// A cache problem must not turn into a confusing read failure; fall through to the
-		// "no summary" branch, which still tells the model how to proceed.
-		summary = undefined;
-	}
-
-	if (summary) {
+	const summarized = await ensureSummary(ctx, absPath);
+	if (summarized) {
 		return truncateChars(
-			[...head, "", "Cached summary of this file (use these line ranges):", "", summary].join("\n"),
+			[
+				...head,
+				"",
+				summarized.fromCache
+					? "Cached summary of this file (use these line ranges):"
+					: "Summary of this file, generated for this read (use these line ranges):",
+				"",
+				summarized.text,
+			].join("\n"),
 			REASON_CHARS,
 		);
 	}
@@ -104,9 +108,36 @@ async function buildBlockReason(
 		[
 			...head,
 			"",
-			"No summary is cached for this file.",
+			"No summary is available for this file.",
 			`Call summary with path="${absPath}" to get a map of its regions, then read the region you need.`,
 		].join("\n"),
 		REASON_CHARS,
 	);
+}
+
+/**
+ * Get a summary for the reason, from cache or by generating one.
+ *
+ * Returns `undefined` when there is nothing to show, which leaves the reason to fall back
+ * to telling the model to call `summary` itself. Every failure mode lands there: an
+ * unreadable file, a provider error, no configured model. A read must not fail because the
+ * summarizer did.
+ */
+async function ensureSummary(
+	ctx: ExtensionContext,
+	absPath: string,
+): Promise<{ text: string; fromCache: boolean } | undefined> {
+	try {
+		const peek = await peekFreshSummary(ctx, absPath);
+		if (peek) return { text: renderSummaryForReason(peek.entry), fromCache: true };
+	} catch {
+		// Fall through to generating one; a cache problem is not fatal.
+	}
+
+	try {
+		const outcome: SummarizeOutcome = await summarizeFile(ctx, { path: absPath });
+		return { text: renderSummaryForReason(outcome.entry), fromCache: false };
+	} catch {
+		return undefined;
+	}
 }

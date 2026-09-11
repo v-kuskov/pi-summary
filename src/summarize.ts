@@ -29,6 +29,7 @@ import {
 } from "./store.ts";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AssistantMessage, Model, Usage } from "@earendil-works/pi-ai";
+import { readSummarySettings } from "./settings.ts";
 
 type AnyModel = Model<any>;
 
@@ -286,45 +287,77 @@ function isProviderError(response: AssistantMessage): boolean {
 }
 
 /**
- * Pick the summarizer: an explicit `provider/model`, else the session's current model.
- * Auth is checked up front so a missing credential reads as a clear message rather than
- * a provider error.
+ * Pick the summarizer, in order: explicit `provider/model`, the `summary.model` setting,
+ * else the session's current model. Auth is checked up front so a missing credential
+ * reads as a clear message rather than a provider error.
  */
 function resolveSummarizerModel(ctx: ExtensionContext, explicit: string | undefined): AnyModel {
+	return resolveNamedModel(ctx, explicit) ?? configuredModel(ctx) ?? sessionModel(ctx);
+}
+
+/** An explicit `provider/model` argument, if one was given and is usable. */
+function resolveNamedModel(ctx: ExtensionContext, explicit: string | undefined): AnyModel | undefined {
 	// Models sometimes fill an optional field with a placeholder instead of omitting it.
 	const placeholder = /^(current|default|auto|session|none|null|undefined)$/i;
 	const trimmed = explicit?.trim() ?? "";
-	if (trimmed.length > 0 && !placeholder.test(trimmed)) {
-		const slash = trimmed.indexOf("/");
-		const provider = slash > 0 ? trimmed.slice(0, slash) : "";
-		const modelId = slash > 0 ? trimmed.slice(slash + 1) : "";
-		if (!provider || !modelId) {
-			throw new SummaryError(
-				`model "${explicit}" is not in provider/model form`,
-				"Pass model as provider/model, for example: deepseek/deepseek-v4-flash, or omit it to summarize with the current session model.",
-			);
-		}
-		const found = ctx.modelRegistry.find(provider, modelId);
-		if (!found) {
-			throw new SummaryError(
-				`unknown model "${explicit}"`,
-				"Omit model to use the current session model.",
-			);
-		}
-		if (!ctx.modelRegistry.hasConfiguredAuth(found)) {
-			throw new SummaryError(
-				`no credentials configured for ${explicit}`,
-				"Omit model to use the current session model, or pick an authenticated provider.",
-			);
-		}
-		return found;
-	}
+	if (trimmed.length === 0 || placeholder.test(trimmed)) return undefined;
 
+	const slash = trimmed.indexOf("/");
+	const provider = slash > 0 ? trimmed.slice(0, slash) : "";
+	const modelId = slash > 0 ? trimmed.slice(slash + 1) : "";
+	if (!provider || !modelId) {
+		throw new SummaryError(
+			`model "${explicit}" is not in provider/model form`,
+			"Pass model as provider/model, for example: deepseek/deepseek-v4-flash, or omit it to summarize with the current session model.",
+		);
+	}
+	const found = ctx.modelRegistry.find(provider, modelId);
+	if (!found) {
+		throw new SummaryError(
+			`unknown model "${explicit}"`,
+			"Omit model to use the current session model.",
+		);
+	}
+	if (!ctx.modelRegistry.hasConfiguredAuth(found)) {
+		throw new SummaryError(
+			`no credentials configured for ${explicit}`,
+			"Omit model to use the current session model, or pick an authenticated provider.",
+		);
+	}
+	return found;
+}
+
+/**
+ * The `summary.model` setting, if set.
+ *
+ * A setting that names a model the registry does not know is skipped with a warning rather
+ * than thrown: an unreadable config should not make the tool unusable, and falling back to
+ * the session model keeps `summary` working.
+ */
+function configuredModel(ctx: ExtensionContext): AnyModel | undefined {
+	const configured = readSummarySettings(ctx.cwd).model;
+	if (!configured || !isProviderModelPair(configured)) return undefined;
+
+	const provider = configured.slice(0, configured.indexOf("/"));
+	const modelId = configured.slice(configured.indexOf("/") + 1);
+	const found = ctx.modelRegistry.find(provider, modelId);
+	if (!found || !ctx.modelRegistry.hasConfiguredAuth(found)) return undefined;
+	return found;
+}
+
+/** True when the value has a non-empty `provider/model` split. */
+function isProviderModelPair(value: string): boolean {
+	const slash = value.indexOf("/");
+	return slash > 0 && slash < value.length - 1;
+}
+
+/** Fall back to the session's current model, or explain why there is none. */
+function sessionModel(ctx: ExtensionContext): AnyModel {
 	const current = ctx.model;
 	if (!current) {
 		throw new SummaryError(
 			"no current model available to summarize with",
-			'Pass model, for example: model="deepseek/deepseek-v4-flash".',
+			'Pass model, for example: model="deepseek/deepseek-v4-flash", or set it with {"summary":{"model":"..."}} in settings.',
 		);
 	}
 	if (!ctx.modelRegistry.hasConfiguredAuth(current)) {

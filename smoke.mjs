@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import extensionFactory from "./index.ts";
 import { countLinesFrom } from "./src/hash.ts";
 import { MAX_ATTEMPTS } from "./src/summarize.ts";
+import { readSummarySettings } from "./src/settings.ts";
 import { extractOverview, parseJsonAnswer } from "./src/prompt.ts";
 import { hasTopLevelShape, normalizeSections } from "./src/schema.ts";
 
@@ -151,6 +152,94 @@ await check("extractOverview salvages prose from a truncated answer", async () =
 		"Implements the sync client.",
 	);
 	assert.equal(extractOverview("```\nA plain prose answer.\n```"), "A plain prose answer.");
+});
+
+await check("readSummarySettings reads the object form and prefers project over global", async () => {
+	const agent = mkdtempSync(join(tmpdir(), "pi-agent-"));
+	const root = tempProject();
+	const previous = process.env.PI_CODING_AGENT_DIR;
+	try {
+		process.env.PI_CODING_AGENT_DIR = agent;
+		writeFileSync(
+			join(agent, "settings.json"),
+			JSON.stringify({ summary: { model: "global/model" } }),
+		);
+		assert.deepEqual(readSummarySettings(root), { model: "global/model" });
+
+		mkdirSync(join(root, ".pi"), { recursive: true });
+		writeFileSync(
+			join(root, ".pi", "settings.json"),
+			JSON.stringify({ summary: { model: "project/model" } }),
+		);
+		assert.deepEqual(readSummarySettings(root), { model: "project/model" }, "project wins");
+	} finally {
+		if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = previous;
+		rmSync(agent, { recursive: true, force: true });
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+await check("readSummarySettings tolerates a bare string and junk values", async () => {
+	const agent = mkdtempSync(join(tmpdir(), "pi-agent-"));
+	const root = tempProject();
+	const previous = process.env.PI_CODING_AGENT_DIR;
+	const write = (value) =>
+		writeFileSync(join(agent, "settings.json"), JSON.stringify({ summary: value }));
+	try {
+		process.env.PI_CODING_AGENT_DIR = agent;
+
+		write("deepseek/deepseek-v4-flash");
+		assert.deepEqual(readSummarySettings(root), { model: "deepseek/deepseek-v4-flash" });
+
+		write({ model: "  spaced/model  " });
+		assert.deepEqual(readSummarySettings(root), { model: "spaced/model" }, "trimmed");
+
+		for (const junk of [null, 42, [], {}, { model: 7 }, { model: "" }, ""]) {
+			write(junk);
+			assert.deepEqual(readSummarySettings(root), {}, `junk ${JSON.stringify(junk)} ignored`);
+		}
+
+		// A corrupt settings file must not throw out of a summarization.
+		writeFileSync(join(agent, "settings.json"), "{ not json");
+		assert.deepEqual(readSummarySettings(root), {});
+	} finally {
+		if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = previous;
+		rmSync(agent, { recursive: true, force: true });
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+await check("the summary.model setting picks the summarizer, and model= overrides it", async () => {
+	const agent = mkdtempSync(join(tmpdir(), "pi-agent-"));
+	const root = tempProject();
+	const previous = process.env.PI_CODING_AGENT_DIR;
+	try {
+		process.env.PI_CODING_AGENT_DIR = agent;
+		writeFileSync(
+			join(agent, "settings.json"),
+			JSON.stringify({ summary: { model: "test/test-model" } }),
+		);
+		writeFileSync(join(root, "src", "a.ts"), numbered(10));
+		const h = makeHarness({ cwd: root });
+
+		const result = await runTool(h, "summary", { path: "src/a.ts" });
+		assert.equal(result.details.model, "test/test-model", "the configured model was used");
+
+		// An unknown configured model is skipped rather than failing the tool.
+		writeFileSync(
+			join(agent, "settings.json"),
+			JSON.stringify({ summary: { model: "nope/missing" } }),
+		);
+		const fallback = await runTool(h, "summary", { path: "src/a.ts", refresh: true });
+		assert.equal(fallback.details.model, "test/test-model", "fell back to the session model");
+	} finally {
+		if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = previous;
+		rmSync(agent, { recursive: true, force: true });
+		rmSync(root, { recursive: true, force: true });
+	}
 });
 
 await check("countLinesFrom matches split semantics and the 200-line threshold", async () => {
@@ -542,8 +631,8 @@ await check("the guard blocks a full read and says what to do", async () => {
 		assert.equal(blocked.block, true);
 		assert.match(blocked.reason, /limited to 200 lines/);
 		assert.match(blocked.reason, /would return more than 200 lines, starting at line 1/);
-		assert.match(blocked.reason, /No summary is cached/);
-		assert.match(blocked.reason, /call summary/i);
+		assert.match(blocked.reason, /limit=200/);
+		assert.match(blocked.reason, /generated for this read/, "a cold block carries a fresh map");
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
@@ -590,6 +679,68 @@ await check("the guard blocks an oversized tail and names the exact range", asyn
 	}
 });
 
+await check("a cold oversized read is summarized by the guard and the map inlined", async () => {
+	const root = tempProject();
+	try {
+		writeFileSync(join(root, "src", "a.ts"), numbered(500));
+		const h = makeHarness({
+			cwd: root,
+			respond: () =>
+				jsonResponse({
+					overview: "Sync client.",
+					sections: [{ start_line: 1, end_line: 40, kind: "class", name: "SyncClient", note: "" }],
+				}),
+		});
+
+		const blocked = await runGuard(h, { path: "src/a.ts" });
+		assert.equal(blocked.block, true);
+		assert.equal(h.calls.length, 1, "the guard paid for one summarization");
+		assert.match(blocked.reason, /generated for this read/, "says the map was just made");
+		assert.match(blocked.reason, /SyncClient/);
+		assert.doesNotMatch(blocked.reason, /No summary is available/);
+
+		// The work it did is cached, so the next oversized read costs nothing.
+		const again = await runGuard(h, { path: "src/a.ts" });
+		assert.equal(h.calls.length, 1, "second block is served from cache");
+		assert.match(again.reason, /Cached summary of this file/);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+await check("a failing summarizer does not break the read guard", async () => {
+	const root = tempProject();
+	try {
+		writeFileSync(join(root, "src", "a.ts"), numbered(500));
+		const h = makeHarness({
+			cwd: root,
+			respond: () => errorResponse("upstream is down"),
+		});
+
+		const blocked = await runGuard(h, { path: "src/a.ts" });
+		assert.equal(blocked.block, true, "the read is still blocked");
+		assert.match(blocked.reason, /No summary is available for this file/);
+		assert.match(blocked.reason, /Call summary with path=/, "falls back to telling the model to ask");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+await check("the guard is silent for reads inside the limit", async () => {
+	const root = tempProject();
+	try {
+		writeFileSync(join(root, "src", "a.ts"), numbered(500));
+		const h = makeHarness({ cwd: root });
+
+		assert.equal(await runGuard(h, { path: "src/a.ts", limit: 200 }), undefined);
+		assert.equal(await runGuard(h, { path: "src/a.ts", limit: 50 }), undefined);
+		assert.equal(await runGuard(h, { path: "src/a.ts", offset: 480 }), undefined, "20 lines left");
+		assert.equal(h.calls.length, 0, "an allowed read never spends a model call");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
 await check("a fresh summary is inlined into the block reason", async () => {
 	const root = tempProject();
 	try {
@@ -606,10 +757,10 @@ await check("a fresh summary is inlined into the block reason", async () => {
 				}),
 		});
 
-		// The guard must not spend a model call of its own.
+		// A cold oversized read is answered with a map the guard generates itself.
 		const blockedCold = await runGuard(h, { path: "src/a.ts" });
-		assert.equal(h.calls.length, 0, "guard never summarizes by itself");
-		assert.match(blockedCold.reason, /No summary is cached/);
+		assert.equal(h.calls.length, 1, "the guard summarizes a file it has never seen");
+		assert.match(blockedCold.reason, /generated for this read/);
 
 		await runTool(h, "summary", { path: "src/a.ts" });
 		const blocked = await runGuard(h, { path: "src/a.ts" });
@@ -624,17 +775,29 @@ await check("a fresh summary is inlined into the block reason", async () => {
 	}
 });
 
-await check("the guard ignores a stale summary rather than quoting it", async () => {
+await check("the guard replaces a stale summary instead of quoting it", async () => {
 	const root = tempProject();
 	try {
 		const file = join(root, "src", "a.ts");
 		writeFileSync(file, numbered(400));
-		const h = makeHarness({ cwd: root });
+		const h = makeHarness({
+			cwd: root,
+			respond: (_context, _opts, n) =>
+				jsonResponse({
+					overview: `Generation ${n}.`,
+					sections: [{ start_line: 1, end_line: 400, kind: "other", name: "whole", note: "" }],
+				}),
+		});
 		await runTool(h, "summary", { path: "src/a.ts" });
+		assert.equal(h.calls.length, 1);
 
+		// The file grows, so the cached entry is stale and describes the wrong line count.
 		writeFileSync(file, numbered(600));
 		const blocked = await runGuard(h, { path: "src/a.ts" });
-		assert.match(blocked.reason, /No summary is cached/, "stale entry is not reused");
+		assert.equal(h.calls.length, 2, "a stale entry is refreshed, not quoted");
+		assert.match(blocked.reason, /generated for this read/);
+		assert.match(blocked.reason, /Generation 2\./, "the fresh overview is what was shown");
+		assert.doesNotMatch(blocked.reason, /Generation 1\./, "the stale overview was not reused");
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}

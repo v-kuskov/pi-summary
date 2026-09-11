@@ -33,13 +33,16 @@ call normally, at most three** if the model's answer fails validation and has to
 repaired (§9 `E5`). The retry cap exists so this stays a bounded cost rather than an
 unbounded loop.
 
-`C2` The read guard — zero model calls, always. It reads the cache and otherwise only
-counts lines in a file. A guard that could summarize would turn one oversized `read`
-into an unannounced model call, which is the fan-out this filter forbids.
+`C2` The read guard — zero model calls when a fresh summary is cached. When the file was
+never summarized (or the entry is stale) it **summarizes the file and inlines the map**, so
+an oversized `read` is answered with a map instead of a dead end. That means a cold
+oversized `read` spends up to three model calls without the caller naming the file to
+`summary`. This is the extension's one unannounced spend, and it is bounded by the same
+`MAX_ATTEMPTS` ceiling. The reason always says which happened: `generated for this read`
+versus `Cached summary of this file`.
 
 Rejected: search-across-cached-summaries and project-wide refresh. Both are unbounded
-fan-out driven by caller text; both were built and removed. Also rejected: having the
-guard auto-summarize the file it blocked.
+fan-out driven by caller text; both were built and removed.
 
 ## 4. Storage
 
@@ -165,12 +168,28 @@ behind its back.
 
 ## 8. Summarization call
 
-`S1` Model resolution order: explicit `model` argument → the session's current model
-(`ctx.model`) → fail with an error naming what is unavailable. The placeholders
-`current`, `default`, `auto`, `session`, `none`, `null` are treated as "use the session
-model", because a model asked for a summarizer by name will happily send the literal
-string. Auth is checked with `hasConfiguredAuth` before the call, so a missing
+`S1` Model resolution order: explicit `model` argument → the `summary.model` setting → the
+session's current model (`ctx.model`) → fail with an error naming what is unavailable.
+
+The placeholders `current`, `default`, `auto`, `session`, `none`, `null` are treated as
+"use the session model", because a model asked for a summarizer by name will happily send
+the literal string. Auth is checked with `hasConfiguredAuth` before the call, so a missing
 credential produces a clear message instead of a provider error.
+
+The setting is read from pi's own settings through `SettingsManager.create(cwd)`, checking
+project scope first so a project can pin its own summarizer:
+
+```json
+{ "summary": { "model": "routeai/deepseek/deepseek-v4.1-flash" } }
+```
+
+Global settings come from `<agentDir>/settings.json`, project settings from
+`<cwd>/.pi/settings.json`. A bare string (`"summary": "provider/model"`) is also accepted.
+pi's `Settings` interface has no field for extension config, but the file is not filtered:
+unknown top-level keys survive load and write, which is what makes this safe. A setting that
+names an unknown model, is malformed, or sits in an unparseable file is skipped in favour of
+the session model rather than thrown — an unreadable config should not make the tool
+unusable.
 
 `S2` **The call requests structured output as JSON, with no tools.** The prompt states the
 contract in prose and the answer is validated locally against a flat schema whose shape is
@@ -272,3 +291,12 @@ is JSON described in the prompt, validated locally with typebox, and repaired by
 the model's own answer with the specific violations — bounded at three calls. A malformed
 answer that survives all three attempts is stored as prose with `mode = 'blob'` rather
 than failing the call or fabricating a map.
+
+`D6` The read guard summarizes a file it has no fresh summary for, so an oversized `read`
+always comes back with a map. This overrides the earlier "the guard never calls a model"
+rule: the user asked for the guard to create the summary rather than return an error. The
+cost is bounded by `D5`'s ceiling, and the block reason states whether the map was cached
+or just generated.
+
+`D7` The summarizer model is configurable through a `summary.model` key in pi's settings
+file, project scope winning over global, defaulting to the session model.
