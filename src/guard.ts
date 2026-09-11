@@ -9,14 +9,11 @@ import { peekFreshSummary } from "./cache.ts";
 import { describeFailure, failureNotice } from "./fallback.ts";
 import { countLinesFrom, looksBinary } from "./hash.ts";
 import { isRegularFile, resolveFilePath } from "./paths.ts";
-import { renderSummaryForReason, truncateChars } from "./render.ts";
+import { MAX_REASON_CHARS, renderSummaryForReason, truncateChars } from "./render.ts";
 import { summarizeFile, type SummarizeOutcome } from "./summarize.ts";
 
 /** Hard limit on lines a single `read` may return. Larger spans must be split. */
 export const READ_LINE_LIMIT = 200;
-
-/** Cap for the blocked-read reason, which carries a whole summary. */
-const REASON_CHARS = 6000;
 
 /** Notices raised for the current batch, keyed by tool call id, awaiting their result. */
 const pendingNotices = new Map<string, string>();
@@ -131,7 +128,7 @@ async function buildBlockResult(
 		summarized.text,
 	];
 
-	return { block: true, reason: truncateChars(head.join("\n"), REASON_CHARS) };
+	return { block: true, reason: truncateChars(head.join("\n"), MAX_REASON_CHARS) };
 }
 
 /** A summary for the block reason, or the reason there is none. */

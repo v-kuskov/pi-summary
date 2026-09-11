@@ -6,6 +6,7 @@ import {
 	type PreparedFile,
 	buildRepairPrompt,
 	buildSummarizePrompt,
+	describeCoverageProblems,
 	extractOverview,
 	modelLabel,
 	parseJsonAnswer,
@@ -120,7 +121,6 @@ export async function summarizeFile(
 			mode: result.mode,
 			overview: result.overview,
 			sections: result.sections,
-			coveredLines: result.coveredLines,
 		});
 
 		const stored = readSummary(db, key);
@@ -143,7 +143,6 @@ export async function summarizeFile(
 type SummaryResult = {
 	overview: string;
 	sections: Section[];
-	coveredLines: number;
 	mode: SummaryMode;
 	usage?: Usage;
 	attempts: number;
@@ -183,6 +182,7 @@ async function requestSummary(
 	let jsonMode = true;
 	let last: AssistantMessage | undefined;
 	let lastText = "";
+	let problems: string[] = [];
 
 	for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
 		const response = await ctx.modelRegistry.complete(
@@ -210,47 +210,52 @@ async function requestSummary(
 		const parsed = parseJsonAnswer(lastText);
 		if (parsed !== undefined && hasTopLevelShape(parsed)) {
 			const value = parsed as EmitSummary;
-			const sections = normalizeSections(value.sections, prepared.shownLines);
+			const sections = normalizeSections(value.sections, prepared.totalLines);
 			// A valid envelope with no usable rows is still a blob: there is no map to show,
 			// and inventing a single file-spanning region would be indistinguishable from a
 			// real one.
 			if (sections) {
-				return {
-					overview: value.overview.trim() || "(no overview provided)",
-					sections,
-					coveredLines: sections.reduce((max, s) => Math.max(max, s.endLine), 0),
-					mode: "mapped",
-					usage: response.usage,
-					attempts: attempt,
-				};
-			}
-
-			// An explicitly empty `sections` is an answer, not a mistake: the model is saying
-			// the file has no map. Accept it as a blob rather than spending calls arguing.
-			if (value.sections.length === 0) {
+				// The excerpt is numbered, so a complete map covers every line exactly once: first
+				// row at line 1, each row starting where the last ended, last row on the final line.
+				// A break means the model worked from a pattern instead of copying the numbers, or
+				// stopped short - either way the boundaries are not trustworthy until it is fixed.
+				const gaps = describeCoverageProblems(sections, prepared.totalLines);
+				if (gaps.length === 0 || attempt >= MAX_ATTEMPTS) {
+					return {
+						overview: value.overview.trim() || "(no overview provided)",
+						sections,
+						mode: "mapped",
+						usage: response.usage,
+						attempts: attempt,
+					};
+				}
+				problems = gaps;
+			} else if (value.sections.length === 0) {
+				// An explicitly empty `sections` is an answer, not a mistake: the model is saying
+				// the file has no map. Accept it as a blob rather than spending calls arguing.
 				return {
 					overview: value.overview.trim() || "(no overview provided)",
 					sections: [],
-					coveredLines: 0,
 					mode: "blob",
 					usage: response.usage,
 					attempts: attempt,
 				};
+			} else {
+				problems = ["\"sections\" contained no usable region"];
 			}
+		} else {
+			problems = describeProblems(parsed);
 		}
 
 		if (attempt < MAX_ATTEMPTS) {
 			messages.push(assistantTextMessage(response, lastText));
-			messages.push(
-				userMessage(buildRepairPrompt(describeProblems(parsed))),
-			);
+			messages.push(userMessage(buildRepairPrompt(problems)));
 		}
 	}
 
 	return {
 		overview: extractOverview(lastText) || "(the summarizer returned no usable answer)",
 		sections: [],
-		coveredLines: 0,
 		mode: "blob",
 		usage: last?.usage,
 		attempts: MAX_ATTEMPTS,

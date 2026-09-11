@@ -1,7 +1,7 @@
 import type { CachedSummary, Freshness, Section } from "./store.ts";
 
 /** Char cap for anything embedded in a block reason or error message. */
-export const MAX_REASON_CHARS = 4000;
+export const MAX_REASON_CHARS = 6000;
 
 export function formatBytes(bytes: number): string {
 	if (bytes < 1024) return `${bytes}B`;
@@ -17,38 +17,28 @@ export function truncateChars(text: string, max: number): string {
 /**
  * Render the `## map` block from section rows.
  *
- * A blob entry has no rows, and the output says exactly that rather than inventing a
- * region that spans the file. The caller cannot tell an invented single region from a
- * real one, so a fake row would be trusted and acted on.
+ * Rows are rendered exactly as stored. A map is complete or it is not a map: a partial one
+ * is sent back to be finished before anything is written, so there is no uncovered tail to
+ * append here and no region to invent. A blob entry has no rows, and the output says so
+ * rather than fabricating a region that spans the file — the caller cannot tell an invented
+ * row from a real one, so a fake row would be trusted and acted on.
  */
-export function renderMap(sections: Section[], totalLines: number, coveredLines: number): string {
+export function renderMap(sections: Section[]): string {
 	if (sections.length === 0) {
 		return [
 			"## map",
-			`  (none) this file was summarized as a single blob; no line detail is available.`,
-			`  Use grep to locate a symbol in it, or read it in ranges of at most 200 lines.`,
+			"  (none) this file was summarized as a single blob; no line detail is available.",
+			"  Use grep to locate a symbol in it, or read it in ranges of at most 200 lines.",
 		].join("\n");
 	}
 
-	const rows: Array<{ start: number; end: number; kind: string; name: string; note: string }> =
-		sections.map((s) => ({
-			start: s.startLine,
-			end: s.endLine,
-			kind: s.kind,
-			name: s.name,
-			note: s.note,
-		}));
-
-	const tailStart = (rows.at(-1)?.end ?? 0) + 1;
-	if (coveredLines < totalLines && tailStart <= totalLines) {
-		rows.push({
-			start: tailStart,
-			end: totalLines,
-			kind: "rest",
-			name: "(not summarized)",
-			note: "beyond what the summarizer was shown; this range is unmapped",
-		});
-	}
+	const rows = sections.map((s) => ({
+		start: s.startLine,
+		end: s.endLine,
+		kind: s.kind,
+		name: s.name,
+		note: s.note,
+	}));
 
 	const width = Math.max(...rows.map((r) => String(r.end).length), 4);
 	const kindWidth = Math.max(...rows.map((r) => r.kind.length), 4);
@@ -87,15 +77,13 @@ export function renderSummary(entry: CachedSummary, options: RenderOptions = {})
 		parts.push(`model: ${entry.model}`);
 		if (entry.mode === "blob") {
 			parts.push("map: none - summarized as a single blob, so there is no line detail");
-		} else if (entry.coveredLines < entry.lines) {
-			parts.push(`note: mapped lines 1-${entry.coveredLines} of ${entry.lines}`);
 		}
 		parts.push("");
 	}
 
 	parts.push(entry.overview.trim());
 	parts.push("");
-	parts.push(renderMap(entry.sections, entry.lines, entry.coveredLines));
+	parts.push(renderMap(entry.sections));
 	parts.push("");
 	parts.push(
 		entry.mode === "blob"
@@ -109,4 +97,3 @@ export function renderSummary(entry: CachedSummary, options: RenderOptions = {})
 export function renderSummaryForReason(entry: CachedSummary): string {
 	return truncateChars(renderSummary(entry, { header: true }), MAX_REASON_CHARS);
 }
-

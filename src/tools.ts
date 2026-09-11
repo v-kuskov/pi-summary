@@ -15,7 +15,6 @@ export type SummaryDetails = {
 	status: string;
 	mode: string;
 	lines: number;
-	coveredLines: number;
 	model: string;
 	extraction: string;
 	sections: number;
@@ -106,7 +105,6 @@ function summarizeDetails(outcome: SummarizeOutcome): SummaryDetails {
 		status: outcome.status,
 		mode: outcome.entry.mode,
 		lines: outcome.entry.lines,
-		coveredLines: outcome.entry.coveredLines,
 		model: outcome.entry.model,
 		extraction: outcome.extraction,
 		sections: outcome.entry.sections.length,
@@ -123,7 +121,6 @@ function failedDetails(absPath: string, error: unknown): SummaryDetails {
 		status: "failed",
 		mode: "raw",
 		lines: 0,
-		coveredLines: 0,
 		model: "",
 		extraction: "none",
 		sections: 0,

@@ -84,12 +84,18 @@ export function describeSchemaErrors(value: unknown): string[] {
 }
 
 /**
- * Clamp, drop, and sort the model's rows into storable sections.
+ * Clamp, dedupe, and sort the model's rows into storable sections.
  *
  * Rows are repaired rather than rejected: a model that put a boundary one line out or
  * wrote a line range as a string has still told us where the region is, and spending a
  * model call to correct arithmetic is a worse trade than clamping it. Rows that cannot be
  * repaired — non-numeric, before line 1, starting past what was shown — are dropped.
+ *
+ * Overlapping rows are trimmed to the unclaimed lines after them. A model asked for
+ * tiling sometimes emits a container row (`1-24 comment`) alongside its contents
+ * (`4-23 Widget1`), and both cannot be true; keeping the later row's start and cutting the
+ * earlier row short is the reading that preserves the innermost, most specific region. Let
+ * through unmodified, such rows render as a map that contradicts itself.
  *
  * Returns undefined when nothing usable survives, which is the caller's signal to treat
  * the answer as a blob rather than as a map.
@@ -120,7 +126,20 @@ export function normalizeSections(raw: unknown, shownLines: number): Section[] |
 
 	if (sections.length === 0) return undefined;
 
-	return sections
-		.sort((a, b) => a.startLine - b.startLine)
-		.map((section, index) => ({ ...section, seq: index }));
+	const sorted = sections.sort((a, b) => a.startLine - b.startLine || a.endLine - b.endLine);
+
+	// Trim each row so it stops before the next row begins, dropping rows that the next row
+	// completely covers.
+	const tiled: Section[] = [];
+	for (let i = 0; i < sorted.length; i++) {
+		const current = sorted[i]!;
+		const next = sorted[i + 1];
+		if (next && current.endLine >= next.startLine) {
+			if (next.startLine <= current.startLine) continue; // fully shadowed
+			current.endLine = next.startLine - 1;
+		}
+		tiled.push(current);
+	}
+
+	return tiled.map((section, index) => ({ ...section, seq: index }));
 }

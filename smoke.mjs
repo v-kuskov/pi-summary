@@ -1,13 +1,15 @@
 import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import assert from "node:assert/strict";
 
 import extensionFactory from "./index.ts";
 import { countLinesFrom } from "./src/hash.ts";
 import { MAX_ATTEMPTS } from "./src/summarize.ts";
+import { openDb } from "./src/store.ts";
 import { readSummarySettings } from "./src/settings.ts";
-import { extractOverview, parseJsonAnswer } from "./src/prompt.ts";
+import { extractOverview, parseJsonAnswer, describeCoverageProblems } from "./src/prompt.ts";
 import { hasTopLevelShape, normalizeSections } from "./src/schema.ts";
 
 let failures = 0;
@@ -42,11 +44,20 @@ const errorResponse = (message) => ({
 	errorMessage: message,
 	usage: { input: 10, output: 5, totalTokens: 15 },
 });
-const defaultAnswer = () =>
-	jsonResponse({
-		overview: "Does a thing.",
-		sections: [{ start_line: 1, end_line: 5, kind: "function", name: "run()", note: "does it" }],
-	});
+// The fake summarizer answers with a map that tiles the excerpt it was given: one row
+// spanning the whole thing. A fixture whose rows leave gaps or overlap would now cost a
+// repair call, so helpers here build tiling answers unless a test wants otherwise.
+const lastShownLine = (context) => {
+	const prompt = context.messages[0].content[0].text;
+	return Number(prompt.match(/The file is (\d+) lines/)[1]);
+};
+const tilingAnswer = (overview, kind = "function", name = "run()", note = "does it") =>
+	(context) =>
+		jsonResponse({
+			overview,
+			sections: [{ start_line: 1, end_line: lastShownLine(context), kind, name, note }],
+		});
+const defaultAnswer = tilingAnswer("Does a thing.");
 
 function makeHarness(options = {}) {
 	const tools = new Map();
@@ -126,7 +137,7 @@ const numbered = (lines) =>
 
 // ------------------------------------------------------------------ units
 
-await check("normalizeSections clamps, sorts, renumbers, and drops unrecoverable rows", async () => {
+await check("normalizeSections clamps, trims overlaps, and drops unrecoverable rows", async () => {
 	const rows = normalizeSections(
 		[
 			{ start_line: 50, end_line: 60, kind: "function", name: "b()", note: "" },
@@ -137,15 +148,55 @@ await check("normalizeSections clamps, sorts, renumbers, and drops unrecoverable
 		],
 		100,
 	);
-	assert.deepEqual(rows.map((s) => s.name), ["A", "b()", "reversed"], "unusable rows dropped");
+	assert.deepEqual(
+		rows.map((s) => s.name),
+		["A", "b()", "reversed"],
+		"unusable rows are dropped",
+	);
 	assert.deepEqual(rows.map((s) => s.seq), [0, 1, 2]);
-	assert.equal(rows[0].endLine, 100, "end clamps to what the model was shown");
+	assert.equal(rows[0].endLine, 49, "A stops one line before the row that begins inside it");
 	assert.equal(rows[0].kind, "class", "kind is normalized");
 	assert.equal(rows[2].endLine, 70, "a reversed range collapses to one line, not dropped");
 
 	assert.equal(normalizeSections([], 100), undefined, "no rows means no map");
 	assert.equal(normalizeSections(null, 100), undefined);
 	assert.equal(normalizeSections("nope", 100), undefined);
+});
+
+await check("normalizeSections resolves a container row against its contents", async () => {
+	// The real drift signature: a model emits a wrapper range and the rows inside it.
+	const rows = normalizeSections(
+		[
+			{ start_line: 1, end_line: 24, kind: "comment", name: "module 1", note: "" },
+			{ start_line: 2, end_line: 2, kind: "import", name: "helper1", note: "" },
+			{ start_line: 4, end_line: 23, kind: "class", name: "Widget1", note: "" },
+		],
+		1396,
+	);
+	assert.deepEqual(
+		rows.map((s) => [s.startLine, s.endLine, s.name]),
+		[
+			[1, 1, "module 1"],
+			[2, 2, "helper1"],
+			[4, 23, "Widget1"],
+		],
+		"the wrapper keeps only the line before its first child, so no row overlaps",
+	);
+	let overlapping = 0;
+	for (let i = 1; i < rows.length; i++) {
+		if (rows[i].startLine <= rows[i - 1].endLine) overlapping++;
+	}
+	assert.equal(overlapping, 0, "no overlapping rows survive");
+
+	// A row entirely inside a later row is dropped, not left contradicting it.
+	const shadowed = normalizeSections(
+		[
+			{ start_line: 1, end_line: 9, kind: "other", name: "outer", note: "" },
+			{ start_line: 1, end_line: 9, kind: "other", name: "same", note: "" },
+		],
+		100,
+	);
+	assert.deepEqual(shadowed.map((s) => s.name), ["same"], "the duplicate to be dropped is arbitrary");
 });
 
 await check("hasTopLevelShape separates repairable shape from repairable rows", async () => {
@@ -270,6 +321,79 @@ await check("the summary.model setting picks the summarizer, and model= override
 		if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
 		else process.env.PI_CODING_AGENT_DIR = previous;
 		rmSync(agent, { recursive: true, force: true });
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+await check("openDb sets busy_timeout before switching to WAL", async () => {
+	// Order matters here. Switching the journal mode needs an exclusive lock, and with the
+	// default zero timeout a competing process fails immediately with SQLITE_BUSY
+	// ("database is locked") instead of waiting. A probe with 12 concurrent writers lost a
+	// row in 4 of 6 runs before this ordering and 0 of 6 after.
+	const root = tempProject();
+	try {
+		const { db, dbPath } = openDb(root);
+		assert.equal(dbPath, join(root, ".pi", "summaries.db"));
+		assert.equal(db.prepare("PRAGMA busy_timeout").get().timeout, 3000, "timeout is in force");
+		assert.equal(db.prepare("PRAGMA journal_mode").get().journal_mode, "wal");
+		db.close();
+
+		const again = openDb(root);
+		assert.equal(again.firstTouch, false, "the path is remembered across opens");
+		assert.equal(again.db.prepare("PRAGMA busy_timeout").get().timeout, 3000);
+		again.db.close();
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+await check("concurrent writers to distinct paths all land in the cache", async () => {
+	// Each writer is its own child process, so busy_timeout is exercised for real rather
+	// than being satisfied by a single process's in-process lock. This is the end-to-end
+	// guard for the SQLITE_BUSY bug above.
+	const root = tempProject();
+	try {
+		const { spawn } = await import("node:child_process");
+		const storeUrl = new URL("./src/store.ts", import.meta.url).href;
+		const worker = [
+			`import { openDb, ensureSchema, writeSummary } from ${JSON.stringify(storeUrl)};`,
+			`const name = process.argv[2];`,
+			`try {`,
+			`  const { db } = openDb(${JSON.stringify(root)});`,
+			`  ensureSchema(db);`,
+			`  writeSummary(db, { path: name, absPath: "/x/" + name, fp: { hash: "h", lines: 5, bytes: 1, mtimeMs: 1 }, model: "m", mode: "mapped", overview: "o", sections: [{ seq: 0, startLine: 1, endLine: 5, kind: "other", name: "x", note: "" }] });`,
+			`  db.close();`,
+			`  console.log("ok");`,
+			`} catch (e) { console.log("err " + e.message); }`,
+		].join("\n");
+		writeFileSync(join(root, "w.mjs"), worker);
+
+		const results = await Promise.all(
+			Array.from(
+				{ length: 8 },
+				(_, i) =>
+					new Promise((resolve) => {
+						const p = spawn(process.execPath, [join(root, "w.mjs"), `f${i}.ts`], {
+							cwd: root,
+							stdio: ["ignore", "pipe", "pipe"],
+						});
+						let out = "";
+						p.stdout.on("data", (d) => (out += d));
+						p.on("close", () => resolve(out.trim()));
+					}),
+			),
+		);
+
+		assert.deepEqual(
+			results.filter((r) => r !== "ok"),
+			[],
+			"no writer is locked out",
+		);
+
+		const db = new DatabaseSync(join(root, ".pi", "summaries.db"));
+		assert.equal(db.prepare("SELECT COUNT(*) c FROM file_summary").get().c, 8, "every row arrived");
+		db.close();
+	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
 });
@@ -446,12 +570,7 @@ await check("a bad first answer is repaired into a good map without degrading", 
 			respond: (_context, _opts, n) =>
 				n === 1
 					? textResponse("Here is the summary you asked for!")
-					: jsonResponse({
-							overview: "Sync client.",
-							sections: [
-								{ start_line: 1, end_line: 20, kind: "function", name: "connect()", note: "dials" },
-							],
-						}),
+					: tilingAnswer("Sync client.")(_context),
 		});
 
 		const result = await runTool(h, "summary", { path: "src/a.ts" });
@@ -495,7 +614,7 @@ await check("a rejected JSON mode is retried without it, and stays within the ca
 			cwd: root,
 			// RouteAI-style provider that rejects response_format but answers fine without it.
 			respond: (_context, opts) =>
-				opts?.samplingParams ? errorResponse("response_format is not supported") : defaultAnswer(),
+				opts?.samplingParams ? errorResponse("response_format is not supported") : defaultAnswer(_context, opts),
 		});
 
 		const result = await runTool(h, "summary", { path: "src/a.ts" });
@@ -561,25 +680,34 @@ await check("an unreadable file is still a real error", async () => {
 	}
 });
 
-await check("a partial map marks the uncovered tail as unmapped", async () => {
+await check("an incomplete map is repaired into a complete one", async () => {
 	const root = tempProject();
 	try {
 		writeFileSync(join(root, "src", "a.ts"), numbered(400));
+		// A map that stops at line 100 of 401 - incomplete, so it costs one repair.
 		const h = makeHarness({
 			cwd: root,
-			respond: () =>
-				jsonResponse({
-					overview: "Partial.",
-					sections: [{ start_line: 1, end_line: 100, kind: "function", name: "a()", note: "" }],
-				}),
+			respond: (context, _opts, n) =>
+				n === 1
+					? jsonResponse({
+							overview: "Partial.",
+							sections: [{ start_line: 1, end_line: 100, kind: "function", name: "a()", note: "" }],
+						})
+					: tilingAnswer("Complete.", "function", "a()")(context),
 		});
 
 		const result = await runTool(h, "summary", { path: "src/a.ts" });
-		// numbered(400) is 400 lines plus a trailing newline, so read counts 401, like read does.
-		assert.equal(result.details.lines, 401);
-		assert.equal(result.details.coveredLines, 100);
-		assert.match(result.content[0].text, /mapped lines 1-100 of 401/);
-		assert.match(result.content[0].text, /101-\s*401\s+rest\s+\(not summarized\)/);
+		assert.equal(h.calls.length, 2, "the short map cost one repair");
+		assert.match(
+			h.calls[1].context.messages[2].content[0].text,
+			/must end at line 401/,
+			"the repair says exactly what was missing",
+		);
+		assert.equal(result.details.mode, "mapped");
+		assert.equal(result.details.degraded, false);
+		// The stored map reaches the file's last line, so there is no rest row.
+		assert.doesNotMatch(result.content[0].text, /rest\s+\(not summarized\)/);
+		assert.match(result.content[0].text, /1-\s*401\s+function/);
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
@@ -591,13 +719,13 @@ await check("a fenced answer parses without spending a repair", async () => {
 		writeFileSync(join(root, "src", "a.ts"), numbered(300));
 		const h = makeHarness({
 			cwd: root,
-			respond: () =>
+			respond: (context) =>
 				textResponse(
 					"```json\n" +
 						JSON.stringify({
 							overview: "Sync client.",
 							sections: [
-								{ start_line: 1, end_line: 20, kind: "function", name: "connect()", note: "dials" },
+								{ start_line: 1, end_line: lastShownLine(context), kind: "function", name: "connect()", note: "dials" },
 							],
 						}) +
 						"\n```",
@@ -613,17 +741,150 @@ await check("a fenced answer parses without spending a repair", async () => {
 	}
 });
 
-await check("a truncated file tells the model what it cannot see", async () => {
+await check("a whole file is sent, with no cap and no truncation language", async () => {
 	const root = tempProject();
 	try {
+		// Well past the old 4000-line cap: every line must still go in.
 		writeFileSync(join(root, "src", "huge.ts"), numbered(5000));
 		const h = makeHarness({ cwd: root });
 		await runTool(h, "summary", { path: "src/huge.ts" });
 
 		const prompt = h.calls[0].context.messages[0].content[0].text;
-		assert.match(prompt, /only the first 4000 lines/);
-		assert.match(prompt, /Map ONLY the lines you can see/);
-		assert.doesNotMatch(prompt, /line 5000\./, "must not claim to have seen the whole file");
+		// numbered(5000) is 5000 lines plus a trailing newline, so 5001 by read's counting.
+		assert.match(prompt, /The file is 5001 lines, and all of it is below/);
+		assert.match(prompt, /line 5001 is the last/);
+		assert.doesNotMatch(prompt, /continues past/, "nothing is held back");
+		assert.doesNotMatch(prompt, /unmapped/);
+
+		// The excerpt really does carry the final line. numbered(5000) ends with a newline, so
+		// line 5001 exists and is empty - the same counting `read` reports.
+		const excerpt = prompt.slice(prompt.indexOf("<file>"), prompt.indexOf("</file>"));
+		assert.match(excerpt, /5001\t\n/, "the last line is present");
+		assert.match(excerpt, /5000\tline 5000\n/);
+		assert.match(excerpt, / 1\tline 1\n/);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+await check("the excerpt is numbered so rows can be copied rather than counted", async () => {
+	const root = tempProject();
+	try {
+		writeFileSync(join(root, "src", "a.ts"), numbered(12));
+		const h = makeHarness({ cwd: root });
+		await runTool(h, "summary", { path: "src/a.ts" });
+
+		const prompt = h.calls[0].context.messages[0].content[0].text;
+		const excerpt = prompt.slice(prompt.indexOf("<file>"), prompt.indexOf("</file>"));
+		// Numbered, tab-separated, starting at 1 - not raw text.
+		assert.match(excerpt, /^<file>\n 1\tline 1\n 2\tline 2/m, "lines carry their numbers");
+		assert.match(prompt, /copy the number printed beside the/i);
+		assert.match(prompt, /do not count lines yourself or compute them from a pattern/i);
+
+		// The whole file is here, and the prompt says so.
+		assert.match(prompt, /The file is 13 lines/);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+await check("describeCoverageProblems catches gaps, overlaps, and an uncovered tail", async () => {
+	const ok = [
+		{ startLine: 1, endLine: 4, name: "a" },
+		{ startLine: 5, endLine: 9, name: "b" },
+	];
+	assert.deepEqual(describeCoverageProblems(ok, 9), [], "a complete map has no problems");
+
+	const gap = [
+		{ startLine: 1, endLine: 4, name: "a" },
+		{ startLine: 6, endLine: 9, name: "b" },
+	];
+	assert.equal(describeCoverageProblems(gap, 9).length, 1);
+	assert.match(describeCoverageProblems(gap, 9)[0], /meet with no gap/);
+
+	const overlap = [
+		{ startLine: 1, endLine: 6, name: "a" },
+		{ startLine: 5, endLine: 9, name: "b" },
+	];
+	assert.equal(describeCoverageProblems(overlap, 9).length, 1);
+
+	const lateStart = [{ startLine: 3, endLine: 9, name: "a" }];
+	assert.match(describeCoverageProblems(lateStart, 9)[0], /must start at line 1/);
+
+	// A map that stops short is incomplete, not merely partial: the cache holds one entry
+	// per file, so the missing tail can never be filled in without re-reading the file.
+	const shortTail = [
+		{ startLine: 1, endLine: 4, name: "a" },
+		{ startLine: 5, endLine: 7, name: "b" },
+	];
+	const problems = describeCoverageProblems(shortTail, 9);
+	assert.equal(problems.length, 1);
+	assert.match(problems[0], /must end at line 9/);
+});
+
+await check("a map that does not tile the excerpt is sent back once, then used", async () => {
+	const root = tempProject();
+	try {
+		writeFileSync(join(root, "src", "a.ts"), numbered(100));
+		// First answer leaves a gap (the drift signature); second answer is contiguous.
+		const h = makeHarness({
+			cwd: root,
+			respond: (_context, _opts, n) =>
+				n === 1
+					? jsonResponse({
+							overview: "Drifted.",
+							sections: [
+								{ start_line: 1, end_line: 20, kind: "import", name: "a" },
+								{ start_line: 60, end_line: 101, kind: "function", name: "b", note: "" },
+							],
+						})
+					: jsonResponse({
+							overview: "Fixed.",
+							sections: [
+								{ start_line: 1, end_line: 20, kind: "import", name: "a" },
+								{ start_line: 21, end_line: 101, kind: "function", name: "b" },
+							],
+						}),
+		});
+
+		const result = await runTool(h, "summary", { path: "src/a.ts" });
+		assert.equal(h.calls.length, 2, "the gap cost exactly one repair");
+		assert.match(
+			h.calls[1].context.messages[2].content[0].text,
+			/rows must meet with no gap and no overlap/,
+		);
+		assert.equal(result.details.attempts, 2);
+		assert.equal(result.details.mode, "mapped");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+await check("a map that still does not cover the file after the cap is kept as-is", async () => {
+	const root = tempProject();
+	try {
+		writeFileSync(join(root, "src", "a.ts"), numbered(500));
+		// Always leaves a gap between two rows: three attempts, then the rows are used.
+		const h = makeHarness({
+			cwd: root,
+			respond: () =>
+				jsonResponse({
+					overview: "Drifted.",
+					sections: [
+						{ start_line: 1, end_line: 40, kind: "class", name: "A" },
+						{ start_line: 60, end_line: 501, kind: "function", name: "B" },
+					],
+				}),
+		});
+
+		const result = await runTool(h, "summary", { path: "src/a.ts" });
+		assert.equal(h.calls.length, MAX_ATTEMPTS, "the cap holds");
+		assert.equal(result.details.mode, "mapped", "the rows are still better than nothing");
+		// Rows are rendered as stored. The gap between them is visible as a jump in the
+		// numbers, which is the honest signal that the map is not contiguous.
+		assert.doesNotMatch(result.content[0].text, /rest\s+\(not summarized\)/);
+		assert.match(result.content[0].text, /1-\s*40\s+class/);
+		assert.match(result.content[0].text, /60-\s*501\s+function/);
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
@@ -767,10 +1028,12 @@ await check("a cold oversized read is summarized by the guard and the map inline
 		writeFileSync(join(root, "src", "a.ts"), numbered(500));
 		const h = makeHarness({
 			cwd: root,
-			respond: () =>
+			respond: (context) =>
 				jsonResponse({
 					overview: "Sync client.",
-					sections: [{ start_line: 1, end_line: 40, kind: "class", name: "SyncClient", note: "" }],
+					sections: [
+						{ start_line: 1, end_line: lastShownLine(context), kind: "class", name: "SyncClient", note: "" },
+					],
 				}),
 		});
 
@@ -845,14 +1108,16 @@ await check("a fresh summary is inlined into the block reason", async () => {
 		writeFileSync(join(root, "src", "a.ts"), numbered(400));
 		const h = makeHarness({
 			cwd: root,
-			respond: () =>
-				jsonResponse({
+			respond: (context) => {
+				const last = lastShownLine(context);
+				return jsonResponse({
 					overview: "HTTP client for the sync layer.",
 					sections: [
 						{ start_line: 1, end_line: 60, kind: "class", name: "SyncClient", note: "transport" },
-						{ start_line: 61, end_line: 400, kind: "method", name: "retry()", note: "backoff" },
+						{ start_line: 61, end_line: last, kind: "method", name: "retry()", note: "backoff" },
 					],
-				}),
+				});
+			},
 		});
 
 		// A cold oversized read is answered with a map the guard generates itself.
@@ -883,7 +1148,9 @@ await check("the guard replaces a stale summary instead of quoting it", async ()
 			respond: (_context, _opts, n) =>
 				jsonResponse({
 					overview: `Generation ${n}.`,
-					sections: [{ start_line: 1, end_line: 400, kind: "other", name: "whole", note: "" }],
+					sections: [
+						{ start_line: 1, end_line: lastShownLine(_context), kind: "other", name: "whole", note: "" },
+					],
 				}),
 		});
 		await runTool(h, "summary", { path: "src/a.ts" });

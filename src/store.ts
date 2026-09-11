@@ -17,12 +17,15 @@ export type Section = {
 
 export type SummaryMode = "mapped" | "blob";
 
+/**
+ * One summary per file. A file is mapped whole or summarized as a blob; there is no
+ * partially mapped state, so `mode` alone says whether the rows mean anything.
+ */
 export type CachedSummary = {
 	path: string;
 	absPath: string;
 	hash: string;
 	lines: number;
-	coveredLines: number;
 	bytes: number;
 	mtimeMs: number;
 	model: string;
@@ -43,7 +46,6 @@ export type SummaryInput = {
 	mode: SummaryMode;
 	overview: string;
 	sections: Section[];
-	coveredLines: number;
 };
 
 const SCHEMA = `
@@ -52,7 +54,6 @@ CREATE TABLE IF NOT EXISTS file_summary (
   abs_path      TEXT NOT NULL,
   hash          TEXT NOT NULL,
   lines         INTEGER NOT NULL,
-  covered_lines INTEGER NOT NULL,
   bytes         INTEGER NOT NULL,
   mtime_ms      INTEGER NOT NULL,
   model         TEXT NOT NULL,
@@ -82,8 +83,12 @@ export function openDb(cwd: string): OpenResult {
 	const dbPath = resolveDbPath(cwd);
 	mkdirSync(dirname(dbPath), { recursive: true });
 	const db = new DatabaseSync(dbPath);
-	db.exec("PRAGMA journal_mode = WAL");
+	// busy_timeout FIRST: switching the journal mode requires an exclusive lock, so with the
+	// default zero timeout two processes starting at once make it fail immediately with
+	// SQLITE_BUSY ("database is locked") instead of waiting their turn. Setting the timeout
+	// afterwards leaves the one statement that needs it most unprotected.
 	db.exec("PRAGMA busy_timeout = 3000");
+	db.exec("PRAGMA journal_mode = WAL");
 	const firstTouch = !seenDbs.has(dbPath);
 	if (firstTouch) seenDbs.add(dbPath);
 	return { db, dbPath, firstTouch };
@@ -117,7 +122,6 @@ export function readSummary(db: DatabaseSync, path: string): CachedSummary | und
 		absPath: String(row.abs_path),
 		hash: String(row.hash),
 		lines: Number(row.lines),
-		coveredLines: Number(row.covered_lines),
 		bytes: Number(row.bytes),
 		mtimeMs: Number(row.mtime_ms),
 		model: String(row.model),
@@ -174,13 +178,12 @@ export function writeSummary(db: DatabaseSync, input: SummaryInput): void {
 	try {
 		db.prepare(
 			`INSERT INTO file_summary
-			   (path, abs_path, hash, lines, covered_lines, bytes, mtime_ms, model, mode, overview, created_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			   (path, abs_path, hash, lines, bytes, mtime_ms, model, mode, overview, created_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			 ON CONFLICT(path) DO UPDATE SET
 			   abs_path = excluded.abs_path,
 			   hash = excluded.hash,
 			   lines = excluded.lines,
-			   covered_lines = excluded.covered_lines,
 			   bytes = excluded.bytes,
 			   mtime_ms = excluded.mtime_ms,
 			   model = excluded.model,
@@ -192,7 +195,6 @@ export function writeSummary(db: DatabaseSync, input: SummaryInput): void {
 			input.absPath,
 			input.fp.hash,
 			input.fp.lines,
-			input.coveredLines,
 			input.fp.bytes,
 			input.fp.mtimeMs,
 			input.model,
