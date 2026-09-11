@@ -17,13 +17,14 @@ export function truncateChars(text: string, max: number): string {
 /**
  * Render the `## map` block from section rows.
  *
- * Rows are rendered exactly as stored. A map is complete or it is not a map: a partial one
- * is sent back to be finished before anything is written, so there is no uncovered tail to
- * append here and no region to invent. A blob entry has no rows, and the output says so
- * rather than fabricating a region that spans the file — the caller cannot tell an invented
- * row from a real one, so a fake row would be trusted and acted on.
+ * Rows are rendered exactly as stored, with unclaimed line ranges shown as `skipped` rows
+ * in place. Gaps are meaningful here: the summarizer is told to skip lines that do nothing,
+ * so a `skipped` row is how the caller learns which lines the model deliberately declined
+ * to map, instead of having to infer it from a jump in the numbers. A blob entry has no
+ * rows, and the output says so rather than fabricating a region that spans the file — the
+ * caller cannot tell an invented row from a real one, so a fake row would be trusted.
  */
-export function renderMap(sections: Section[]): string {
+export function renderMap(sections: Section[], totalLines: number): string {
 	if (sections.length === 0) {
 		return [
 			"## map",
@@ -32,13 +33,34 @@ export function renderMap(sections: Section[]): string {
 		].join("\n");
 	}
 
-	const rows = sections.map((s) => ({
-		start: s.startLine,
-		end: s.endLine,
-		kind: s.kind,
-		name: s.name,
-		note: s.note,
-	}));
+	type Row = { start: number; end: number; kind: string; name: string; note: string };
+
+	// Interleave the skipped ranges so every line is accounted for in the output, and a
+	// reader can see at a glance that a gap is deliberate.
+	const rows: Row[] = [];
+	let cursor = 1;
+	for (const s of sections) {
+		if (s.startLine > cursor) {
+			rows.push({
+				start: cursor,
+				end: s.startLine - 1,
+				kind: "skipped",
+				name: "(nothing to map)",
+				note: "",
+			});
+		}
+		rows.push({ start: s.startLine, end: s.endLine, kind: s.kind, name: s.name, note: s.note });
+		cursor = s.endLine + 1;
+	}
+	if (cursor <= totalLines) {
+		rows.push({
+			start: cursor,
+			end: totalLines,
+			kind: "skipped",
+			name: "(nothing to map)",
+			note: "",
+		});
+	}
 
 	const width = Math.max(...rows.map((r) => String(r.end).length), 4);
 	const kindWidth = Math.max(...rows.map((r) => r.kind.length), 4);
@@ -46,7 +68,7 @@ export function renderMap(sections: Section[]): string {
 		const range = `${String(r.start).padStart(width)}-${String(r.end).padStart(width)}`;
 		const kind = r.kind.padEnd(kindWidth);
 		const detail = r.note ? `${r.name} - ${r.note}` : r.name;
-		return `${range}  ${kind}  ${detail}`;
+		return `${range}  ${kind}  ${detail}`.trimEnd();
 	});
 	return `## map\n${lines.join("\n")}`;
 }
@@ -83,7 +105,7 @@ export function renderSummary(entry: CachedSummary, options: RenderOptions = {})
 
 	parts.push(entry.overview.trim());
 	parts.push("");
-	parts.push(renderMap(entry.sections));
+	parts.push(renderMap(entry.sections, entry.lines));
 	parts.push("");
 	parts.push(
 		entry.mode === "blob"

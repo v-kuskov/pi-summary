@@ -55,7 +55,6 @@ CREATE TABLE file_summary (
   abs_path      TEXT NOT NULL,     -- for change detection after cwd changes
   hash          TEXT NOT NULL,     -- sha256 of contents, first 16 hex chars
   lines         INTEGER NOT NULL,  -- line count at summarize time (drives the guard)
-  covered_lines INTEGER NOT NULL,  -- how far the map reaches; < lines means partial
   bytes         INTEGER NOT NULL,
   mtime_ms      INTEGER NOT NULL,
   model         TEXT NOT NULL,     -- "deepseek/deepseek-v4-flash"
@@ -81,9 +80,10 @@ its rows in `file_section`, and the map text is rendered from those rows on ever
 One source of truth, so the prose and the map cannot disagree; a cache hit is two
 SELECTs and a string join.
 
-`F1a` `covered_lines` records how far the map reaches. It is below `lines` only when the
-file was too big to send whole, and it is what stops the tool from implying it mapped
-code it never saw.
+`F1a` There is no `covered_lines` column. A summary is `overview` plus rows, and rows may
+leave gaps where the model judged lines to be dead. The whole file is always sent (`S6`),
+so there is no "how far did it get" figure to record, and a gap is visible in the rendered
+map as a `skipped` row rather than as a number nobody checks.
 
 `F2` `file_section` is derived: it is written only in the same transaction as
 `file_summary`, and is only consulted for paths whose stored `hash` still matches the
@@ -115,19 +115,27 @@ model: deepseek/deepseek-v4-flash
 
 ## map
    1-  24  import   node/fs, node/path; module constants
-  25- 140  class    FooClient - HTTP transport with retry
+  25-  25  skipped  (nothing to map)
+  26- 140  class    FooClient - HTTP transport with retry
  141- 620  method   FooClient.request() - builds, signs, sends
  621-1420  method   FooClient.retry() - backoff and jitter
 
-# read src/foo.ts with offset/limit inside one range (max 200 lines per call).
+# read src/foo.ts with offset/limit inside one range above (max 200 lines per call).
 ```
 
 `cache:` reads `fresh` (served from cache), `miss` (nothing was cached), `forced`
 (explicit refresh), or `stale` (the file changed and was re-summarized).
 
-A file larger than the summarizer's input window is truncated before sending, and the
-map says so with a `rest (not summarized)` row covering the tail, so a range is never
-implied to have been seen when it was not.
+Unclaimed line ranges are rendered as `skipped` rows, so the map accounts for every line
+of the file. A gap means the summarizer judged those lines to do nothing — blank lines, a
+license header, generated boilerplate — which is what the prompt asks for (`S2`). Rendering
+the gap explicitly means the caller does not have to notice a jump in the numbers to know a
+range is unmapped.
+
+`O1` The map is rendered as text, never as JSON. The model's JSON is validated and stored,
+then re-rendered into this form on every read; the JSON never reaches the model. Rows are
+`start-end  kind  name - note`, numbers right-aligned, so the ranges line up for scanning
+without the model having to parse anything.
 
 ## 7. The `read` guard
 
@@ -213,10 +221,23 @@ contract in prose and the answer is validated locally against a flat schema whos
 exactly what the database stores:
 
 ```ts
-{ overview: string,
+{ overview: string,   // up to 10 sentences
   sections: Array<{ start_line: integer, end_line: integer,
-                    kind: enum, name: string, note: string }> }
+                    kind: enum, name: string, note: string }>  // note: up to 2 sentences / 200 chars }
 ```
+
+The excerpt is **line-numbered** — every line is prefixed with its own number in a fixed
+width column — and the prompt tells the model to copy numbers out of that column rather
+than count lines. This is the fix for the one measured failure mode: with raw unnumbered
+text, `qwen3.8-flash` extrapolated a spacing rule and drifted a mean of 24 lines (max 68)
+on a 1396-line file, while `deepseek-v4.1-flash` counted accurately. Numbering turns a
+counting task into a copying task. See `S6`.
+
+`sections` may **leave gaps**: the prompt asks the model to skip runs of lines that do
+nothing (blank lines, license headers, generated boilerplate) rather than invent a region
+to cover them. Rows must not overlap; overlaps are trimmed locally (`E2`). Notes and the
+overview are cut at `MAX_NOTE_CHARS = 200` and `MAX_OVERVIEW_CHARS = 2400` on the way into
+storage, so one runaway field cannot crowd the map out of a read-block reason.
 
 No `tools` array is sent to the summarizer, and it is never given tools to call. JSON mode
 is attempted opportunistically through `samplingParams:{response_format:{type:"json_object"}}`,
@@ -243,18 +264,34 @@ nothing to accept locally and is not worth a model call to fix.
 
 `E2` The payload must have `overview: string` and `sections: array` (`hasTopLevelShape`).
 Anything else is malformed and triggers a repair. Rows inside a well-shaped payload are
-**normalized, not rejected**: line ranges are clamped to the lines actually shown,
-reversed ranges collapse to one line, `kind` is lowercased, and rows with a non-numeric or
-out-of-range start are dropped. Spending a model call to correct arithmetic is a worse
-trade than clamping it.
+**normalized, not rejected**: line ranges are clamped to the file's length, reversed ranges
+collapse to one line, `kind` is lowercased, rows with a non-numeric or out-of-range start
+are dropped, and **overlapping rows are trimmed** so the earlier row ends one line before
+the later one begins (a container row emitted alongside its contents is cut back to the
+lines before its first child; a fully shadowed row is dropped). Spending a model call to
+correct arithmetic is a worse trade than clamping it, and the trim is deterministic —
+verified by test that an overlapping answer still costs exactly one call. Notes over
+`MAX_NOTE_CHARS` are cut at a word boundary with an ellipsis.
+
+Gaps are **preserved, never filled**. A jump in the line numbers is the model declining to
+map dead lines, which is what the prompt asks for; filling it would invent a region and
+reporting it would spend a repair call asking the model to map blank lines it was told to
+skip.
 
 `E3` **A valid envelope that normalizes to zero rows is accepted as a blob immediately.**
 An empty `sections` array is the model's answer, not a mistake, so it is not argued with.
 
-`E4` **Repair.** On malformed output the model's own answer is resent as its turn, followed
-by the specific violations from typebox (`/sections/0/start_line: Expected integer`).
-This is a fix-up loop over a single prompt — the summarizer never chooses what to do next
-and is never given tools.
+`E4` **Repair fires only on malformed output** — an answer that is not JSON, or that is JSON
+without `overview: string` and `sections: array`. The model's own answer is resent as its
+turn, followed by the specific violations from typebox
+(`/sections/0/start_line Expected integer`). This is a fix-up loop over a single prompt —
+the summarizer never chooses what to do next and is never given tools.
+
+**Nothing validates the map's content.** Structure and schema are checked; correctness is
+not. A contiguous, well-formed map can still name the wrong lines — measured directly:
+`qwen3.8-flash` produced a perfectly contiguous map with zero gaps and zero overlaps that
+drifted a mean of 24 lines. `S2`'s numbering addresses the cause, but no local check
+detects a drift, because the only thing that can is comparing against the source.
 
 `E5` **The loop is bounded at `MAX_ATTEMPTS = 3`** total model calls: one plus at most two
 repairs. The extension's cost filter promises a single call per file, so the ceiling is
@@ -269,6 +306,13 @@ answer — and stored with **zero section rows** and `mode = 'blob'`.
 model's fault. A rejected `response_format` is retried once without it; a persistent
 provider error fails the tool call rather than storing garbage. The retry consumes an
 attempt so the ceiling holds even when a provider rejects JSON mode every time.
+
+`S6` **The whole file is sent, with no line or byte cap.** An earlier version capped the
+excerpt at 4000 lines / 160 KB and sent raw text; both are gone. The summarizer models in
+use have a 1M-token context, and a partial map is close to useless — the cache holds one
+entry per file, so a tail left unmapped can never be filled in without re-reading the file
+anyway. A file too large for the configured model's context is rejected by the provider,
+which surfaces as an ordinary summarizer error (`G`).
 
 `S4` Blob is a deliberate degradation, not a fabricated map. An earlier draft wrote one
 section spanning the whole file when parsing failed; that is worse than no map, because
@@ -325,3 +369,31 @@ read at all stays a hard error, because a fallback there would mean returning an
 body and hiding the real problem. The same rule applies to a bad `model` argument: it is a
 caller mistake, the file is still readable, so the model gets the file and the mistake is
 shown.
+
+`D9` The whole file is sent to the summarizer, with no line or byte cap. The models in use
+have a 1M-token context, and the cache holds one entry per file, so a partially mapped file
+could never be completed without re-reading it. The earlier 4000-line / 160 KB cap and its
+`rest (not summarized)` row are gone.
+
+`D10` Gaps in the map are legal and meaningful. The prompt asks the model to skip lines
+that do nothing; the validator no longer reports them; the renderer shows them as `skipped`
+rows. The earlier "rows must tile the file" rule was replaced because it spent model calls
+asking the model to map blank lines it had been told to skip.
+
+`D11` `overview` may run to about ten sentences and a note to two sentences / 200
+characters — deliberately looser than the original one-to-three-sentence overview and
+90-character note, which were too tight to say anything about how a region is used. Both
+are cut on the way into storage (`MAX_OVERVIEW_CHARS = 2400`, `MAX_NOTE_CHARS = 200`) so a
+single runaway field cannot crowd the map out of the read-block reason.
+
+`D12` The excerpt is line-numbered and the prompt says to copy numbers out of the left
+column rather than count lines. This is the response to a measured failure: given raw
+unnumbered text, `qwen3.8-flash` invented a spacing rule and drifted a mean of 24 lines on
+a 1396-line file, while `deepseek-v4.1-flash` counted accurately. Numbering converts a
+counting task into a copying task.
+
+`D13` The two `PRAGMA` statements in `openDb` are ordered `busy_timeout` before
+`journal_mode`, and the order is load-bearing. Switching journal mode takes an exclusive
+lock; with the default zero timeout a second process opening the same cache fails
+immediately with `SQLITE_BUSY` instead of waiting. Measured with 12 concurrent writers:
+the original order lost a row in 4 of 6 runs, the corrected order in 0 of 6.

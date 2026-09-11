@@ -18,6 +18,12 @@ export const SECTION_KINDS = [
 	"other",
 ] as const;
 
+/** Longest a note may be before it is cut. Two sentences, matching the prompt. */
+export const MAX_NOTE_CHARS = 200;
+
+/** Longest an overview may be before it is cut. Ten sentences, matching the prompt. */
+export const MAX_OVERVIEW_CHARS = 2400;
+
 /**
  * The shape the model must return, and the shape the database stores.
  *
@@ -29,7 +35,7 @@ export const SECTION_KINDS = [
 export const emitSummarySchema = Type.Object({
 	overview: Type.String({
 		description:
-			"One to three sentences: what this file does, and what its main exports are for.",
+			"Up to ten sentences: what the file is for, its main exports and how they relate, and what a reader must know before changing it.",
 	}),
 	sections: Type.Array(
 		Type.Object({
@@ -39,11 +45,14 @@ export const emitSummarySchema = Type.Object({
 			name: Type.String({
 				description: "Declaration or symbol name; use (top level) for loose statements.",
 			}),
-			note: Type.String({ description: "At most 90 characters on what the region does." }),
+			note: Type.String({
+				description:
+					"Up to two sentences on what the region does, including a side effect or invariant a reader needs before editing it.",
+			}),
 		}),
 		{
 			description:
-				"Contiguous regions covering the file in order, with no gaps and no overlaps.",
+				"Regions in line order. They must not overlap, and they may leave gaps where lines do nothing.",
 		},
 	),
 });
@@ -83,6 +92,13 @@ export function describeSchemaErrors(value: unknown): string[] {
 	return errors;
 }
 
+export function truncateNote(note: string, max = MAX_NOTE_CHARS): string {
+	if (note.length <= max) return note;
+	const cut = note.slice(0, max);
+	const lastSpace = cut.lastIndexOf(" ");
+	return `${lastSpace > 0 ? cut.slice(0, lastSpace) : cut}…`;
+}
+
 /**
  * Clamp, dedupe, and sort the model's rows into storable sections.
  *
@@ -91,11 +107,15 @@ export function describeSchemaErrors(value: unknown): string[] {
  * model call to correct arithmetic is a worse trade than clamping it. Rows that cannot be
  * repaired — non-numeric, before line 1, starting past what was shown — are dropped.
  *
- * Overlapping rows are trimmed to the unclaimed lines after them. A model asked for
- * tiling sometimes emits a container row (`1-24 comment`) alongside its contents
+ * Overlapping rows are trimmed to the unclaimed lines after them. A model asked for a
+ * complete map sometimes emits a container row (`1-24 comment`) alongside its contents
  * (`4-23 Widget1`), and both cannot be true; keeping the later row's start and cutting the
  * earlier row short is the reading that preserves the innermost, most specific region. Let
  * through unmodified, such rows render as a map that contradicts itself.
+ *
+ * Gaps are preserved, never filled. The prompt tells the model to skip lines that do
+ * nothing, so a jump in the line numbers is its answer rather than an error, and the
+ * renderer marks the skipped ranges explicitly.
  *
  * Returns undefined when nothing usable survives, which is the caller's signal to treat
  * the answer as a blob rather than as a map.
@@ -120,7 +140,9 @@ export function normalizeSections(raw: unknown, shownLines: number): Section[] |
 			endLine: Math.max(Math.min(endLine, shownLines), startLine),
 			kind: String(row.kind ?? "other").trim().toLowerCase() || "other",
 			name: String(row.name ?? "").trim() || "(unnamed)",
-			note: String(row.note ?? "").trim(),
+			// A runaway note is cut rather than trusted: one unbounded note can outweigh every
+			// other row in a map and crowd out the read-block reason.
+			note: truncateNote(String(row.note ?? "").trim()),
 		});
 	}
 

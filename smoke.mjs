@@ -9,8 +9,9 @@ import { countLinesFrom } from "./src/hash.ts";
 import { MAX_ATTEMPTS } from "./src/summarize.ts";
 import { openDb } from "./src/store.ts";
 import { readSummarySettings } from "./src/settings.ts";
-import { extractOverview, parseJsonAnswer, describeCoverageProblems } from "./src/prompt.ts";
-import { hasTopLevelShape, normalizeSections } from "./src/schema.ts";
+import { extractOverview, parseJsonAnswer } from "./src/prompt.ts";
+import { hasTopLevelShape, normalizeSections, MAX_NOTE_CHARS } from "./src/schema.ts";
+import { renderMap } from "./src/render.ts";
 
 let failures = 0;
 let passed = 0;
@@ -680,34 +681,28 @@ await check("an unreadable file is still a real error", async () => {
 	}
 });
 
-await check("an incomplete map is repaired into a complete one", async () => {
+await check("a map with a gap is accepted without spending a repair", async () => {
 	const root = tempProject();
 	try {
 		writeFileSync(join(root, "src", "a.ts"), numbered(400));
-		// A map that stops at line 100 of 401 - incomplete, so it costs one repair.
+		// Lines 101-400 are left out. Under the old contract that cost a repair; gaps are now
+		// the model declining to map dead lines, so it is accepted as-is.
 		const h = makeHarness({
 			cwd: root,
-			respond: (context, _opts, n) =>
-				n === 1
-					? jsonResponse({
-							overview: "Partial.",
-							sections: [{ start_line: 1, end_line: 100, kind: "function", name: "a()", note: "" }],
-						})
-					: tilingAnswer("Complete.", "function", "a()")(context),
+			respond: () =>
+				jsonResponse({
+					overview: "Skips the generated tail.",
+					sections: [{ start_line: 1, end_line: 100, kind: "function", name: "a()", note: "" }],
+				}),
 		});
 
 		const result = await runTool(h, "summary", { path: "src/a.ts" });
-		assert.equal(h.calls.length, 2, "the short map cost one repair");
-		assert.match(
-			h.calls[1].context.messages[2].content[0].text,
-			/must end at line 401/,
-			"the repair says exactly what was missing",
-		);
+		assert.equal(h.calls.length, 1, "a gap is not worth a model call");
 		assert.equal(result.details.mode, "mapped");
 		assert.equal(result.details.degraded, false);
-		// The stored map reaches the file's last line, so there is no rest row.
-		assert.doesNotMatch(result.content[0].text, /rest\s+\(not summarized\)/);
-		assert.match(result.content[0].text, /1-\s*401\s+function/);
+		assert.equal(result.details.attempts, 1);
+		// The unclaimed lines are shown as skipped, not silently dropped.
+		assert.match(result.content[0].text, /101-\s*401\s+skipped/);
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
@@ -754,7 +749,7 @@ await check("a whole file is sent, with no cap and no truncation language", asyn
 		assert.match(prompt, /The file is 5001 lines, and all of it is below/);
 		assert.match(prompt, /line 5001 is the last/);
 		assert.doesNotMatch(prompt, /continues past/, "nothing is held back");
-		assert.doesNotMatch(prompt, /unmapped/);
+		assert.doesNotMatch(prompt, /left unmapped/, "no line was held back from the model");
 
 		// The excerpt really does carry the final line. numbered(5000) ends with a newline, so
 		// line 5001 exists and is empty - the same counting `read` reports.
@@ -788,103 +783,101 @@ await check("the excerpt is numbered so rows can be copied rather than counted",
 	}
 });
 
-await check("describeCoverageProblems catches gaps, overlaps, and an uncovered tail", async () => {
-	const ok = [
-		{ startLine: 1, endLine: 4, name: "a" },
-		{ startLine: 5, endLine: 9, name: "b" },
-	];
-	assert.deepEqual(describeCoverageProblems(ok, 9), [], "a complete map has no problems");
+await check("gaps survive storage and render as explicit skipped rows", async () => {
+	// The map accounts for every line in the output, so a deliberate gap shows as
+	// `skipped` rather than as a jump in the numbers the reader has to notice.
+	const rows = normalizeSections(
+		[
+			{ start_line: 1, end_line: 3, kind: "import", name: "a", note: "" },
+			{ start_line: 7, end_line: 9, kind: "function", name: "b", note: "" },
+		],
+		12,
+	);
+	assert.deepEqual(
+		rows.map((s) => [s.startLine, s.endLine]),
+		[
+			[1, 3],
+			[7, 9],
+		],
+		"the gap between 4 and 6 is preserved, not filled",
+	);
 
-	const gap = [
-		{ startLine: 1, endLine: 4, name: "a" },
-		{ startLine: 6, endLine: 9, name: "b" },
-	];
-	assert.equal(describeCoverageProblems(gap, 9).length, 1);
-	assert.match(describeCoverageProblems(gap, 9)[0], /meet with no gap/);
-
-	const overlap = [
-		{ startLine: 1, endLine: 6, name: "a" },
-		{ startLine: 5, endLine: 9, name: "b" },
-	];
-	assert.equal(describeCoverageProblems(overlap, 9).length, 1);
-
-	const lateStart = [{ startLine: 3, endLine: 9, name: "a" }];
-	assert.match(describeCoverageProblems(lateStart, 9)[0], /must start at line 1/);
-
-	// A map that stops short is incomplete, not merely partial: the cache holds one entry
-	// per file, so the missing tail can never be filled in without re-reading the file.
-	const shortTail = [
-		{ startLine: 1, endLine: 4, name: "a" },
-		{ startLine: 5, endLine: 7, name: "b" },
-	];
-	const problems = describeCoverageProblems(shortTail, 9);
-	assert.equal(problems.length, 1);
-	assert.match(problems[0], /must end at line 9/);
+	const map = renderMap(rows, 12);
+	assert.match(map, /^\s*4-\s*6\s+skipped/m, "the interior gap is shown");
+	assert.match(map, /^\s*10-\s*12\s+skipped/m, "the unclaimed tail is shown");
+	assert.match(map, /1-\s*3\s+import/, "real rows still render");
 });
 
-await check("a map that does not tile the excerpt is sent back once, then used", async () => {
+await check("a runaway note is cut to the stated budget", async () => {
+	const longNote = Array.from({ length: 80 }, (_, i) => `word${i}`).join(" ");
+	const rows = normalizeSections(
+		[{ start_line: 1, end_line: 5, kind: "function", name: "a", note: longNote }],
+		5,
+	);
+	assert.ok(rows[0].note.length <= MAX_NOTE_CHARS + 1, "note is cut");
+	assert.ok(rows[0].note.endsWith("…"), "the cut is marked");
+	assert.doesNotMatch(rows[0].note, /word79/, "the tail is gone");
+
+	const short = normalizeSections(
+		[{ start_line: 1, end_line: 5, kind: "function", name: "a", note: "short" }],
+		5,
+	);
+	assert.equal(short[0].note, "short", "a note inside the budget is untouched");
+});
+
+await check("overlapping rows are trimmed locally, without spending a repair", async () => {
 	const root = tempProject();
 	try {
 		writeFileSync(join(root, "src", "a.ts"), numbered(100));
-		// First answer leaves a gap (the drift signature); second answer is contiguous.
-		const h = makeHarness({
-			cwd: root,
-			respond: (_context, _opts, n) =>
-				n === 1
-					? jsonResponse({
-							overview: "Drifted.",
-							sections: [
-								{ start_line: 1, end_line: 20, kind: "import", name: "a" },
-								{ start_line: 60, end_line: 101, kind: "function", name: "b", note: "" },
-							],
-						})
-					: jsonResponse({
-							overview: "Fixed.",
-							sections: [
-								{ start_line: 1, end_line: 20, kind: "import", name: "a" },
-								{ start_line: 21, end_line: 101, kind: "function", name: "b" },
-							],
-						}),
-		});
-
-		const result = await runTool(h, "summary", { path: "src/a.ts" });
-		assert.equal(h.calls.length, 2, "the gap cost exactly one repair");
-		assert.match(
-			h.calls[1].context.messages[2].content[0].text,
-			/rows must meet with no gap and no overlap/,
-		);
-		assert.equal(result.details.attempts, 2);
-		assert.equal(result.details.mode, "mapped");
-	} finally {
-		rmSync(root, { recursive: true, force: true });
-	}
-});
-
-await check("a map that still does not cover the file after the cap is kept as-is", async () => {
-	const root = tempProject();
-	try {
-		writeFileSync(join(root, "src", "a.ts"), numbered(500));
-		// Always leaves a gap between two rows: three attempts, then the rows are used.
+		// Two rows claim lines 40-60. The trim is deterministic, so paying a model call to
+		// correct arithmetic the code already fixes would contradict the cost discipline.
 		const h = makeHarness({
 			cwd: root,
 			respond: () =>
 				jsonResponse({
-					overview: "Drifted.",
+					overview: "Overlapped.",
 					sections: [
-						{ start_line: 1, end_line: 40, kind: "class", name: "A" },
-						{ start_line: 60, end_line: 501, kind: "function", name: "B" },
+						{ start_line: 1, end_line: 60, kind: "class", name: "a" },
+						{ start_line: 40, end_line: 101, kind: "function", name: "b", note: "" },
 					],
 				}),
 		});
 
 		const result = await runTool(h, "summary", { path: "src/a.ts" });
-		assert.equal(h.calls.length, MAX_ATTEMPTS, "the cap holds");
-		assert.equal(result.details.mode, "mapped", "the rows are still better than nothing");
-		// Rows are rendered as stored. The gap between them is visible as a jump in the
-		// numbers, which is the honest signal that the map is not contiguous.
-		assert.doesNotMatch(result.content[0].text, /rest\s+\(not summarized\)/);
-		assert.match(result.content[0].text, /1-\s*40\s+class/);
-		assert.match(result.content[0].text, /60-\s*501\s+function/);
+		assert.equal(h.calls.length, 1, "a fixable overlap is not worth a model call");
+		assert.equal(result.details.mode, "mapped");
+		assert.equal(result.details.attempts, 1);
+		// The earlier row is cut to the line before its child begins.
+		assert.match(result.content[0].text, /1-\s*39\s+class/);
+		assert.match(result.content[0].text, /40-\s*101\s+function/);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+await check("no stored map can contain overlapping rows, however the model answers", async () => {
+	const root = tempProject();
+	try {
+		writeFileSync(join(root, "src", "a.ts"), numbered(500));
+		const h = makeHarness({
+			cwd: root,
+			respond: () =>
+				jsonResponse({
+					overview: "Always overlaps.",
+					sections: [
+						{ start_line: 1, end_line: 100, kind: "class", name: "A" },
+						{ start_line: 60, end_line: 200, kind: "function", name: "B" },
+					],
+				}),
+		});
+
+		const result = await runTool(h, "summary", { path: "src/a.ts" });
+		assert.equal(h.calls.length, 1, "one call: the overlap is not a repair problem");
+		assert.equal(result.details.mode, "mapped");
+		assert.equal(result.details.sections, 2);
+		assert.match(result.content[0].text, /1-\s*59\s+class/);
+		assert.match(result.content[0].text, /60-\s*200\s+function/);
+		assert.match(result.content[0].text, /201-\s*501\s+skipped/);
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}

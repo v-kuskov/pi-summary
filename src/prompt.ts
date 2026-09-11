@@ -78,18 +78,18 @@ export function buildSummarizePrompt(path: string, file: PreparedFile): string {
 		"JSON shape:",
 		'  { "overview": string, "sections": [ { "start_line": number, "end_line": number, "kind": string, "name": string, "note": string } ] }',
 		"",
-		"overview: one to three sentences, plain prose. It must stand alone - it is shown without the map when there is no room for both.",
-		"sections: one row per region, ordered by line, covering the whole file: the first row starts at line 1, each row starts on the line after the previous row ends, and the last row ends at line " +
-			`${file.totalLines}. Every line belongs to exactly one row, so there are no gaps and no overlaps.`,
-		"  A row starts on the line where its declaration begins.",
+		"overview: up to ten sentences of plain prose, and it must stand alone - it is shown without the map when there is no room for both. Say what the file is for, what its main exports are and how they relate, and anything a reader must know before changing it. Skip line numbers and restating the map.",
+		"sections: one row per region that does something, in line order. Rows must not overlap.",
+		"  A row starts on the line where its declaration begins and ends on its last line.",
+		"  Leave gaps between rows where nothing happens, such as runs of blank lines, long license headers, and generated boilerplate. A gap is the answer 'these lines are not worth mapping', so skip them rather than inventing a region to cover them. Skipped lines are shown to the caller as 'skipped', so a gap costs nothing and reads correctly.",
 		"  start_line / end_line: integers copied from the left column, inclusive.",
 		`  kind: one of ${SECTION_KINDS.join(", ")}.`,
 		"  name: the declaration or symbol name, or (top level) for loose statements.",
-		"  note: at most 90 characters on what that row does.",
+		"  note: up to two sentences, or about 200 characters. This is the only place detail lives - the caller reads the map and then a single range, so say what the region does and any side effect or invariant that matters when editing it. Do not pad a trivia row to fill the budget.",
 		"",
-		"One row per top-level declaration. A run of adjacent one-line declarations of the same",
-		"kind is one row; a class or function is one row covering its whole body. Blank lines go",
-		"to the row before them.",
+		"Map only lines that do something. A run of adjacent one-line declarations of the same",
+		"kind is one row; a class or function is one row covering its whole body. Do not merge",
+		"unrelated regions to avoid a gap, and do not add a row for lines that do nothing.",
 		"",
 		"Example. An 8-line file and its correct rows:",
 		"",
@@ -102,14 +102,14 @@ export function buildSummarizePrompt(path: string, file: PreparedFile): string {
 		`     7${GUTTER}}`,
 		`     8${GUTTER}`,
 		"",
-		'{"overview":"Reads files and clamps numbers to a limit. Exports clamp, which caps a value at LIMIT.","sections":[',
-		'{"start_line":1,"end_line":2,"kind":"import","name":"node/fs/promises","note":"imported for readFile, used by callers of this module"},',
-		'{"start_line":3,"end_line":4,"kind":"const","name":"LIMIT","note":"caps every value clamp returns"},',
-		'{"start_line":5,"end_line":8,"kind":"function","name":"clamp()","note":"returns the smaller of n and LIMIT"}]}',
+		'{"overview":"Reads files and clamps numbers to a limit. Exports clamp, which caps a value at LIMIT; callers use it to keep pagination sizes inside the API limit. The module has no side effects, so importing it is free.","sections":[',
+		'{"start_line":1,"end_line":1,"kind":"import","name":"node/fs/promises","note":"Imported for readFile, though nothing in this file calls it - an unused import."},',
+		'{"start_line":3,"end_line":3,"kind":"const","name":"LIMIT","note":"The cap clamp applies. Lowering it silently changes every caller that relies on the default page size."},',
+		'{"start_line":5,"end_line":7,"kind":"function","name":"clamp()","note":"Returns min of n and LIMIT. Pure, and safe to call in a hot loop."}]}',
 		"",
-		"The three rows above cover the whole 8-line file: row 1 starts at 1 and ends at 2, row 2 starts at 3 and ends at 4, row 3 starts at 5 and ends at line 8. Each number was copied out of the left column.",
+		"The three rows above leave lines 2, 4, and 8 unmapped on purpose: they are blank, so there is nothing to say about them. Each number was copied out of the left column.",
 		"",
-		"Now map the file below the same way, covering all of it.",
+		"Now map the file below the same way.",
 		"",
 		"<file>",
 		file.text,
@@ -127,50 +127,10 @@ export function buildRepairPrompt(problems: string[]): string {
 		"",
 		"Reply with the corrected JSON object only. No prose, no markdown fence.",
 		"Re-read the numbers in the left column of the excerpt and copy them, rather than adjusting them by hand.",
+		"Rows may leave gaps for lines that do nothing; what they must not do is overlap each other.",
 	].join("\n");
 }
 
-/**
- * Check that the rows cover the whole file with no gap and no overlap.
- *
- * Coverage is the one property of a map that can be checked without the source, and every
- * complete map has it. A break means either the model worked from a pattern instead of
- * copying the numbers, or it stopped short - and since the cache holds one entry per file,
- * a partial map can never be completed without re-reading the file, so it is worth one
- * repair call to ask for the whole thing.
- *
- * Violations are returned as text for the repair prompt.
- */
-export function describeCoverageProblems(
-	sections: Array<{ startLine: number; endLine: number; name: string }>,
-	totalLines: number,
-): string[] {
-	const problems: string[] = [];
-
-	const first = sections[0]!;
-	if (first.startLine !== 1) {
-		problems.push(`the first row starts at line ${first.startLine}; it must start at line 1`);
-	}
-
-	for (let i = 1; i < sections.length; i++) {
-		const previous = sections[i - 1]!;
-		const current = sections[i]!;
-		if (current.startLine !== previous.endLine + 1) {
-			problems.push(
-				`row "${current.name}" starts at line ${current.startLine} but the row before it ends at line ${previous.endLine}; rows must meet with no gap and no overlap`,
-			);
-		}
-	}
-
-	const last = sections[sections.length - 1]!;
-	if (last.endLine !== totalLines) {
-		problems.push(
-			`the last row ends at line ${last.endLine}; it must end at line ${totalLines}, the last line of the file`,
-		);
-	}
-
-	return problems.slice(0, 5);
-}
 
 /**
  * Parse an answer that is supposed to be JSON.

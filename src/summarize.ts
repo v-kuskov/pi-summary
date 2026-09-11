@@ -6,7 +6,6 @@ import {
 	type PreparedFile,
 	buildRepairPrompt,
 	buildSummarizePrompt,
-	describeCoverageProblems,
 	extractOverview,
 	modelLabel,
 	parseJsonAnswer,
@@ -16,6 +15,7 @@ import {
 	type EmitSummary,
 	describeSchemaErrors,
 	hasTopLevelShape,
+	MAX_OVERVIEW_CHARS,
 	normalizeSections,
 } from "./schema.ts";
 import {
@@ -190,7 +190,6 @@ async function requestSummary(
 			{ messages: messages as never },
 			jsonMode ? { ...base, samplingParams: { response_format: { type: "json_object" } } } : base,
 		);
-
 		if (isProviderError(response)) {
 			if (jsonMode) {
 				// Drop the override and try this same step again. Counted as an attempt so the
@@ -210,42 +209,35 @@ async function requestSummary(
 		const parsed = parseJsonAnswer(lastText);
 		if (parsed !== undefined && hasTopLevelShape(parsed)) {
 			const value = parsed as EmitSummary;
+			// Overlapping rows are trimmed here rather than reported back to the model. The trim
+			// is deterministic, and spending a model call to fix arithmetic the code already
+			// fixes for free contradicts the cost discipline. Gaps are left alone: they are the
+			// model declining to map dead lines, and the renderer shows them as skipped.
 			const sections = normalizeSections(value.sections, prepared.totalLines);
-			// A valid envelope with no usable rows is still a blob: there is no map to show,
-			// and inventing a single file-spanning region would be indistinguishable from a
-			// real one.
 			if (sections) {
-				// The excerpt is numbered, so a complete map covers every line exactly once: first
-				// row at line 1, each row starting where the last ended, last row on the final line.
-				// A break means the model worked from a pattern instead of copying the numbers, or
-				// stopped short - either way the boundaries are not trustworthy until it is fixed.
-				const gaps = describeCoverageProblems(sections, prepared.totalLines);
-				if (gaps.length === 0 || attempt >= MAX_ATTEMPTS) {
-					return {
-						overview: value.overview.trim() || "(no overview provided)",
-						sections,
-						mode: "mapped",
-						usage: response.usage,
-						attempts: attempt,
-					};
-				}
-				problems = gaps;
-			} else if (value.sections.length === 0) {
-				// An explicitly empty `sections` is an answer, not a mistake: the model is saying
-				// the file has no map. Accept it as a blob rather than spending calls arguing.
 				return {
-					overview: value.overview.trim() || "(no overview provided)",
-					sections: [],
-					mode: "blob",
+					overview: truncateOverview(value.overview.trim() || "(no overview provided)"),
+					sections,
+					mode: "mapped",
 					usage: response.usage,
 					attempts: attempt,
 				};
-			} else {
-				problems = ["\"sections\" contained no usable region"];
 			}
-		} else {
-			problems = describeProblems(parsed);
+
+			// A valid envelope with no usable rows is a blob: there is no map to show, and
+			// inventing a single file-spanning region would be indistinguishable from a real one.
+			// An explicitly empty `sections` is the model's answer that the file has no map, so
+			// accept it rather than spending calls arguing.
+			return {
+				overview: truncateOverview(value.overview.trim() || "(no overview provided)"),
+				sections: [],
+				mode: "blob",
+				usage: response.usage,
+				attempts: attempt,
+			};
 		}
+
+		problems = describeProblems(parsed);
 
 		if (attempt < MAX_ATTEMPTS) {
 			messages.push(assistantTextMessage(response, lastText));
@@ -254,12 +246,25 @@ async function requestSummary(
 	}
 
 	return {
-		overview: extractOverview(lastText) || "(the summarizer returned no usable answer)",
+		overview: truncateOverview(extractOverview(lastText) || "(the summarizer returned no usable answer)"),
 		sections: [],
 		mode: "blob",
 		usage: last?.usage,
 		attempts: MAX_ATTEMPTS,
 	};
+}
+
+/**
+ * Cut a runaway overview, keeping whole sentences so the prose still reads cleanly.
+ *
+ * The prompt allows ten sentences, which is a lot; a model that ignores that could return a
+ * page of prose and push the map out of the read-block reason entirely.
+ */
+function truncateOverview(overview: string): string {
+	if (overview.length <= MAX_OVERVIEW_CHARS) return overview;
+	const cut = overview.slice(0, MAX_OVERVIEW_CHARS);
+	const lastStop = Math.max(cut.lastIndexOf(". "), cut.lastIndexOf("\n"));
+	return `${lastStop > 0 ? cut.slice(0, lastStop + 1) : cut} …`;
 }
 
 /** What to tell the model was wrong. Precise when the shape was parseable, blunt when not. */
