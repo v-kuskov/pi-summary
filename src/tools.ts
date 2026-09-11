@@ -37,11 +37,12 @@ export function registerSummaryTool(pi: ExtensionAPI): void {
 		name: "summary",
 		label: "Summarize file",
 		description:
-			"Get a structural summary of a file: what it does, plus a map of which line ranges hold what. The file is summarized by a model the first time and then served from a local cache until the file changes. Use this before reading an unfamiliar or large file, then read only the range you need.",
-		promptSnippet: "Summarize a file: its purpose and a map of its line ranges",
+			"Get a structural summary of a text file: what it does, plus a complete map of which line ranges hold what. Use it to find the part of a file you need without reading the whole thing. `read` returns at most 200 lines per call, so on a longer file get the map here first and then read only the range you need. The file is summarized by a model the first time and served from a local cache afterwards, so only the first call on a file costs anything. Works on any text file, not just source code.",
+		promptSnippet: "Summarize a file: its purpose and a complete map of its line ranges",
 		promptGuidelines: [
-			"Use summary before read on a file you have not seen, to get its purpose and the line range of the part you need.",
-			"After summary, read only the range you need with offset and limit instead of the whole file.",
+			"Use summary before read on any file longer than 200 lines: read returns at most 200 lines per call, and summary gives you the complete map of ranges to choose from.",
+			"After summary, read with offset and limit inside one range the map names, rather than reading the whole file.",
+			"Call summary on unfamiliar files of any kind, including prose, config, and data, since its map covers the whole file.",
 		],
 		parameters: Type.Object({
 			path: Type.String({
@@ -50,7 +51,7 @@ export function registerSummaryTool(pi: ExtensionAPI): void {
 			model: Type.Optional(
 				Type.String({
 					description:
-						'Summarizer as "provider/model", for example "deepseek/deepseek-v4-flash". Defaults to the current session model.',
+						'Summarizer as "provider/model", for example "routeai/deepseek/deepseek-v4.1-flash". Defaults to the configured summarizer, or the current session model.',
 				}),
 			),
 			refresh: Type.Optional(
@@ -58,8 +59,7 @@ export function registerSummaryTool(pi: ExtensionAPI): void {
 					description: "Re-summarize even if the cached summary is still fresh.",
 				}),
 			),
-		}),
-		executionMode: "parallel",
+		}),		executionMode: "parallel",
 		async execute(
 			_id,
 			params,
