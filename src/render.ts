@@ -3,6 +3,15 @@ import type { CachedSummary, Freshness, Section } from "./store.ts";
 /** Char cap for anything embedded in a block reason or error message. */
 export const MAX_REASON_CHARS = 6000;
 
+/**
+ * Hard limit on lines a single `read` may return. Larger spans must be split.
+ *
+ * The guard enforces it and the model-facing text quotes it, so it lives here - next to the
+ * strings that have to agree with it - rather than in the guard, where a change to the
+ * limit would silently leave every message quoting the old number.
+ */
+export const READ_LINE_LIMIT = 200;
+
 export function formatBytes(bytes: number): string {
 	if (bytes < 1024) return `${bytes}B`;
 	if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
@@ -29,7 +38,8 @@ export function renderMap(sections: Section[], totalLines: number): string {
 		return [
 			"## map",
 			"  (none) this file was summarized as a single blob; no line detail is available.",
-			"  Use grep to locate a symbol in it, or read it in ranges of at most 200 lines.",
+			"  Use grep to locate a symbol in it, or read it in ranges of at most " +
+				`${READ_LINE_LIMIT} lines.`,
 		].join("\n");
 	}
 
@@ -109,8 +119,8 @@ export function renderSummary(entry: CachedSummary, options: RenderOptions = {})
 	parts.push("");
 	parts.push(
 		entry.mode === "blob"
-			? `# read ${entry.path} in ranges (max 200 lines per call), or grep it for a symbol.`
-			: `# read ${entry.path} with offset/limit inside one range above (max 200 lines per call).`,
+			? `# read ${entry.path} in ranges (max ${READ_LINE_LIMIT} lines per call), or grep it for a symbol.`
+			: `# read ${entry.path} with offset/limit inside one range above (max ${READ_LINE_LIMIT} lines per call).`,
 	);
 	return parts.join("\n");
 }

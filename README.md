@@ -21,8 +21,9 @@ pi install git:github.com/<you>/pi-summary     # or npm:pi-summary once publishe
 ```
 
 The summarizer is a plain completion with **no tools**: it is asked for JSON, the answer is
-validated, and a malformed answer is sent back to the model with the specific violations
-up to three attempts in total before the result degrades to a prose-only blob.
+validated, and output that is not the agreed shape is sent back to the model with the
+specific violations, up to three attempts in total, before the result degrades to a
+prose-only blob. It never chooses its own next step and is never given a tool to call.
 
 Or load a local checkout directly:
 
@@ -46,11 +47,14 @@ model: deepseek/deepseek-v4-flash
 
 An HTTP client for the internal Orders API. Wraps node fetch with signed requests,
 retry with jitter, and a rate limiter shared per host. Exports FooClient and the
-RetryPolicy type. No top-level side effects.
+RetryPolicy type. No top-level side effects. Signing reads process.env.SECRET fresh on
+
+every attempt, so a test that does not set it signs with an empty key.
 
 ## map
    1-  24  import   node/fs, node/path; module constants
-  25- 140  class    FooClient - HTTP transport with retry
+  25-  25  skipped  (nothing to map)
+  26- 140  class    FooClient - HTTP transport with retry
  141- 620  method   FooClient.request() - builds, signs, sends
  621-1420  method   FooClient.retry() - backoff and jitter
 
@@ -107,6 +111,13 @@ drift apart. If the summarizer returns no usable line map, the entry is stored a
 **blob** — overview only, zero rows — and says so, rather than inventing a single region
 spanning the file.
 
+Rows may leave gaps: the summarizer is told to skip lines that do nothing, so a blank
+run, a license header, or generated boilerplate is deliberately unmapped rather than
+absorbed into a neighbour or covered by a region invented for the purpose. Gaps are
+rendered as `skipped (nothing to map)` rows, so the map still accounts for every line and
+you never have to notice a jump in the numbers. Rows may not overlap — two notes cannot
+describe the same line. Overlaps are trimmed locally, so they never cost a retry.
+
 ## Options
 
 | Argument  | Meaning                                                              |
@@ -153,7 +164,14 @@ npm run check     # tsc --noEmit && node smoke.mjs
 fake `ModelRegistry`, against a temp project directory. It covers cache hit/miss/stale/
 forced, the hash-over-mtime rule, the blob degradation, the repair loop and its cap,
 settings precedence, and the guard's allow/block boundaries — including that a cold
-oversized read summarizes and that a failing summarizer still blocks cleanly.
+oversized read summarizes and that a failing summarizer lets the read through and says so.
+
+Nothing checks the map's *content*. Structure and schema are validated, and a
+contiguous, well-formed map can still name the wrong lines. The defence is in the prompt
+itself: the excerpt is line-numbered and the model is told to copy numbers out of the
+left column rather than count lines. That was measured, not assumed — given raw
+unnumbered text one model invented a spacing rule and drifted a mean of 24 lines on a
+1396-line file, while another counted accurately.
 
 `docs/DESIGN.md` records the reasoning, including the cost filter and the rejected
 designs.

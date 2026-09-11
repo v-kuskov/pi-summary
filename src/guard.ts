@@ -6,14 +6,17 @@ import {
 	isToolCallEventType,
 } from "@earendil-works/pi-coding-agent";
 import { peekFreshSummary } from "./cache.ts";
-import { describeFailure, failureNotice } from "./fallback.ts";
+import { notifyUser } from "./error.ts";
+import { failureNotice } from "./fallback.ts";
 import { countLinesFrom, looksBinary } from "./hash.ts";
 import { isRegularFile, resolveFilePath } from "./paths.ts";
-import { MAX_REASON_CHARS, renderSummaryForReason, truncateChars } from "./render.ts";
+import {
+	MAX_REASON_CHARS,
+	READ_LINE_LIMIT,
+	renderSummaryForReason,
+	truncateChars,
+} from "./render.ts";
 import { summarizeFile, type SummarizeOutcome } from "./summarize.ts";
-
-/** Hard limit on lines a single `read` may return. Larger spans must be split. */
-export const READ_LINE_LIMIT = 200;
 
 /** Notices raised for the current batch, keyed by tool call id, awaiting their result. */
 const pendingNotices = new Map<string, string>();
@@ -38,9 +41,16 @@ export function registerReadGuard(pi: ExtensionAPI): void {
 		if (!isToolCallEventType("read", event)) return;
 
 		const absPath = resolveFilePath(event.input.path, ctx.cwd);
-		// Anything the guard cannot measure is left to the built-in read tool.
-		if (!isRegularFile(absPath)) return;
-		if (await looksBinary(absPath)) return;
+		// Anything the guard cannot measure is left to the built-in read tool. The probe
+		// functions below open the file, and it can vanish in between - an editor rewriting
+		// it, a delete, a permission change - so they are guarded too. A read must never
+		// fail because the *guard* failed to look at the file.
+		try {
+			if (!isRegularFile(absPath)) return;
+			if (await looksBinary(absPath)) return;
+		} catch {
+			return;
+		}
 
 		const rawOffset = event.input.offset;
 		const offset =
@@ -55,7 +65,12 @@ export function registerReadGuard(pi: ExtensionAPI): void {
 		// A non-positive limit is the built-in tool's problem, not the guard's.
 		if (limit !== undefined && limit <= 0) return;
 
-		const remaining = await countLinesFrom(absPath, offset, READ_LINE_LIMIT);
+		let remaining: number;
+		try {
+			remaining = await countLinesFrom(absPath, offset, READ_LINE_LIMIT);
+		} catch {
+			return; // unreadable now: let the built-in read report it
+		}
 		if (remaining === 0) return; // offset past EOF: let the read tool raise its own error
 
 		// With an explicit limit the call is already bounded; otherwise the whole tail counts
@@ -63,7 +78,7 @@ export function registerReadGuard(pi: ExtensionAPI): void {
 		const span = limit === undefined ? remaining : Math.min(remaining, limit);
 		if (span <= READ_LINE_LIMIT) return;
 
-		return buildBlockResult(ctx, absPath, event.toolCallId, offset, remaining);
+		return buildBlockResult(ctx, absPath, event.toolCallId, offset);
 	});
 
 	// A notification only exists in the UI, which is absent in print and RPC runs. When a
@@ -85,9 +100,9 @@ export function registerReadGuard(pi: ExtensionAPI): void {
  * Compose the guard's verdict for an oversized read, summarizing the file if needed.
  *
  * `remaining` is the counter's sentinel (`READ_LINE_LIMIT + 1`) meaning "more than the
- * limit", not an exact count — counting a huge file to print a precise number would defeat
- * the cheap early exit — so the wording says "more than" rather than naming a figure it
- * does not know.
+ * limit", never an exact count - counting a huge file to print a precise number would
+ * defeat the cheap early exit - so the wording says "more than" rather than naming a
+ * figure it does not know.
  *
  * Returns `undefined` to allow the read when there is no summary to justify blocking it.
  */
@@ -96,19 +111,15 @@ async function buildBlockResult(
 	absPath: string,
 	toolCallId: string,
 	offset: number,
-	remaining: number,
 ): Promise<ToolCallEventResult | undefined> {
-	const exact = remaining <= READ_LINE_LIMIT;
-	const span = exact
-		? `would return ${remaining} lines (lines ${offset}-${offset + remaining - 1})`
-		: `would return more than ${READ_LINE_LIMIT} lines, starting at line ${offset}`;
+	const span = `would return more than ${READ_LINE_LIMIT} lines, starting at line ${offset}`;
 
 	const summarized = await ensureSummary(ctx, absPath);
 
 	// No summary, so no reason to block. Report why and let the built-in read run.
 	if (summarized.error !== undefined) {
 		const notice = failureNotice("summary", summarized.error, "Reading the whole file instead.");
-		notify(ctx, notice);
+		notifyUser(ctx, notice, "error");
 		// Stashed for the `tool_result` handler, which appends it to the read output. The
 		// map is keyed by tool call id and only written when the read is allowed, so an
 		// unrelated read cannot pick up someone else's notice.
@@ -158,14 +169,4 @@ async function ensureSummary(ctx: ExtensionContext, absPath: string): Promise<En
 		return { fromCache: false, error };
 	}
 	return { text: renderSummaryForReason(outcome.entry), fromCache: false };
-}
-
-/** Show an error in the UI when there is one to show it in. */
-function notify(ctx: ExtensionContext, message: string): void {
-	if (!ctx.hasUI) return;
-	try {
-		ctx.ui.notify(message, "error");
-	} catch {
-		// A notification is a courtesy; never let it break a read.
-	}
 }

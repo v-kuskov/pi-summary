@@ -1,5 +1,5 @@
 import { uuidv7 } from "@earendil-works/pi-ai";
-import { assistantText, SummaryError } from "./error.ts";
+import { assistantText, notifyUser, SummaryError } from "./error.ts";
 import { fingerprint } from "./hash.ts";
 import { cacheKey, findProjectRoot, isRegularFile, resolveFilePath } from "./paths.ts";
 import {
@@ -57,7 +57,6 @@ export type SummarizeOutcome = {
 	status: SummarizeStatus;
 	usage?: Usage;
 	dbPath: string;
-	firstTouch: boolean;
 	/** How the model's answer was read: validated JSON, or salvaged prose. */
 	extraction: "json" | "blob";
 	/** True when the answer never became valid JSON and the map is missing. */
@@ -87,7 +86,7 @@ export async function summarizeFile(
 
 	const root = findProjectRoot(ctx.cwd);
 	const key = cacheKey(absPath, root);
-	const { db, dbPath, firstTouch } = openDb(ctx.cwd);
+	const { db, dbPath } = openDb(ctx.cwd);
 	try {
 		ensureSchema(db);
 		const cached = readSummary(db, key);
@@ -98,7 +97,6 @@ export async function summarizeFile(
 					entry: cached,
 					status: "fresh",
 					dbPath,
-					firstTouch,
 					extraction: cached.mode === "mapped" ? "json" : "blob",
 					degraded: cached.mode === "blob",
 					attempts: 0,
@@ -130,7 +128,6 @@ export async function summarizeFile(
 			status,
 			usage: result.usage,
 			dbPath,
-			firstTouch,
 			extraction: result.mode === "mapped" ? "json" : "blob",
 			degraded: result.mode === "blob",
 			attempts: result.attempts,
@@ -312,17 +309,14 @@ function resolveNamedModel(ctx: ExtensionContext, explicit: string | undefined):
 	const trimmed = explicit?.trim() ?? "";
 	if (trimmed.length === 0 || placeholder.test(trimmed)) return undefined;
 
-	const slash = trimmed.indexOf("/");
-	const provider = slash > 0 ? trimmed.slice(0, slash) : "";
-	const modelId = slash > 0 ? trimmed.slice(slash + 1) : "";
-	if (!provider || !modelId) {
+	const parsed = parseProviderModel(trimmed);
+	if (!parsed) {
 		throw new SummaryError(
 			`model "${explicit}" is not in provider/model form`,
 			"Pass model as provider/model, for example: deepseek/deepseek-v4-flash, or omit it to summarize with the current session model.",
 		);
 	}
-	const found = ctx.modelRegistry.find(provider, modelId);
-	if (!found) {
+	const found = ctx.modelRegistry.find(parsed.provider, parsed.modelId);	if (!found) {
 		throw new SummaryError(
 			`unknown model "${explicit}"`,
 			"Omit model to use the current session model.",
@@ -349,14 +343,12 @@ function resolveNamedModel(ctx: ExtensionContext, explicit: string | undefined):
 function configuredModel(ctx: ExtensionContext): AnyModel | undefined {
 	const configured = readSummarySettings(ctx.cwd).model;
 	if (!configured) return undefined;
-	if (!isProviderModelPair(configured)) {
+	const parsed = parseProviderModel(configured);
+	if (!parsed) {
 		warnOnce(ctx, configured, `summary.model "${configured}" is not in provider/model form`);
 		return undefined;
 	}
-
-	const provider = configured.slice(0, configured.indexOf("/"));
-	const modelId = configured.slice(configured.indexOf("/") + 1);
-	const found = ctx.modelRegistry.find(provider, modelId);
+	const found = ctx.modelRegistry.find(parsed.provider, parsed.modelId);
 	if (!found) {
 		warnOnce(
 			ctx,
@@ -383,18 +375,18 @@ const warned = new Set<string>();
 function warnOnce(ctx: ExtensionContext, key: string, message: string): void {
 	if (warned.has(key)) return;
 	warned.add(key);
-	if (!ctx.hasUI) return;
-	try {
-		ctx.ui.notify(message, "warning");
-	} catch {
-		// A notification is a courtesy; never let it break the call.
-	}
+	notifyUser(ctx, message, "warning");
 }
 
-/** True when the value has a non-empty `provider/model` split. */
-function isProviderModelPair(value: string): boolean {
+/**
+ * Split `provider/model` at the first slash, or `undefined` when either side is empty.
+ *
+ * A provider or model id may itself contain a slash, so only the first one separates them.
+ */
+function parseProviderModel(value: string): { provider: string; modelId: string } | undefined {
 	const slash = value.indexOf("/");
-	return slash > 0 && slash < value.length - 1;
+	if (slash <= 0 || slash === value.length - 1) return undefined;
+	return { provider: value.slice(0, slash), modelId: value.slice(slash + 1) };
 }
 
 /** Fall back to the session's current model, or explain why there is none. */

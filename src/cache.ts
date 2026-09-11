@@ -1,14 +1,10 @@
-import { isRegularFile, resolveFilePath } from "./paths.ts";
+import { isRegularFile, cacheKey, findProjectRoot, resolveFilePath } from "./paths.ts";
 import { ensureSchema, freshnessOf, openDb, readSummary } from "./store.ts";
-import { summarizeFile } from "./summarize.ts";
-import { cacheKey, findProjectRoot } from "./paths.ts";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { CachedSummary } from "./store.ts";
 
 export type PeekResult = {
 	entry: CachedSummary;
-	dbPath: string;
-	firstTouch: boolean;
 };
 
 /**
@@ -25,16 +21,14 @@ export async function peekFreshSummary(
 	if (!isRegularFile(absPath)) return undefined;
 
 	const root = findProjectRoot(ctx.cwd);
-	const { db, dbPath, firstTouch } = openDb(ctx.cwd);
+	const { db } = openDb(ctx.cwd);
 	try {
 		ensureSchema(db);
 		const cached = readSummary(db, cacheKey(absPath, root));
 		if (!cached) return undefined;
 		if ((await freshnessOf(cached)) !== "fresh") return undefined;
-		return { entry: cached, dbPath, firstTouch };
+		return { entry: cached };
 	} finally {
 		db.close();
 	}
 }
-
-export { summarizeFile };

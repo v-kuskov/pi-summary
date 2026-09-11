@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -340,7 +340,7 @@ await check("openDb sets busy_timeout before switching to WAL", async () => {
 		db.close();
 
 		const again = openDb(root);
-		assert.equal(again.firstTouch, false, "the path is remembered across opens");
+		assert.equal(again.dbPath, join(root, ".pi", "summaries.db"), "stable across opens");
 		assert.equal(again.db.prepare("PRAGMA busy_timeout").get().timeout, 3000);
 		again.db.close();
 	} finally {
@@ -499,7 +499,7 @@ await check("an mtime-only touch does not re-summarize", async () => {
 		await runTool(h, "summary", { path: "src/a.ts" });
 		assert.equal(h.calls.length, 1);
 
-		// Same bytes, new mtime: the mtime pre-check misses, the hash decides.
+		// Same bytes, new mtime: only the hash decides, and it matches.
 		writeFileSync(file, numbered(50));
 		const later = new Date(Date.now() + 5000);
 		utimesSync(file, later, later);
@@ -507,6 +507,44 @@ await check("an mtime-only touch does not re-summarize", async () => {
 		const again = await runTool(h, "summary", { path: "src/a.ts" });
 		assert.equal(h.calls.length, 1, "hash matched, so no model call");
 		assert.equal(again.details.status, "fresh");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+await check("a same-size rewrite with a matching mtime is still detected as stale", async () => {
+	// The bug this locks down: the cache used to treat a matching size + mtime as proof the
+	// file was unchanged and skip hashing. A same-length edit landing in the same millisecond
+	// then served a stale line map for a file the model was about to edit - confirmed by
+	// reproducing it before the fix. The hash is now the only thing that decides.
+	const root = tempProject();
+	try {
+		const file = join(root, "src", "a.ts");
+		const original = `${numbered(50)}`;
+		writeFileSync(file, original);
+		const h = makeHarness({ cwd: root });
+
+		const first = await runTool(h, "summary", { path: "src/a.ts" });
+		assert.equal(h.calls.length, 1);
+		const firstHash = first.content[0].text.match(/sha (\w+)/)[1];
+		const stored = statSync(file);
+
+		// Same byte length, different content, mtime forced back to the stored value.
+		const edited = original.replace("line 1\n", "LINE 1\n");
+		assert.equal(edited.length, original.length, "fixture must keep the byte length equal");
+		writeFileSync(file, edited);
+		utimesSync(file, stored.atimeMs / 1000, stored.mtimeMs / 1000);
+		assert.equal(statSync(file).size, stored.size, "size matches what was stored");
+		assert.equal(
+			Math.round(statSync(file).mtimeMs),
+			Math.round(stored.mtimeMs),
+			"mtime matches what was stored - the shortcut would say 'fresh'",
+		);
+
+		const again = await runTool(h, "summary", { path: "src/a.ts" });
+		assert.equal(h.calls.length, 2, "content changed, so it must re-summarize");
+		const againHash = again.content[0].text.match(/sha (\w+)/)[1];
+		assert.notEqual(againHash, firstHash, "and store the new hash");
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
@@ -933,7 +971,10 @@ await check("the cache lives in the project's .pi dir and is keyed from the root
 		const h = makeHarness({ cwd: join(root, "src") });
 
 		const result = await runTool(h, "summary", { path: "a.ts" });
-		assert.match(result.content[0].text, /# cache: .*\.pi[\\/]summaries\.db/);
+		// The database path lives in `details`, which the model never sees - it is not worth
+		// a line of context to tell the model where the cache file is.
+		assert.match(result.details.dbPath, /\.pi[\\/]summaries\.db$/);
+		assert.doesNotMatch(result.content[0].text, /summaries\.db/, "no cache path in the text");
 		assert.equal(result.details.path, "src/a.ts", "keyed relative to the project root");
 	} finally {
 		rmSync(root, { recursive: true, force: true });
@@ -1175,6 +1216,35 @@ await check("the guard never blocks a binary file", async () => {
 	}
 });
 
+await check("the guard allows the read when it cannot read the file itself", async () => {
+	// The guard stats the file, then opens it to count lines. If it loses read permission in
+	// between - or the file is deleted, which is what an editor rewrite looks like - an
+	// unguarded `open` rejects and the *guard* fails the read. It must let the read through
+	// and leave reporting to the built-in tool. Read-deny via ACL gives stat=true, open=EPERM.
+	const root = tempProject();
+	try {
+		const file = join(root, "src", "denied.ts");
+		writeFileSync(file, numbered(400));
+		const { execFileSync } = await import("node:child_process");
+		const user = process.env.USERNAME;
+		if (process.platform !== "win32" || !user) {
+			console.log("     (skipped: read-deny fixture needs Windows and USERNAME)");
+			return;
+		}
+
+		const h = makeHarness({ cwd: root });
+		execFileSync("icacls", [file, "/deny", `${user}:(R)`], { stdio: "pipe" });
+		try {
+			const out = await runGuard(h, { path: "src/denied.ts" });
+			assert.equal(out, undefined, "guard allows the read rather than rejecting");
+			assert.equal(h.calls.length, 0, "and never reaches the summarizer");
+		} finally {
+			execFileSync("icacls", [file, "/remove:d", user], { stdio: "pipe" });
+		}
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
 await check("the guard respects the offset+limit the model already chose", async () => {
 	const root = tempProject();
 	try {

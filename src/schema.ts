@@ -128,16 +128,22 @@ export function normalizeSections(raw: unknown, shownLines: number): Section[] |
 		if (!item || typeof item !== "object") continue;
 		const row = item as Record<string, unknown>;
 		const startLine = Math.trunc(Number(row.start_line));
-		const endLine = Math.trunc(Number(row.end_line));
-		if (!Number.isFinite(startLine) || !Number.isFinite(endLine)) continue;
+		if (!Number.isFinite(startLine)) continue;
 		if (startLine < 1 || startLine > shownLines) continue;
+
+		// A bad `end_line` is coerced to `startLine` rather than dropping the row: the start
+		// line is the row's address, so a row with a good start still points at a real place
+		// in the file, and losing it costs more than reading it as a single line.
+		const rawEnd = Math.trunc(Number(row.end_line));
+		const endLine = Math.max(
+			Math.min(Number.isFinite(rawEnd) ? rawEnd : startLine, shownLines),
+			startLine,
+		);
 
 		sections.push({
 			seq: 0,
 			startLine,
-			// A row cannot claim lines past what the model was shown, and a reversed range is
-			// read as a single line rather than dropped.
-			endLine: Math.max(Math.min(endLine, shownLines), startLine),
+			endLine,
 			kind: String(row.kind ?? "other").trim().toLowerCase() || "other",
 			name: String(row.name ?? "").trim() || "(unnamed)",
 			// A runaway note is cut rather than trusted: one unbounded note can outweigh every

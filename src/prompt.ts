@@ -54,9 +54,9 @@ export async function prepareFile(absPath: string): Promise<PreparedFile> {
  *
  * - The excerpt is **numbered**, and the prompt says to copy numbers from the left column.
  *   That turns a counting task, which models fail at over long files, into a copying task.
- * - The rows must **tile** the excerpt — each row beginning where the last one ended. That
- *   is a completion criterion the model can check as it writes and the caller can check
- *   after, rather than a property nobody verifies.
+ * - The rows may **leave gaps** where lines do nothing, but must not **overlap** - two rows
+ *   describing the same line leave the caller unable to tell which note applies. Overlap is
+ *   trimmed locally rather than sent back, so it never costs a model call.
  */
 export function buildSummarizePrompt(path: string, file: PreparedFile): string {
 	return [

@@ -74,10 +74,7 @@ CREATE TABLE IF NOT EXISTS file_section (
 );
 `;
 
-/** Databases this process has already opened, so the first touch can report the path. */
-const seenDbs = new Set<string>();
-
-export type OpenResult = { db: DatabaseSync; dbPath: string; firstTouch: boolean };
+export type OpenResult = { db: DatabaseSync; dbPath: string };
 
 export function openDb(cwd: string): OpenResult {
 	const dbPath = resolveDbPath(cwd);
@@ -89,9 +86,7 @@ export function openDb(cwd: string): OpenResult {
 	// afterwards leaves the one statement that needs it most unprotected.
 	db.exec("PRAGMA busy_timeout = 3000");
 	db.exec("PRAGMA journal_mode = WAL");
-	const firstTouch = !seenDbs.has(dbPath);
-	if (firstTouch) seenDbs.add(dbPath);
-	return { db, dbPath, firstTouch };
+	return { db, dbPath };
 }
 
 /** Create tables if absent. Cheap enough to run on every connection. */
@@ -142,12 +137,15 @@ export function readSummary(db: DatabaseSync, path: string): CachedSummary | und
 /**
  * Compare a cached entry against the file on disk.
  *
- * `mtime` and `size` are only a cheap pre-check: when they match, the file is unchanged
- * and no hashing is needed. When they differ the hash decides, which is what catches a
- * rewrite that lands within the same mtime tick.
+ * A size mismatch is conclusive - the file cannot be what was summarized - so it returns
+ * `stale` without reading the file. Everything else is decided by hashing.
  *
- * Re-summarizing costs a model call, so this errs toward hashing rather than toward
- * calling the model on a maybe-changed file.
+ * `mtime` is deliberately **not** trusted. Treating a matching mtime as proof of an
+ * unchanged file is wrong: an edit of the same length landing in the same millisecond, a
+ * `cp -p`/`touch -r` that restores a timestamp, and volumes with coarse mtime resolution
+ * all produce a matching mtime over different content, which would serve a stale line map
+ * for a file the model is about to edit. Reading the file to hash it is cheap next to the
+ * model call the shortcut was trying to avoid, so the hash is the only thing that decides.
  */
 export async function freshnessOf(
 	entry: Pick<CachedSummary, "hash" | "absPath" | "bytes" | "mtimeMs">,
@@ -158,9 +156,7 @@ export async function freshnessOf(
 	} catch {
 		return "missing";
 	}
-	if (stats.size === entry.bytes && Math.round(stats.mtimeMs) === entry.mtimeMs) {
-		return "fresh";
-	}
+	if (stats.size !== entry.bytes) return "stale";
 	try {
 		const fp = await fingerprint(entry.absPath);
 		return fp.hash === entry.hash ? "fresh" : "stale";

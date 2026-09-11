@@ -4,10 +4,10 @@ import type {
 	ExtensionAPI,
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import { SummaryError } from "./error.ts";
+import { notifyUser, SummaryError } from "./error.ts";
 import { describeFailure, failureNotice, loadWholeFile } from "./fallback.ts";
 import { resolveFilePath } from "./paths.ts";
-import { renderSummary } from "./render.ts";
+import { renderSummary, READ_LINE_LIMIT } from "./render.ts";
 import { summarizeFile, type SummarizeOutcome } from "./summarize.ts";
 
 export type SummaryDetails = {
@@ -29,18 +29,18 @@ export type SummaryDetails = {
  * The `summary` tool: a cached structural summary of one file, plus the map of which line
  * ranges hold what.
  *
- * The point is to make the guarded `read` usable. `read` returns at most 200 lines, so a
- * model facing a 1400-line file needs to know which 200 to ask for.
+ * The point is to make the guarded `read` usable. `read` returns at most `READ_LINE_LIMIT`
+ * lines, so a model facing a 1400-line file needs to know which 200 to ask for.
  */
 export function registerSummaryTool(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "summary",
 		label: "Summarize file",
 		description:
-			"Get a structural summary of a text file: what it does, plus a complete map of which line ranges hold what. Use it to find the part of a file you need without reading the whole thing. `read` returns at most 200 lines per call, so on a longer file get the map here first and then read only the range you need. The file is summarized by a model the first time and served from a local cache afterwards, so only the first call on a file costs anything. Works on any text file, not just source code.",
+			`Get a structural summary of a text file: what it does, plus a complete map of which line ranges hold what. Use it to find the part of a file you need without reading the whole thing. \`read\` returns at most ${READ_LINE_LIMIT} lines per call, so on a longer file get the map here first and then read only the range you need. The file is summarized by a model the first time and served from a local cache afterwards, so only the first call on a file costs anything. Works on any text file, not just source code.`,
 		promptSnippet: "Summarize a file: its purpose and a complete map of its line ranges",
 		promptGuidelines: [
-			"Use summary before read on any file longer than 200 lines: read returns at most 200 lines per call, and summary gives you the complete map of ranges to choose from.",
+			`Use summary before read on any file longer than ${READ_LINE_LIMIT} lines: read returns at most ${READ_LINE_LIMIT} lines per call, and summary gives you the complete map of ranges to choose from.`,
 			"After summary, read with offset and limit inside one range the map names, rather than reading the whole file.",
 			"Call summary on unfamiliar files of any kind, including prose, config, and data, since its map covers the whole file.",
 		],
@@ -82,7 +82,6 @@ export function registerSummaryTool(pi: ExtensionAPI): void {
 				return wholeFileFallback(ctx, params.path, error);
 			}
 			const lines: string[] = [];
-			if (outcome.firstTouch) lines.push(`# cache: ${outcome.dbPath}`);
 			lines.push(renderSummary(outcome.entry, { header: true, freshness: outcome.status }));
 			if (outcome.degraded) {
 				lines.push(
@@ -146,7 +145,7 @@ async function wholeFileFallback(
 ): Promise<AgentToolResult<SummaryDetails>> {
 	const absPath = resolveFilePath(path, ctx.cwd);
 	const notice = failureNotice("summary", error, "Returning the whole file instead.");
-	notifyError(ctx, notice);
+	notifyUser(ctx, notice, "error");
 
 	let body: string;
 	let details = failedDetails(absPath, error);
@@ -168,14 +167,4 @@ async function wholeFileFallback(
 		content: [{ type: "text", text: `# ${notice}\n\n${body}` }],
 		details,
 	};
-}
-
-/** Show an error in the UI when there is one to show it in. */
-function notifyError(ctx: ExtensionContext, message: string): void {
-	if (!ctx.hasUI) return;
-	try {
-		ctx.ui.notify(message, "error");
-	} catch {
-		// A notification is a courtesy; never let it break the tool call.
-	}
 }

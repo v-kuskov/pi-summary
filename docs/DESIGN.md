@@ -95,10 +95,16 @@ rows instead of parsing prose.
 
 ## 5. Freshness
 
-`F4` Cache validity is content-addressed: `sha256(file)`. `mtime` and `bytes` are stored
-as a cheap pre-check but never trusted alone — a file rewritten within the same mtime
-tick still invalidates on hash. The pre-check exists because hashing is I/O the guard
-would otherwise pay on every `read`; the hash is what makes the answer correct.
+`F4` Cache validity is content-addressed: `sha256(file)`. `bytes` is a cheap pre-check that
+can only return `stale` early — a size mismatch is conclusive, and the hash decides every
+other case.
+
+`mtime` is stored but never used to decide freshness. An earlier version treated a matching
+`mtime` as proof of an unchanged file and skipped hashing; that is wrong, and it was
+reproduced serving a stale map: an edit of the same length landing in the same millisecond,
+a `cp -p`/`touch -r` restoring a timestamp, and volumes with coarse mtime resolution all
+produce a matching `mtime` over different content. Hashing one file is cheap next to the
+model call the shortcut was trying to avoid, so the shortcut is gone.
 
 `F5` `summary(path)` on a stale entry re-summarizes and replaces, and says so. The
 caller never has to know the difference; asking for a summary always returns a summary
@@ -171,9 +177,10 @@ The guard skips anything that is not a regular file, and skips content with a NU
 in the first 8000.
 
 `G4` The block reason carries a fresh summary, truncated to 6000 chars so the error result
-stays small, and closes with a concrete suggested call. It names the exact span that
-triggered the block and the range to ask for instead, and it labels the map as cached or
-just generated.
+stays small, and closes with a concrete suggested call. Because the line counter stops
+early (`G2`), the reason can only say "more than 200 lines, starting at line N" — it never
+names an exact span, since computing one would mean counting a file the guard deliberately
+avoids counting. It labels the map as cached or just generated.
 
 `G5` The guard is implemented with `pi.on("tool_call")`, not by overriding the `read`
 tool. A second `read` registration would replace the built-in renderer and any other
@@ -190,6 +197,12 @@ a large file is returned truncated rather than in full.
 
 `G7` The guard never turns a failure into a raised error. `summary` failing is recoverable
 by definition - the file is still there - so the read path always produces a result.
+
+The guard's own file access is guarded for the same reason. It stats the file, then opens it
+to look for binary content and again to count lines; the file can vanish or lose read
+permission in between - an editor rewriting it, a delete, an ACL change - and an unguarded
+`open` would reject and fail the *read* because the guard could not do its job. Both probes
+are wrapped, and a failure falls through to the built-in tool.
 
 ## 8. Summarization call
 
