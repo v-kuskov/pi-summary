@@ -330,19 +330,55 @@ function resolveNamedModel(ctx: ExtensionContext, explicit: string | undefined):
 /**
  * The `summary.model` setting, if set.
  *
- * A setting that names a model the registry does not know is skipped with a warning rather
- * than thrown: an unreadable config should not make the tool unusable, and falling back to
- * the session model keeps `summary` working.
+ * A setting that names a model the registry does not know is skipped rather than thrown:
+ * an unreadable config should not make the tool unusable, and falling back to the session
+ * model keeps `summary` working. The fallback is announced once, because a silently
+ * ignored setting is indistinguishable from one that is being honoured - the summarizer
+ * just quietly costs a different amount than intended.
  */
 function configuredModel(ctx: ExtensionContext): AnyModel | undefined {
 	const configured = readSummarySettings(ctx.cwd).model;
-	if (!configured || !isProviderModelPair(configured)) return undefined;
+	if (!configured) return undefined;
+	if (!isProviderModelPair(configured)) {
+		warnOnce(ctx, configured, `summary.model "${configured}" is not in provider/model form`);
+		return undefined;
+	}
 
 	const provider = configured.slice(0, configured.indexOf("/"));
 	const modelId = configured.slice(configured.indexOf("/") + 1);
 	const found = ctx.modelRegistry.find(provider, modelId);
-	if (!found || !ctx.modelRegistry.hasConfiguredAuth(found)) return undefined;
+	if (!found) {
+		warnOnce(
+			ctx,
+			configured,
+			`summary.model "${configured}" names no known model; using the session model instead`,
+		);
+		return undefined;
+	}
+	if (!ctx.modelRegistry.hasConfiguredAuth(found)) {
+		warnOnce(
+			ctx,
+			configured,
+			`summary.model "${configured}" has no configured credentials; using the session model instead`,
+		);
+		return undefined;
+	}
 	return found;
+}
+
+/** Settings values already reported, so a recurring fallback does not repeat itself. */
+const warned = new Set<string>();
+
+/** Announce a bad `summary.model` once per value, when there is a UI to announce it in. */
+function warnOnce(ctx: ExtensionContext, key: string, message: string): void {
+	if (warned.has(key)) return;
+	warned.add(key);
+	if (!ctx.hasUI) return;
+	try {
+		ctx.ui.notify(message, "warning");
+	} catch {
+		// A notification is a courtesy; never let it break the call.
+	}
 }
 
 /** True when the value has a non-empty `provider/model` split. */

@@ -247,13 +247,25 @@ await check("the summary.model setting picks the summarizer, and model= override
 		const result = await runTool(h, "summary", { path: "src/a.ts" });
 		assert.equal(result.details.model, "test/test-model", "the configured model was used");
 
-		// An unknown configured model is skipped rather than failing the tool.
+		// An unknown configured model is skipped rather than failing the tool, and since a
+		// silently ignored setting looks exactly like an honoured one, it is announced.
 		writeFileSync(
 			join(agent, "settings.json"),
 			JSON.stringify({ summary: { model: "nope/missing" } }),
 		);
+		h.ctx.hasUI = true;
+		h.ctx.ui = { notify: (message, type) => h.notices.push({ message, type }) };
+
 		const fallback = await runTool(h, "summary", { path: "src/a.ts", refresh: true });
 		assert.equal(fallback.details.model, "test/test-model", "fell back to the session model");
+		assert.equal(h.notices.length, 1, "the ignored setting is reported");
+		assert.equal(h.notices[0].type, "warning");
+		assert.match(h.notices[0].message, /nope\/missing/);
+		assert.match(h.notices[0].message, /names no known model/);
+
+		// Reported once, not on every call.
+		await runTool(h, "summary", { path: "src/a.ts", refresh: true });
+		assert.equal(h.notices.length, 1, "the warning does not repeat");
 	} finally {
 		if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
 		else process.env.PI_CODING_AGENT_DIR = previous;
