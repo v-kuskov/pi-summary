@@ -1526,6 +1526,105 @@ await check("a read the guard does not claim behaves exactly like the built-in r
 	}
 });
 
+await check("a concurrent cold read of one file is summarized once", async () => {
+	// A model can ask for the same file several times in a single turn, and nothing about a
+	// `read` call serializes them. Each one used to summarize the file on its own, paying for
+	// a model call per read - five reads of an un-summarized file cost five calls.
+	const root = tempProject();
+	const previous = process.env.PI_CODING_AGENT_DIR;
+	const agent = mkdtempSync(join(tmpdir(), "pi-agent-"));
+	process.env.PI_CODING_AGENT_DIR = agent;
+	try {
+		writeFileSync(join(agent, "settings.json"), "{}");
+		writeFileSync(join(root, "src", "a.ts"), numbered(500));
+		let summarizerCalls = 0;
+		const h = makeHarness({
+			cwd: root,
+			respond: (context) => {
+				summarizerCalls++;
+				return jsonResponse({
+					overview: "One client.",
+					sections: [
+						{ start_line: 1, end_line: lastShownLine(context), kind: "class", name: "Client", note: "" },
+					],
+				});
+			},
+		});
+
+		// Deliberately not awaited one at a time: all five are in flight together, which is
+		// the window the cache cannot cover.
+		const results = await Promise.all(
+			Array.from({ length: 5 }, () => runRead(h, { path: "src/a.ts" })),
+		);
+
+		assert.equal(summarizerCalls, 1, "five concurrent cold reads share one summarization");
+		for (const result of results) {
+			assert.equal(result.isError, undefined, "every read still succeeded");
+			assert.match(result.content[0].text, /Client/, "and every read got the map");
+		}
+
+		// The shared run is done, so this is the cache answering and not a stale join.
+		assert.equal(h.calls.length, 1, "a later read costs nothing");
+	} finally {
+		if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = previous;
+		rmSync(root, { recursive: true, force: true });
+		rmSync(agent, { recursive: true, force: true });
+	}
+});
+
+await check("a refresh neither joins nor is joined by a run in flight", async () => {
+	// The dedupe map is published by ordinary calls only. A forced run must not join one:
+	// it was asked to re-summarize, and inheriting an ordinary run's answer would return the
+	// cached entry it exists to replace. Driven through `summary` because `refresh` is that
+	// tool's parameter - the guard has no way to ask for a refresh.
+	const root = tempProject();
+	const previous = process.env.PI_CODING_AGENT_DIR;
+	const agent = mkdtempSync(join(tmpdir(), "pi-agent-"));
+	process.env.PI_CODING_AGENT_DIR = agent;
+	try {
+		writeFileSync(join(agent, "settings.json"), "{}");
+		writeFileSync(join(root, "src", "a.ts"), numbered(500));
+
+		// Hold the first summarization open so the second call is genuinely concurrent with
+		// it, rather than racing to finish first.
+		let release;
+		const held = new Promise((resolve) => {
+			release = resolve;
+		});
+		let summarizerCalls = 0;
+		let firstCall = true;
+		const h = makeHarness({
+			cwd: root,
+			respond: async (context) => {
+				summarizerCalls++;
+				if (firstCall) {
+					firstCall = false;
+					await held;
+				}
+				return jsonResponse({
+					overview: "One client.",
+					sections: [
+						{ start_line: 1, end_line: lastShownLine(context), kind: "class", name: "Client", note: "" },
+					],
+				});
+			},
+		});
+
+		const ordinary = runTool(h, "summary", { path: "src/a.ts" });
+		const forced = runTool(h, "summary", { path: "src/a.ts", refresh: true });
+		release();
+		await Promise.all([ordinary, forced]);
+
+		assert.equal(summarizerCalls, 2, "a refresh summarizes again instead of joining the run");
+	} finally {
+		if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = previous;
+		rmSync(root, { recursive: true, force: true });
+		rmSync(agent, { recursive: true, force: true });
+	}
+});
+
 await check("an image read gets pi's own images.autoResize setting", async () => {
 	// The replacement builds the delegated read itself, and that definition takes this
 	// setting. It is read only for images - the built-in consults it in the image branch

@@ -66,13 +66,55 @@ export type SummarizeOutcome = {
 };
 
 /**
+ * Runs already under way, so callers asking for the same file at the same time share one.
+ *
+ * A cold oversized `read` is the case that matters: the model can issue several reads of the
+ * same file in a single turn, and without this each one summarizes the file independently.
+ * Entries are dropped as soon as the run settles, so a later call reads the cache as usual.
+ *
+ * A forced refresh neither joins a run nor publishes one. It was asked to re-run, and a caller
+ * that expects cached semantics must never silently receive a refresh that started without it.
+ */
+const inFlight = new Map<string, Promise<SummarizeOutcome>>();
+
+/**
  * Return a summary of `path`: from cache when the file is unchanged, otherwise by asking
  * a model and caching the result.
  *
  * `status` reports which happened so the caller can tell the model whether it just paid
  * for a model call.
+ *
+ * Concurrent callers for one file share a single run. The model and signal of whichever call
+ * started the run are the ones used, so a joiner neither overrides the model nor adds a second
+ * cancel, and a joiner's failure is the starter's failure.
  */
 export async function summarizeFile(
+	ctx: ExtensionContext,
+	options: SummarizeOptions,
+): Promise<SummarizeOutcome> {
+	if (options.force) return runSummarize(ctx, options);
+
+	// Keyed on what makes two runs the same work: the same file in the same project, which is
+	// the same cache entry. The root is part of the key because a key on its own is relative
+	// to it, so two projects with a `src/foo.ts` would otherwise share a run.
+	const root = findProjectRoot(ctx.cwd);
+	const file = cacheKey(resolveFilePath(options.path, ctx.cwd), root);
+	const runKey = [root, file, options.model ?? ""].join("\u0000");
+
+	const running = inFlight.get(runKey);
+	if (running) return running;
+
+	const run = runSummarize(ctx, options);
+	inFlight.set(runKey, run);
+	try {
+		return await run;
+	} finally {
+		inFlight.delete(runKey);
+	}
+}
+
+/** The work behind `summarizeFile`, run at most once at a time per file. */
+async function runSummarize(
 	ctx: ExtensionContext,
 	options: SummarizeOptions,
 ): Promise<SummarizeOutcome> {

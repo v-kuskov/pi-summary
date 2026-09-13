@@ -39,6 +39,14 @@ answer to the read**. That means an oversized `read` spends up to three model ca
 the caller naming the file to `summary`. This is the extension's one unannounced spend, and
 it is bounded by the same `MAX_ATTEMPTS` ceiling.
 
+The cache cannot cover a single turn that reads one file several times, because those calls
+are in flight together and none of them finds a stored entry yet. So the guard's spend is
+bounded **per file**, not per read: concurrent calls for one file share a single run and the
+first one's model call pays for all of them. Five reads of an un-summarized file cost one
+call, not five, and not the fifteen the `MAX_ATTEMPTS` ceiling would otherwise allow. A
+`refresh` is refused that sharing — it neither joins a run nor publishes one — because it was
+asked to re-summarize and silently inheriting another call's cached answer is the opposite.
+
 Rejected: search-across-cached-summaries and project-wide refresh. Both are unbounded
 fan-out driven by caller text; both were built and removed.
 
@@ -460,7 +468,8 @@ than failing the call or fabricating a map.
 `D6` The read guard summarizes a file it has no fresh summary for, so an oversized `read`
 always comes back with a map. This overrides the earlier "the guard never calls a model"
 rule: the user asked for the guard to create the summary rather than return an error. The
-cost is bounded by `D5`'s ceiling.
+cost is bounded by `D5`'s ceiling — and per file rather than per read, since concurrent reads
+of one file share a single summarization (`C2`).
 
 `D7` The summarizer model is configurable through a `summary.model` key in pi's settings
 file, project scope winning over global, defaulting to the session model.
