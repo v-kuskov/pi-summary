@@ -2,6 +2,7 @@ import {
 	type ExtensionAPI,
 	type ExtensionContext,
 	createReadToolDefinition,
+	detectSupportedImageMimeTypeFromFile,
 } from "@earendil-works/pi-coding-agent";
 import { peekFreshSummary } from "./cache.ts";
 import { notifyUser } from "./error.ts";
@@ -78,22 +79,49 @@ export function registerReadTool(pi: ExtensionAPI): void {
 /**
  * Run the built-in read, on the built-in's own terms.
  *
- * The definition is built fresh per call rather than once: `autoResizeImages` comes from pi's
- * settings and an extension context does not expose it, and the session may have been replaced
- * or the project switched since this tool was registered. It is built against the process cwd
- * as a fallback only — the built-in resolves every path against the calling context's cwd,
+ * The definition is built fresh per call rather than once: the session may have been replaced
+ * or the project switched since this tool was registered, and `autoResizeImages` comes from
+ * pi's settings, which an extension context does not expose. It is built against the process
+ * cwd as a fallback only — the built-in resolves every path against the calling context's cwd,
  * which is passed straight through.
+ *
+ * Reading that setting costs a synchronous load of pi's settings files. The built-in consults
+ * it in one place only — the branch that has already classified the file as an image — so a
+ * read is checked for being an image first and every other read skips the setting entirely
+ * rather than paying for a value it would discard. Detection is by content, like the built-in
+ * does it, so an image with an unexpected extension is still resized on the user's terms.
  */
-function delegate(
+async function delegate(
 	toolCallId: string,
 	params: ReadInput,
 	signal: AbortSignal | undefined,
 	onUpdate: Parameters<ReturnType<typeof createReadToolDefinition>["execute"]>[3],
 	ctx: ExtensionContext,
 ) {
-	return createReadToolDefinition(process.cwd(), {
-		autoResizeImages: readImageAutoResize(ctx.cwd),
-	}).execute(toolCallId, params, signal, onUpdate, ctx);
+	const options = (await looksLikeImage(params.path, ctx.cwd))
+		? { autoResizeImages: readImageAutoResize(ctx.cwd) }
+		: {};
+	return createReadToolDefinition(process.cwd(), options).execute(
+		toolCallId,
+		params,
+		signal,
+		onUpdate,
+		ctx,
+	);
+}
+
+/**
+ * Whether the built-in read will treat this path as an image, using its own detection.
+ *
+ * A path that cannot be opened is not an image: the built-in read is about to report that
+ * itself, and reporting it here would replace its message with this one.
+ */
+async function looksLikeImage(path: string, cwd: string): Promise<boolean> {
+	try {
+		return (await detectSupportedImageMimeTypeFromFile(resolveFilePath(path, cwd))) !== null;
+	} catch {
+		return false;
+	}
 }
 
 /** A `read` call's arguments, as the shared schema defines them. */

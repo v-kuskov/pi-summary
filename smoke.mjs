@@ -1526,5 +1526,51 @@ await check("a read the guard does not claim behaves exactly like the built-in r
 	}
 });
 
+await check("an image read gets pi's own images.autoResize setting", async () => {
+	// The replacement builds the delegated read itself, and that definition takes this
+	// setting. It is read only for images - the built-in consults it in the image branch
+	// alone - so this pins that the value still arrives there. With resizing off the
+	// built-in returns the bytes untouched, which makes the setting observable in the
+	// result rather than only in a timing difference.
+	const root = tempProject();
+	const previous = process.env.PI_CODING_AGENT_DIR;
+	const agent = mkdtempSync(join(tmpdir(), "pi-agent-"));
+	process.env.PI_CODING_AGENT_DIR = agent;
+	// A 1x1 greyscale PNG is small enough to inline whole when it is not resized.
+	const PNG = Buffer.from(
+		"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAAAAAA6fptVAAAACUlEQVR4nGIAAAACAAH6zsgUAAAAAElFTkSuQmCC",
+		"base64",
+	);
+	try {
+		writeFileSync(join(agent, "settings.json"), "{}");
+		writeFileSync(join(root, "src", "pic.png"), PNG);
+		const h = makeHarness({ cwd: root });
+
+		// Resizing on: the built-in processes the image, so the bytes are not passed through.
+		const resized = await runRead(h, { path: "src/pic.png" });
+		assert.match(resized.content[0].text, /Read image file/, "the built-in handled the image");
+		assert.notEqual(
+			resized.content.find((c) => c.type === "image")?.data,
+			PNG.toString("base64"),
+			"with the default setting the image goes through the resize path",
+		);
+
+		// Resizing off, set globally the way pi reads it. The untouched bytes are the proof
+		// that the setting reached the definition the guard built.
+		writeFileSync(join(agent, "settings.json"), JSON.stringify({ images: { autoResize: false } }));
+		const untouched = await runRead(h, { path: "src/pic.png" });
+		assert.equal(
+			untouched.content.find((c) => c.type === "image")?.data,
+			PNG.toString("base64"),
+			"autoResize:false is honoured, so the image is returned unresized",
+		);
+	} finally {
+		if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = previous;
+		rmSync(root, { recursive: true, force: true });
+		rmSync(agent, { recursive: true, force: true });
+	}
+});
+
 console.log(`\n${passed} passed, ${failures} failed`);
 process.exit(failures === 0 ? 0 : 1);

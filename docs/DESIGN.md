@@ -254,6 +254,15 @@ and `promptGuidelines`. All four come from building the definition with pi's own
 the tool the model sees is the built-in's. Only the oversized span diverges; every other call
 is delegated to the built-in `execute`, errors included.
 
+A delegated read must be built with the same options pi builds the built-in one with, or the
+replacement silently changes behaviour it was meant to preserve. The one that matters is
+`images.autoResize`: pi passes it into the definition it builds, and an extension context does
+not expose it, so it is read from pi's own settings files. It is read **only for a read that
+is already an image** — the built-in consults it in that branch alone, and loading the settings
+files costs about a millisecond of synchronous I/O, which every text read would otherwise pay
+for a value it discards. A read is classified by content, with pi's own detector, so an image
+with an unexpected extension still gets the user's setting.
+
 `G6` A failed summary **lets the read run** — the file's lines are returned, because with no
 map to offer withholding the file would take it away and leave nothing behind. The read keeps
 the built-in 2000-line cap, so a large file comes back truncated by that cap. The failure is

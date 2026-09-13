@@ -65,6 +65,9 @@ function pick(raw: unknown): SummarySettings {
  * files pi reads. It matters because the replacement delegates real reads to a definition it
  * builds itself, and building it with the default would quietly ignore the user's choice.
  *
+ * Reading it loads both settings files synchronously, so callers should ask only when the
+ * value will be used - the built-in `read` consults it for images alone.
+ *
  * Anything unreadable means the default, which is what pi uses when the key is absent.
  */
 export function readImageAutoResize(cwd: string, manager?: SettingsManager): boolean {
