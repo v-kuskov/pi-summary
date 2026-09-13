@@ -12,34 +12,40 @@ import { isRegularFile, isUnguardedPath, resolveFilePath } from "./paths.ts";
 import { READ_LINE_LIMIT, renderSummary } from "./render.ts";
 import { summarizeFile, type SummarizeOutcome } from "./summarize.ts";
 
-/** Text to append to a read result, keyed by tool call id, awaiting that result. */
-const pendingAppends = new Map<string, string>();
+/** A notice to append to a read result, keyed by tool call id, awaiting that result. */
+const pendingNotices = new Map<string, string>();
 
 /**
- * Cap an oversized `read` at `READ_LINE_LIMIT` lines and hand back the file's map alongside
- * the content it did return.
+ * A read either returns the lines it asked for, or it returns the file's map. Nothing else.
+ *
+ * A span of `READ_LINE_LIMIT` lines or fewer is left alone and returns exactly what was read.
+ * A span of more than that is answered with the map instead: the call is blocked, the read
+ * never runs, and the model gets the summary as the tool result. So a refused read costs
+ * nothing from the file itself and nothing from the model's context.
  *
  * The map is served from cache when one is fresh. When the file has never been summarized the
- * guard summarizes it here, so an oversized `read` is answered with a map rather than a dead
- * end. That means a cold oversized read costs model calls — this is the one place in the
- * extension that spends them without the caller naming a file to `summary` — so the appended
- * text states whether the map came from cache or was just generated, and the work is bounded
- * by `MAX_ATTEMPTS` in `summarize.ts`.
+ * guard summarizes it here, so a cold oversized `read` costs up to `MAX_ATTEMPTS` model calls —
+ * this is the one place in the extension that spends them without the caller naming a file to
+ * `summary`.
  *
- * The call is *not* blocked. A blocked call is reported to the model as a tool error by pi's
- * core (`createErrorToolResult`), and no `tool_result` handler runs for it, so there is no way
- * to return the map without also returning a failure. Instead the guard clamps `input.limit` —
- * allowed, since `tool_call` handlers may mutate `input` — and appends the map to the real
- * result, which stays a success because the read did happen.
+ * The call is refused rather than clamped because a clamped read is neither of the two useful
+ * answers. It spends the context of a real read and still shows a fraction of the file, and a
+ * map bolted onto its tail hides that the model was cut off. `read`'s own limit is the rule:
+ * ask for more than it, and the answer is the map.
  *
- * When no summary can be produced the call is left alone, and the failure is raised as a
- * notification without touching the read: with no map to offer, clamping would only take lines
- * away from the model.
+ * A refusal is reported to the model as a failed call — pi's core turns the reason into an error
+ * tool result — which is deliberate here: the read genuinely did not happen, and the reason
+ * carries the map. No `tool_result` handler runs for a refused call, so the reason is the only
+ * channel out.
+ *
+ * When no summary can be produced the read is *not* refused: with no map to offer, refusing the
+ * read would take the file away and leave nothing behind. The failure is raised as a
+ * notification and, for runs with no UI, as a note appended to the read result.
  *
  * Prose, notes and extensionless files (`.md`, `.txt`, `Makefile`) are never touched. They are
- * written to be read in order and a map of a README says nothing a skim does not, so the 200
- * line cap buys nothing there and only cuts the file mid-section. The cap is for source files,
- * where not knowing which range holds a symbol costs a wasted call.
+ * written to be read in order and a map of a README says nothing a skim does not, so the limit
+ * buys nothing there and only cuts the file mid-section. The limit is for source files, where
+ * not knowing which range holds a symbol costs a wasted call.
  */
 export function registerReadGuard(pi: ExtensionAPI): void {
 	pi.on("tool_call", async (event, ctx) => {
@@ -80,71 +86,65 @@ export function registerReadGuard(pi: ExtensionAPI): void {
 		if (remaining === 0) return; // offset past EOF: let the read tool raise its own error
 
 		// With an explicit limit the call is already bounded; otherwise the whole tail counts
-		// as the span the model is asking for, which is exactly the unbounded read to cap.
+		// as the span the model is asking for, which is exactly the unbounded read to refuse.
 		const span = limit === undefined ? remaining : Math.min(remaining, limit);
 		if (span <= READ_LINE_LIMIT) return;
 
 		const summarized = await ensureSummary(ctx, absPath);
 
-		// No summary, so nothing to add to the read and no reason to shorten it.
+		// No summary, so refusing the read would leave the model with nothing. Let it through
+		// and say why.
 		if (summarized.error !== undefined) {
-			const notice = failureNotice("summary", summarized.error, "Reading the whole file instead.");
+			const notice = failureNotice("summary", summarized.error, "Reading the file directly.");
 			notifyUser(ctx, notice, "error");
-			pendingAppends.set(event.toolCallId, `# ${notice}`);
+			pendingNotices.set(event.toolCallId, `# ${notice}`);
 			return;
 		}
 
-		// The read now returns exactly the first `READ_LINE_LIMIT` lines from the offset. The
-		// clamp is what makes the appended map actionable: the model is looking at lines it can
-		// place on the map, and can ask for another range by number.
-		event.input.limit = READ_LINE_LIMIT;
-
-		const last = offset + READ_LINE_LIMIT - 1;
-		const head = [
-			"",
-			`# this call would have returned more than ${READ_LINE_LIMIT} lines, so it was capped at`,
-			`# limit=${READ_LINE_LIMIT}: lines ${offset}-${last} are above. Use offset/limit to read`,
-			"# further, or read one region below.",
-			"",
-			summarized.fromCache
-				? "Cached summary of this file (use these line ranges):"
-				: "Summary of this file, generated for this read (use these line ranges):",
-			"",
-			summarized.text,
-		];
-		pendingAppends.set(event.toolCallId, head.join("\n"));
+		return { block: true, reason: renderReason(offset, summarized) };
 	});
 
-	// A notification only exists in the UI, which is absent in print and RPC runs. The appended
-	// text is what reaches the model, so the notice and the map both travel this path.
+	// A notification only exists in the UI, which is absent in print and RPC runs. On the
+	// failure path the read does run, so the notice rides its result.
 	pi.on("tool_result", async (event) => {
 		if (!isReadToolResult(event)) return;
-		const append = pendingAppends.get(event.toolCallId);
-		if (append === undefined) return;
-		pendingAppends.delete(event.toolCallId);
+		const notice = pendingNotices.get(event.toolCallId);
+		if (notice === undefined) return;
+		pendingNotices.delete(event.toolCallId);
 
-		return {
-			content: [...event.content, { type: "text", text: `\n${append}` }],
-		};
+		return { content: [...event.content, { type: "text", text: `\n${notice}` }] };
 	});
 }
 
-/** A summary for the appended text, or the reason there is none. */
-type EnsureResult =
-	| { text: string; fromCache: boolean; error?: undefined }
-	| { text?: undefined; fromCache: false; error: unknown };
+/**
+ * The text a refused read returns: why it was not performed, then the map.
+ *
+ * The map is rendered with its header, so the model still sees the file's size and hash.
+ */
+function renderReason(offset: number, summarized: Summarized): string {
+	const where = offset === 1 ? "this file" : `lines ${offset} onward`;
+	const banner = [
+		`# read not performed: ${where} is longer than ${READ_LINE_LIMIT} lines, and a read returns`,
+		`# at most ${READ_LINE_LIMIT}. The summary is below; read one of its ranges with offset/limit.`,
+		"",
+	];
+	return [...banner, summarized.text].join("\n");
+}
+
+/** A summary to answer the read with, or the reason there is none. */
+type Summarized = { text: string; error?: undefined } | { text?: undefined; error: unknown };
 
 /**
- * Get a summary to append, from cache or by generating one.
+ * Get a summary from cache or by generating one.
  *
  * Nothing here throws: a `read` must not fail because the summarizer did. A cache problem
- * falls through to generating a summary, and a failure to generate is returned so the
- * caller can notify and leave the read unmodified.
+ * falls through to generating a summary, and a failure to generate is returned so the caller
+ * can notify and let the read through.
  */
-async function ensureSummary(ctx: ExtensionContext, absPath: string): Promise<EnsureResult> {
+async function ensureSummary(ctx: ExtensionContext, absPath: string): Promise<Summarized> {
 	try {
 		const peek = await peekFreshSummary(ctx, absPath);
-		if (peek) return { text: renderSummary(peek.entry), fromCache: true };
+		if (peek) return { text: renderSummary(peek.entry) };
 	} catch {
 		// Fall through to generating one; an unreadable cache is not fatal.
 	}
@@ -153,7 +153,7 @@ async function ensureSummary(ctx: ExtensionContext, absPath: string): Promise<En
 	try {
 		outcome = await summarizeFile(ctx, { path: absPath });
 	} catch (error) {
-		return { fromCache: false, error };
+		return { error };
 	}
-	return { text: renderSummary(outcome.entry), fromCache: false };
+	return { text: renderSummary(outcome.entry) };
 }

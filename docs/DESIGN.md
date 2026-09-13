@@ -14,9 +14,9 @@ part of the file holds what before paying for all of it.
 `M1` **`summary` tool** — one model call per file, cached. Returns what the file does
 plus a line map: which region holds which declaration.
 
-`M2` **`read` guard** — `tool_call` handler on `read`. Caps a call whose line span
-exceeds 200 by setting `input.limit`, and appends the summary of the file to the result,
-so the capped read is not a dead end: the model keeps the lines it asked for plus the map.
+`M2` **`read` guard** — `tool_call` handler on `read`. A call whose line span exceeds
+200 is refused, and the refusal carries the file's summary, so the model gets the map
+instead of a dead end. A call within the limit is returned exactly as asked.
 
 Neither mechanism depends on the other. `M1` alone saves tokens on deliberate use.
 `M2` alone forces the model to work in ranges. Together, `M2` teaches and `M1` pays.
@@ -34,12 +34,10 @@ repaired (§9 `E5`). The retry cap exists so this stays a bounded cost rather th
 unbounded loop.
 
 `C2` The read guard — zero model calls when a fresh summary is cached. When the file was
-never summarized (or the entry is stale) it **summarizes the file and appends the map**, so
-an oversized `read` is answered with a map instead of a dead end. That means a cold
-oversized `read` spends up to three model calls without the caller naming the file to
-`summary`. This is the extension's one unannounced spend, and it is bounded by the same
-`MAX_ATTEMPTS` ceiling. The appended text always says which happened: `generated for this
-read` versus `Cached summary of this file`.
+never summarized (or the entry is stale) it **summarizes the file and returns the map as the
+answer to the read**. That means an oversized `read` spends up to three model calls without
+the caller naming the file to `summary`. This is the extension's one unannounced spend, and
+it is bounded by the same `MAX_ATTEMPTS` ceiling.
 
 Rejected: search-across-cached-summaries and project-wide refresh. Both are unbounded
 fan-out driven by caller text; both were built and removed.
@@ -159,11 +157,18 @@ it does not know a file's length until it has read it, which is the action being
 trigger the model cannot test reads as inapplicable and is skipped, so the tool went unused.
 The trigger is now "a source file you have not seen", which is known at decision time.
 
-`P2` The guidelines must not advertise what the guard refuses to cap. The old text said to
+`P2` The guidelines must not advertise what the guard lets through. The old text said to
 call `summary` on "prose, config, and data" and the description claimed it "works on any text
 file". Both are now false of the read path (`G3`), and they dilute the code trigger that the
 tool is for. The `summary` tool still summarizes any text file on request — only the wording
 stops inviting it for prose.
+
+The same rule killed the bullet that described the guard: "a read longer than 200 lines is
+not performed, it returns the file's summary instead." True, and useless — it tells the
+model that reading a big file costs nothing and yields the map anyway, which is precisely
+the reason not to call the tool. The guard's refusal says the same thing at the moment it
+is true, when the model has already made the mistake. The guideline list states only the
+case for calling `summary` first.
 
 `P3` The description leads with the action and the cost. The model already knows `read` works,
 so it needs a reason to spend a call instead: "a 1400-line file costs seven reads or one
@@ -178,25 +183,24 @@ return number 200 or fewer:
 span = min(limit ?? Infinity, totalLines - offset + 1)
 ```
 
-So `read(big-file)` is capped to 200 lines, `read(big-file, offset=141, limit=200)` is
-allowed, `read(small-file)` is allowed, and `read(big-file, offset=1400, limit=10)` is
-allowed. A call already carrying a small `limit` is never touched, so the guard does not
-fight a model that is reading properly.
+So `read(big-file)` is refused and answered with the map,
+`read(big-file, offset=141, limit=200)` is allowed, `read(small-file)` is allowed, and
+`read(big-file, offset=1400, limit=10)` is allowed. A call already carrying a small
+`limit` is never touched, so the guard does not fight a model that is reading properly.
 
 Verified against the built-in tool: `read(offset=1000, limit=200)` on a 3000-line file
 returns lines 1000-1199, followed by `[1802 more lines in file. Use offset=1200 to
-continue.]`. Content is returned from the requested offset; a guarded file is never
-replaced by the map. The guard's 200-line figure is its own limit, not the built-in
-tool's - the built-in caps at 2000 lines / 50KB, which is why an allowed read of a large
-file still comes back truncated (`G6`).
+continue.]`. The guard's 200-line figure is its own limit, not the built-in
+tool's - the built-in caps at 2000 lines / 50KB, so a large file that reaches the guard's
+failure path (`G6`) comes back truncated by the built-in cap rather than in full.
 
 `G2` Counting lines is bounded. The guard only needs to know whether more than 200
 lines remain from `offset`, so it streams the file in 64KB chunks and stops counting
 once it has passed `offset + 200`. It never reads a large file fully into memory, and
 it reads at most `offset + 200` lines regardless of file size. When it hits the budget
-it returns `stopAfter + 1` as a sentinel, which is why the guard knows only that the span
-exceeded 200 lines and caps to a fixed 200 rather than naming an exact count it never
-computed.
+it returns `stopAfter + 1` as a sentinel, so the guard knows only that the span
+exceeded 200 lines. It never needs the exact count: the map's own header carries the file's
+line count.
 
 `G3` Non-text and non-code files are not guarded. Binary and image reads are already governed
 by the built-in byte cap and by `autoResizeImages`; a 200-line limit on a PNG is meaningless.
@@ -205,21 +209,31 @@ first 8000.
 
 It also skips `.md`, `.txt`, and any path with no extension — `Makefile`, `.gitignore`,
 `LICENSE`. Same reasoning: prose and notes are written to be read in order, and a map of a
-README says nothing a skim does not, so capping one only cuts it mid-section. The 200-line cap
-is for source files, where guessing the wrong range costs a wasted call. Unguarded paths fall
-through to the built-in `read`, which has its own 2000-line cap. The `summary` tool itself
-still accepts any text file on request; only the read override skips prose. Note that
-`.eslintrc.json` *is* guarded — a dotfile's leading dot is not an extension.
+README says nothing a skim does not, so refusing one only takes the file away. The 200-line
+limit is for source files, where guessing the wrong range costs a wasted call. Unguarded
+paths fall through to the built-in `read`, which has its own 2000-line cap. The `summary`
+tool itself still accepts any text file on request; only the read override skips prose. Note
+that `.eslintrc.json` *is* guarded — a dotfile's leading dot is not an extension.
 
-`G4` The read is capped, not blocked: the guard sets `input.limit = 200` and appends the map
-to the result. `tool_call` handlers may mutate `input`, and a blocked call is not a viable
-alternative — pi's core turns a block into `createErrorToolResult`, and no `tool_result`
-handler runs for it, so a blocked read can only ever be reported to the model as a failure.
-Clamping and appending keeps the read a success, because the read did happen: the model gets
-the first 200 lines from its offset, plus the map. The appended text names the range it kept
-and labels the map as cached or just generated.
+`G4` A read either returns the lines it was asked for, or it returns the map. Nothing else.
 
-The map is appended whole, uncapped. The cap that used to be here — 6000 chars, applied
+A span of 200 lines or fewer is left alone and returns exactly what was read. A span of more
+is **refused**: the guard returns `{ block: true, reason }`, the read never runs, and the
+reason is the map, preceded by two lines saying the read was not performed and the model
+should read one of the ranges below with `offset`/`limit`.
+
+Blocking is what makes the two answers unambiguous. The earlier design clamped
+`input.limit` to 200 and appended the map to the result: the model then spent the context of
+a real read, still saw only a fraction of the file, and had to notice a tail it did not ask
+for to learn it had been cut. `read`'s own limit is the rule — ask for more than it and the
+answer is the map, not a shortened file with a map attached.
+
+A block is reported by pi's core as an error tool result, which is correct here: the read
+did not happen. The reason text is the only channel out, since pi skips `tool_result`
+entirely for a blocked call — which is why the map is inside the reason rather than in a
+replacement result.
+
+The map is rendered whole, uncapped. The cap that used to be here — 6000 chars, applied
 twice, once inside the renderer and again over the composed reason — was worse than the
 problem it solved. Truncation kept the *first* rows of the map, so what the model received
 was contiguous and therefore indistinguishable from a complete map, while the trailing read
@@ -229,16 +243,14 @@ partial one.
 
 `G5` The guard is implemented with `pi.on("tool_call")`, not by overriding the `read`
 tool. A second `read` registration would replace the built-in renderer and any other
-extension's `read` override; the event handler composes with both. It does patch args —
-`input.limit` is clamped — which pi supports by mutating `input` in place, and the appended
-text says so, so the model is told its call was shortened rather than discovering it.
+extension's `read` override; the event handler composes with both.
 
-`G6` A failed summary **leaves the read untouched** — it neither caps nor appends. With no map
-to offer, clamping would only take lines away from the model, so the read proceeds as the
-model asked. The failure is reported as a notification and, since a notification does not
+`G6` A failed summary **lets the read through** — the call is not blocked, because with no
+map to offer a refusal would take the file away and leave nothing behind. The read proceeds
+as the model asked and keeps the built-in 2000-line cap, so a large file comes back truncated
+by that cap. The failure is reported as a notification and, since a notification does not
 exist in print or RPC runs, appended to the read result through a `tool_result` handler keyed
-by tool call id. The read keeps the built-in 2000-line cap, so a large file is returned
-truncated rather than in full.
+by tool call id.
 
 `G7` The guard never turns a failure into a raised error. `summary` failing is recoverable
 by definition - the file is still there - so the read path always produces a result.
@@ -295,7 +307,7 @@ counting task into a copying task. See `S6`.
 nothing (blank lines, license headers, generated boilerplate) rather than invent a region
 to cover them. Rows must not overlap; overlaps are trimmed locally (`E2`). Notes and the
 overview are cut at `MAX_NOTE_CHARS = 200` and `MAX_OVERVIEW_CHARS = 2400` on the way into
-storage, so one runaway field cannot crowd the map out of the appended text.
+storage, so one runaway field cannot crowd the map out of the read answer.
 
 No `tools` array is sent to the summarizer, and it is never given tools to call. JSON mode
 is attempted opportunistically through `samplingParams:{response_format:{type:"json_object"}}`,
@@ -385,8 +397,8 @@ map: none - summarized as a single blob, so there is no line detail
 ```
 
 `S5` The mode is visible everywhere the entry is used — in `summary` output and in the
-rendered `## map` block — so the model can tell what to trust. A blob entry still satisfies
-the guard, but it tells the model to grep or read in ranges instead of pretending to know
+rendered `## map` block — so the model can tell what to trust. A blob entry still answers the
+guard, but it tells the model to grep or read in ranges instead of pretending to know
 where anything is.
 
 ## 10. Decisions taken
@@ -394,8 +406,8 @@ where anything is.
 `D1` Storage: prose overview plus derived section rows. No stored blob, no stored
 rendered map, no FTS index.
 
-`D2` `read` guard caps oversized spans at 200 lines and appends the cached summary to the
-result.
+`D2` `read` guard refuses a span longer than 200 lines and returns the cached summary as the
+answer to the read.
 
 `D3` Delivered as a publishable pi package: `package.json` with `pi.extensions`,
 `pi-package`/`pi-extension` keywords, README, tsconfig, and a `smoke.mjs` that drives
@@ -415,8 +427,7 @@ than failing the call or fabricating a map.
 `D6` The read guard summarizes a file it has no fresh summary for, so an oversized `read`
 always comes back with a map. This overrides the earlier "the guard never calls a model"
 rule: the user asked for the guard to create the summary rather than return an error. The
-cost is bounded by `D5`'s ceiling, and the appended text states whether the map was cached
-or just generated.
+cost is bounded by `D5`'s ceiling.
 
 `D7` The summarizer model is configurable through a `summary.model` key in pi's settings
 file, project scope winning over global, defaulting to the session model.
@@ -443,7 +454,7 @@ asking the model to map blank lines it had been told to skip.
 characters — deliberately looser than the original one-to-three-sentence overview and
 90-character note, which were too tight to say anything about how a region is used. Both
 are cut on the way into storage (`MAX_OVERVIEW_CHARS = 2400`, `MAX_NOTE_CHARS = 200`) so a
-single runaway field cannot crowd the map out of the appended read text.
+single runaway field cannot crowd the map out of the read answer.
 
 `D12` The excerpt is line-numbered and the prompt says to copy numbers out of the left
 column rather than count lines. This is the response to a measured failure: given raw
@@ -457,12 +468,15 @@ lock; with the default zero timeout a second process opening the same cache fail
 immediately with `SQLITE_BUSY` instead of waiting. Measured with 12 concurrent writers:
 the original order lost a row in 4 of 6 runs, the corrected order in 0 of 6.
 
-`D14` A capped `read` is a success, not a block. The guard clamps `input.limit` and appends
-the map through a `tool_result` handler instead of returning `{ block: true }`. A block is
-reported by pi's core as an error result and skips `tool_result` entirely, so a blocked read
-could never carry the map without also carrying a failure.
+`D14` A read longer than 200 lines **is not performed**. The guard returns `{ block: true }`
+with the map as the reason. Two earlier designs were tried and rejected. Clamping
+`input.limit` to 200 and appending the map was built and shipped: it spends the context of a
+real read, still shows a fraction of the file, and hides the cut in a tail the model did not
+ask for. A block that carries only an instruction, with no map, was rejected because it turns
+a read into a failure with nothing to show for it. Blocking *with* the map is the design:
+the model asked to see more than a read can return, and the map is the useful answer.
 
-`D15` Neither the rendered summary nor the appended text names the summarizer model. It is
+`D15` Neither the rendered summary nor the refusal text names the summarizer model. It is
 recorded in the cache and in the tool result's `details`, where it is useful for diagnosing a
 bad map, but it tells the model nothing it can act on and invites it to reason about the map's
 trustworthiness from a model name it has no basis to judge.

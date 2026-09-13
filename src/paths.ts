@@ -4,10 +4,10 @@ import { dirname, extname, isAbsolute, join, relative, resolve, sep } from "node
 /**
  * Extensions the read guard leaves alone.
  *
- * Prose and notes are read whole - they are written to be read in order, and a 200-line cap
- * on a README cuts it mid-section while the map of a README adds nothing a skim does not.
- * The cap exists for source files, where a wrong guess about where a symbol lives costs a
- * wasted call.
+ * Prose and notes are read whole - they are written to be read in order, and refusing a
+ * README because of its length only takes the file away, while the map of one adds nothing a
+ * skim does not. The limit exists for source files, where a wrong guess about where a symbol
+ * lives costs a wasted call.
  */
 const UNGUARDED_EXTENSIONS = new Set([".md", ".txt"]);
 

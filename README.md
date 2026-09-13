@@ -7,10 +7,10 @@ Two things, working together:
 - **`summary` tool** — normally one model call per file, at most three. Returns what the
   file does and a map of which line ranges hold what. Cached in SQLite; asking again
   returns the cached result without a model call until the file's contents change.
-- **`read` guard** — `tool_call` handler that caps any `read` that would return more
-  than 200 lines to 200, and appends a summary of the file to the result. The cap is not a
-  dead end: the model keeps the lines it asked for plus the map it needed. A file with no
-  summary yet is summarized on the spot and labelled as such. Prose, notes and extensionless
+- **`read` guard** — `tool_call` handler that refuses any `read` longer than 200 lines and
+  returns the file's summary instead, so the model reads one of the map's ranges rather than
+  the whole file. A read of 200 lines or fewer is returned exactly as asked. A file with no
+  summary yet is summarized on the spot. Prose, notes and extensionless
   files (`.md`, `.txt`, `Makefile`, `.gitignore`) are never touched — they read whole.
 
 ## Install
@@ -60,40 +60,35 @@ every attempt, so a test that does not set it signs with an empty key.
 # read src/foo.ts with offset/limit inside one range (max 200 lines per call).
 ```
 
-A later `read path="src/foo.ts"` with no range is capped, and the map is appended to
-the lines that did come back:
+A later `read path="src/foo.ts"` with no range is refused, and the map is all that comes
+back:
 
 ```
-...lines 1-200 of src/foo.ts...
+# read not performed: this file is longer than 200 lines, and a read returns
+# at most 200. The summary is below; read one of its ranges with offset/limit.
 
-# this call would have returned more than 200 lines, so it was capped at
-# limit=200: lines 1-200 are above. Use offset/limit to read
-# further, or read one region below.
+# src/foo.ts  (1420 lines, 48.2KB, sha 9f2c1ab4)
 
-Cached summary of this file (use these line ranges):
+An HTTP client for the internal Orders API. ...
 
 ## map
    1-  24  import   node/fs, node/path; module constants
   26- 140  class    FooClient - HTTP transport with retry
  141- 620  method   FooClient.request() - builds, signs, sends
  621-1420  method   FooClient.retry() - backoff and jitter
+
+# read src/foo.ts with offset/limit inside one range above (max 200 lines per call).
 ```
 
 `read path="src/foo.ts" offset=141 limit=200` passes through untouched.
 
-A `read` that already carries a small `limit` is never modified, so the guard does not
-fight a model that is reading properly. `read path="src/foo.ts" limit=2000` is capped the
+A `read` that already carries a small `limit` is never touched, so the guard does not
+fight a model that is reading properly. `read path="src/foo.ts" limit=2000` is refused the
 same way a bare `read` is — the span that would come back is what counts, not whether
-`limit` was passed.
+`limit` was passed. A file whose summary cannot be produced is read as asked, with the
+failure reported instead: with no map to offer, refusing would only take the file away.
 
-If nothing is cached yet, the guard summarizes the file and says so:
-
-```
-Summary of this file, generated for this read (use these line ranges):
-...
-```
-
-That makes an oversized `read` of an unfamiliar file cost model calls without you asking
+Until the file is summarized, an oversized `read` costs model calls without you asking
 for them — the one place this extension spends unbounded-by-the-caller, capped at three
 calls per file and cached afterwards.
 
@@ -155,9 +150,9 @@ failing.
   which is unbounded model spend driven by a query string.
 - **No project-wide refresh.** Same reason.
 - **No `read` tool override.** The guard is a `tool_call` handler, so it composes with
-  the built-in renderer and with other extensions that already override `read`. It clamps
-  `limit` on the input and appends to the result rather than blocking, because a blocked
-  call is an error result the extension cannot amend.
+  the built-in renderer and with other extensions that already override `read`. It refuses
+  the oversized call and puts the map in the refusal, rather than replacing the `read` tool
+  or shortening its input.
 
 ## Development
 
@@ -169,10 +164,10 @@ npm run check     # tsc --noEmit && node smoke.mjs
 `smoke.mjs` drives the real tool and the real guard with a fake `ExtensionAPI` and a
 fake `ModelRegistry`, against a temp project directory. It covers cache hit/miss/stale/
 forced, the hash-over-mtime rule, the blob degradation, the repair loop and its cap,
-the `mtime_ms` migration, settings precedence, and the guard's cap boundaries —
-including that a cold oversized read summarizes, that the appended map carries every row
-uncut, that prose and extensionless files are left outside the cap, and that a failing
-summarizer leaves the read alone and says so.
+the `mtime_ms` migration, settings precedence, and the guard's boundaries —
+including that a cold oversized read summarizes and returns the map, that the map carries
+every row uncut, that prose and extensionless files are left outside the limit, and that a
+failing summarizer lets the read through and says so.
 
 Nothing checks the map's *content*. Structure and schema are validated, and a
 contiguous, well-formed map can still name the wrong lines. The defence is in the prompt

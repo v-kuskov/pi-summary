@@ -1,7 +1,7 @@
 {
   "name": "pi-summary",
   "version": "0.1.0",
-  "description": "Pi Coding Agent extension — summarizes a file once with a model, caches the result in local SQLite, and caps `read` at 200 lines per call so the model asks for the range it needs.",
+  "description": "Pi Coding Agent extension — summarizes a file once with a model, caches the result in local SQLite, and answers any `read` of more than 200 lines with that file's map instead of the whole file.",
   "keywords": [
     "pi-package",
     "pi-extension",

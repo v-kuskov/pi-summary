@@ -49,8 +49,6 @@ export function renderMap(sections: Section[]): string {
 }
 
 export type RenderOptions = {
-	/** Include the cache/model header lines. Off inside a read-block reason. */
-	header?: boolean;
 	/**
 	 * Cache state shown in the header. Includes the two states that only exist right after
 	 * a model call: `miss` (nothing was cached) and `forced` (an explicit refresh).
@@ -61,21 +59,21 @@ export type RenderOptions = {
 /**
  * Render a cached summary as the text the model sees. The map is always derived from the
  * section rows, so the prose and the line numbers cannot drift apart.
+ *
+ * The header is always shown, and it never names the summarizer model (`D15`): the model a
+ * file was summarized with is not something the caller can act on.
  */
 export function renderSummary(entry: CachedSummary, options: RenderOptions = {}): string {
-	const showHeader = options.header ?? true;
 	const parts: string[] = [];
 
-	if (showHeader) {
-		parts.push(
-			`# ${entry.path}  (${entry.lines} lines, ${formatBytes(entry.bytes)}, sha ${entry.hash})`,
-		);
-		if (options.freshness) parts.push(`cache: ${options.freshness}`);
-		if (entry.mode === "blob") {
-			parts.push("map: none - summarized as a single blob, so there is no line detail");
-		}
-		parts.push("");
+	parts.push(
+		`# ${entry.path}  (${entry.lines} lines, ${formatBytes(entry.bytes)}, sha ${entry.hash})`,
+	);
+	if (options.freshness) parts.push(`cache: ${options.freshness}`);
+	if (entry.mode === "blob") {
+		parts.push("map: none - summarized as a single blob, so there is no line detail");
 	}
+	parts.push("");
 
 	parts.push(entry.overview.trim());
 	parts.push("");

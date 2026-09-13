@@ -96,8 +96,8 @@ const runTool = (h, name, params) =>
 /**
  * Run every tool_call handler and return the (possibly mutated) input, as pi sees it.
  *
- * The guard does not block: it clamps `input.limit` in place, so a test reads the mutation
- * and then asks for the text appended to the result phase.
+ * A refused read is not a mutation - the guard blocks it - so the refusal is read from
+ * `runGuardBlock`. This is for the reads that are let through.
  */
 async function runGuard(h, input) {
 	for (const { event, handler } of h.handlers) {
@@ -105,6 +105,22 @@ async function runGuard(h, input) {
 		await handler({ type: "tool_call", toolCallId: "t", toolName: "read", input }, h.ctx);
 	}
 	return input;
+}
+
+/**
+ * Run every tool_call handler and return the reason the guard refused the read, or undefined
+ * when the call is left to run.
+ */
+async function runGuardBlock(h, input) {
+	for (const { event, handler } of h.handlers) {
+		if (event !== "tool_call") continue;
+		const out = await handler(
+			{ type: "tool_call", toolCallId: "t", toolName: "read", input },
+			h.ctx,
+		);
+		if (out?.block) return out.reason;
+	}
+	return undefined;
 }
 
 /** Run every tool_result handler, returning the replacement content if one was produced. */
@@ -1069,24 +1085,22 @@ await check("a file outside the project root is still cached", async () => {
 
 // ------------------------------------------------------------------ read guard
 
-await check("the guard caps a full read and hands back the map", async () => {
+await check("the guard refuses a read longer than it returns", async () => {
 	const root = tempProject();
 	try {
 		writeFileSync(join(root, "src", "a.ts"), numbered(400));
 		const h = makeHarness({ cwd: root });
 
-		const input = await runGuard(h, { path: "src/a.ts" });
-		assert.equal(input.limit, 200, "the span is clamped to the limit");
-		const text = await appendedText(h, input);
-		assert.match(text, /capped at/);
-		assert.match(text, /lines 1-200/);
-		assert.match(text, /generated for this read/, "a cold cap carries a fresh map");
+		const reason = await runGuardBlock(h, { path: "src/a.ts" });
+		assert.match(reason, /read not performed/);
+		assert.match(reason, /at most 200/);
+		assert.match(reason, /## map/, "the reason carries the map, not just a refusal");
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
 });
 
-await check("the appended map carries every row, with nothing cut off", async () => {
+await check("the refused map carries every row, with nothing cut off", async () => {
 	// A cap here used to truncate the map to a fraction of its rows and drop the trailing
 	// read hint. The partial map was indistinguishable from a complete one because the rows
 	// it kept were contiguous, so a model capped for needing a map got a plausible map with
@@ -1108,9 +1122,7 @@ await check("the appended map carries every row, with nothing cut off", async ()
 			respond: () => jsonResponse({ overview: "Many functions.", sections: rows }),
 		});
 
-		const input = await runGuard(h, { path: "src/big.ts" });
-		assert.equal(input.limit, 200);
-		const text = await appendedText(h, input);
+		const text = await runGuardBlock(h, { path: "src/big.ts" });
 		assert.ok(!text.includes("truncated"), "no truncation marker");
 		for (const index of [0, 199, 399]) {
 			assert.match(text, new RegExp(`handleThing${index}\\(\\)`), `row ${index} is present`);
@@ -1128,51 +1140,47 @@ await check("the guard leaves bounded reads and small files alone", async () => 
 		writeFileSync(join(root, "src", "big.ts"), numbered(400));
 		writeFileSync(join(root, "src", "small.ts"), numbered(20));
 		const h = makeHarness({ cwd: root });
+		const allowed = async (input, what) => assert.equal(await runGuardBlock(h, input), undefined, what);
 
-		assert.equal((await runGuard(h, { path: "src/big.ts", limit: 200 })).limit, 200, "exactly 200 ok");
-		assert.equal((await runGuard(h, { path: "src/big.ts", limit: 100 })).limit, 100, "limit ok");
-		assert.equal((await runGuard(h, { path: "src/small.ts" })).limit, undefined, "small file ok");
-		assert.equal(
-			(await runGuard(h, { path: "src/nope.ts" })).limit,
-			undefined,
-			"missing file left alone",
-		);
-		assert.equal(
-			(await runGuard(h, { path: "src/big.ts", offset: 401 })).limit,
-			undefined,
-			"past EOF left alone",
-		);
-		assert.equal(await appendedText(h, {}), undefined, "and nothing was appended");
+		await allowed({ path: "src/big.ts", limit: 200 }, "exactly 200 lines is a read");
+		await allowed({ path: "src/big.ts", limit: 100 }, "a smaller limit is a read");
+		await allowed({ path: "src/small.ts" }, "a small file is a read");
+		await allowed({ path: "src/nope.ts" }, "a missing file is left to the read tool");
+		await allowed({ path: "src/big.ts", offset: 401 }, "past EOF is left to the read tool");
+		assert.equal(h.calls.length, 0, "and no allowed read spends a model call");
+		assert.equal(await appendedText(h, {}), undefined, "nothing was appended either");
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
 });
 
-await check("the guard caps an oversized tail and names the range it kept", async () => {
+await check("an oversized tail is refused and the offset named", async () => {
 	const root = tempProject();
 	try {
 		writeFileSync(join(root, "src", "big.ts"), numbered(400));
 		const h = makeHarness({ cwd: root });
 
-		const input = await runGuard(h, { path: "src/big.ts", offset: 150 });
-		assert.equal(input.limit, 200);
-		assert.match(await appendedText(h, input), /lines 150-349/);
+		const tail = await runGuardBlock(h, { path: "src/big.ts", offset: 150 });
+		assert.match(tail, /lines 150 onward/);
+		assert.match(tail, /## map/);
 
 		assert.equal(
-			(await runGuard(h, { path: "src/big.ts", offset: 202 })).limit,
+			await runGuardBlock(h, { path: "src/big.ts", offset: 202 }),
 			undefined,
-			"exactly 200 lines from the offset is allowed",
+			"exactly 200 lines from the offset is a read",
 		);
-		// numbered(400) counts as 401 lines, so 201..401 is 201 lines and must be capped.
-		const nearEnd = await runGuard(h, { path: "src/big.ts", offset: 201 });
-		assert.equal(nearEnd.limit, 200);
-		assert.match(await appendedText(h, nearEnd), /lines 201-400/);
+		// numbered(400) counts as 401 lines, so 201..401 is 201 lines and must be refused.
+		assert.match(
+			await runGuardBlock(h, { path: "src/big.ts", offset: 201 }),
+			/read not performed/,
+			"one line over the limit is refused",
+		);
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
 });
 
-await check("a cold oversized read is summarized by the guard and the map appended", async () => {
+await check("a cold oversized read is summarized by the guard and refused with the map", async () => {
 	const root = tempProject();
 	try {
 		writeFileSync(join(root, "src", "a.ts"), numbered(500));
@@ -1187,25 +1195,21 @@ await check("a cold oversized read is summarized by the guard and the map append
 				}),
 		});
 
-		const input = await runGuard(h, { path: "src/a.ts" });
-		assert.equal(input.limit, 200);
-		const text = await appendedText(h, input);
+		const text = await runGuardBlock(h, { path: "src/a.ts" });
 		assert.equal(h.calls.length, 1, "the guard paid for one summarization");
-		assert.match(text, /generated for this read/, "says the map was just made");
-		assert.match(text, /SyncClient/);
-		assert.doesNotMatch(text, /No summary is available/);
+		assert.match(text, /read not performed/, "the read does not run");
+		assert.match(text, /SyncClient/, "the map it just made is the answer");
 
 		// The work it did is cached, so the next oversized read costs nothing.
-		const again = await runGuard(h, { path: "src/a.ts" });
-		assert.equal(again.limit, 200);
-		assert.equal(h.calls.length, 1, "second cap is served from cache");
-		assert.match(await appendedText(h, again), /Cached summary of this file/);
+		const again = await runGuardBlock(h, { path: "src/a.ts" });
+		assert.equal(h.calls.length, 1, "the second read is served from cache");
+		assert.match(again, /SyncClient/);
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
 });
 
-await check("a failing summarizer leaves the read untouched and notifies", async () => {
+await check("a failing summarizer lets the read through and notifies", async () => {
 	const root = tempProject();
 	try {
 		writeFileSync(join(root, "src", "a.ts"), numbered(500));
@@ -1217,11 +1221,11 @@ await check("a failing summarizer leaves the read untouched and notifies", async
 		h.ctx.ui = { notify: (message, type) => h.notices.push({ message, type }) };
 
 		const input = await runGuard(h, { path: "src/a.ts" });
-		assert.equal(input.limit, undefined, "the read is not shortened when there is no map");
+		assert.equal(input.limit, undefined, "the read is not rewritten when there is no map");
 		assert.equal(h.notices.length, 1, "the failure is surfaced");
 		assert.equal(h.notices[0].type, "error");
 		assert.match(h.notices[0].message, /upstream is down/);
-		assert.match(h.notices[0].message, /Reading the whole file instead/);
+		assert.match(h.notices[0].message, /Reading the file directly/);
 
 		// Without a UI a notification reaches nobody, so the same notice rides the read
 		// result the model actually receives.
@@ -1259,7 +1263,7 @@ await check("the guard is silent for reads inside the limit", async () => {
 	}
 });
 
-await check("a fresh summary is appended to the capped read", async () => {
+await check("a read of a summarized file returns the cached map", async () => {
 	const root = tempProject();
 	try {
 		writeFileSync(join(root, "src", "a.ts"), numbered(400));
@@ -1277,20 +1281,18 @@ await check("a fresh summary is appended to the capped read", async () => {
 			},
 		});
 
-		// A cold oversized read is answered with a map the guard generates itself.
-		const cold = await runGuard(h, { path: "src/a.ts" });
-		assert.equal(h.calls.length, 1, "the guard summarizes a file it has never seen");
-		assert.match(await appendedText(h, cold), /generated for this read/);
-
+		// Calling the tool is what puts the map in the cache, and the read is then answered
+		// from it, without a second model call.
 		await runTool(h, "summary", { path: "src/a.ts" });
-		const input = await runGuard(h, { path: "src/a.ts" });
-		assert.equal(input.limit, 200);
-		const text = await appendedText(h, input);
-		assert.match(text, /Cached summary of this file/);
+		assert.equal(h.calls.length, 1);
+
+		const text = await runGuardBlock(h, { path: "src/a.ts" });
+		assert.equal(h.calls.length, 1, "the read is answered from the cache");
+		assert.match(text, /read not performed/);
 		assert.match(text, /## map/);
 		assert.match(text, /SyncClient/);
 		assert.match(text, /retry\(\)/);
-		assert.match(text, /offset\/limit|limit=200/);
+		assert.match(text, /offset\/limit/);
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
@@ -1316,11 +1318,9 @@ await check("the guard replaces a stale summary instead of quoting it", async ()
 
 		// The file grows, so the cached entry is stale and describes the wrong line count.
 		writeFileSync(file, numbered(600));
-		const input = await runGuard(h, { path: "src/a.ts" });
+		const text = await runGuardBlock(h, { path: "src/a.ts" });
 		assert.equal(h.calls.length, 2, "a stale entry is refreshed, not quoted");
-		const text = await appendedText(h, input);
-		assert.match(text, /generated for this read/);
-		assert.match(text, /Generation 2\./, "the fresh overview is what was shown");
+		assert.match(text, /Generation 2\./, "the fresh overview is what is shown");
 		assert.doesNotMatch(text, /Generation 1\./, "the stale overview was not reused");
 	} finally {
 		rmSync(root, { recursive: true, force: true });
@@ -1328,9 +1328,9 @@ await check("the guard replaces a stale summary instead of quoting it", async ()
 });
 
 await check("the guard leaves prose, notes and extensionless files to read", async () => {
-	// The 200 line cap is for source files, where guessing the wrong range costs a call. A
+	// The 200 line limit is for source files, where guessing the wrong range costs a call. A
 	// README is written to be read in order, and a map of one says nothing a skim does not,
-	// so capping it only cuts it mid-section. Unguarded paths fall through to the built-in
+	// so refusing it only takes the file away. Unguarded paths fall through to the built-in
 	// read, which has its own 2000-line cap.
 	const root = tempProject();
 	try {
@@ -1341,14 +1341,16 @@ await check("the guard leaves prose, notes and extensionless files to read", asy
 		const h = makeHarness({ cwd: root });
 
 		for (const name of ["README.md", "notes.txt", "Makefile", ".gitignore", "LICENSE"]) {
-			const input = await runGuard(h, { path: name });
-			assert.equal(input.limit, undefined, `${name} is not capped`);
+			assert.equal(await runGuardBlock(h, { path: name }), undefined, `${name} is a read`);
 		}
 		assert.equal(h.calls.length, 0, "and none of them is summarized");
 
-		// A source file beside them still is, so the filter is the extension, not the size.
-		const code = await runGuard(h, { path: "src/a.ts" });
-		assert.equal(code.limit, 200, "a .ts file of the same size is still capped");
+		// A source file beside them is refused, so the filter is the extension, not the size.
+		assert.match(
+			await runGuardBlock(h, { path: "src/a.ts" }),
+			/read not performed/,
+			"a .ts file of the same size returns a map instead",
+		);
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
@@ -1397,7 +1399,7 @@ await check("the guard allows the read when it cannot read the file itself", asy
 		execFileSync("icacls", [file, "/deny", `${user}:(R)`], { stdio: "pipe" });
 		try {
 			const out = await runGuard(h, { path: "src/denied.ts" });
-			assert.equal(out.limit, undefined, "guard leaves the read alone rather than shortening it");
+			assert.equal(out.limit, undefined, "the guard leaves the read alone rather than refusing it");
 			assert.equal(h.calls.length, 0, "and never reaches the summarizer");
 		} finally {
 			execFileSync("icacls", [file, "/remove:d", user], { stdio: "pipe" });

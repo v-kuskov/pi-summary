@@ -255,7 +255,7 @@ async function requestSummary(
  * Cut a runaway overview, keeping whole sentences so the prose still reads cleanly.
  *
  * The prompt allows ten sentences, which is a lot; a model that ignores that could return a
- * page of prose and push the map out of the read-block reason entirely.
+ * page of prose and push the map out of the guard's refusal text entirely.
  */
 function truncateOverview(overview: string): string {
 	if (overview.length <= MAX_OVERVIEW_CHARS) return overview;

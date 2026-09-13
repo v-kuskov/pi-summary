@@ -41,8 +41,6 @@ export function registerSummaryTool(pi: ExtensionAPI): void {
 		promptSnippet: "Map a code file's line ranges before reading it",
 		promptGuidelines: [
 			`Before reading a source file you have not seen, call summary on it first. It returns the line ranges, so you read one region instead of the whole file.`,
-			`When a read comes back capped at ${READ_LINE_LIMIT} lines, the map of the whole file is appended to that result. Use it to pick the next range with offset and limit.`,
-			"Reach for summary on large or unfamiliar code, where reading the whole file costs many calls and still overflows.",
 		],
 		parameters: Type.Object({
 			path: Type.String({
@@ -59,7 +57,8 @@ export function registerSummaryTool(pi: ExtensionAPI): void {
 					description: "Re-summarize even if the cached summary is still fresh.",
 				}),
 			),
-		}),		executionMode: "parallel",
+		}),
+		executionMode: "parallel",
 		async execute(
 			_id,
 			params,
@@ -82,7 +81,7 @@ export function registerSummaryTool(pi: ExtensionAPI): void {
 				return wholeFileFallback(ctx, params.path, error);
 			}
 			const lines: string[] = [];
-			lines.push(renderSummary(outcome.entry, { header: true, freshness: outcome.status }));
+			lines.push(renderSummary(outcome.entry, { freshness: outcome.status }));
 			if (outcome.degraded) {
 				lines.push(
 					`# the summarizer did not return a usable line map after ${outcome.attempts} attempts, so only the prose above is cached`,
