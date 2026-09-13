@@ -1,6 +1,8 @@
 import { mkdirSync, mkdtempSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir as osHomedir, tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
+import { setCapabilities, getCapabilities } from "@earendil-works/pi-tui";
 import { DatabaseSync } from "node:sqlite";
 import assert from "node:assert/strict";
 
@@ -1499,6 +1501,257 @@ await check("the replaced read keeps the built-in tool's surface", async () => {
 	// Renderers are resolved per slot by the TUI, so the built-in one draws our results too.
 	assert.equal(typeof registered.renderCall, "function", "the built-in call renderer is kept");
 	assert.equal(typeof registered.renderResult, "function", "the built-in result renderer is kept");
+});
+
+/**
+ * A theme that styles nothing.
+ *
+ * The renderers are the subject here, not the colors: an identity `fg`/`bold` leaves the text
+ * the renderer composed readable in an assertion, and the codes it would have emitted are pi's
+ * contract, tested in pi.
+ */
+const stubTheme = { fg: (_color, text) => text, bold: (text) => text };
+
+/**
+ * The render context the TUI hands a renderer, with the fields the renderers read.
+ *
+ * `lastComponent` starts undefined, which is how a first render arrives.
+ */
+function renderContext(overrides = {}) {
+	return {
+		args: {},
+		toolCallId: "id",
+		invalidate: () => {},
+		lastComponent: undefined,
+		state: undefined,
+		cwd: process.cwd(),
+		executionStarted: false,
+		argsComplete: true,
+		isPartial: false,
+		expanded: false,
+		showImages: false,
+		isError: false,
+		...overrides,
+	};
+}
+
+/** The visible rows a component renders to, trimmed and without blank padding. */
+function renderRows(component, width = 120) {
+	return component
+		.render(width)
+		.map((line) => line.trimEnd())
+		.filter((line) => line !== "")
+		.join("\n");
+}
+
+await check("the summary tool draws itself, and reuses the slot the TUI gives it", async () => {
+	// Without renderers a summary call is drawn generically, so the call that produced the map
+	// is the one line of the transcript that says nothing about what happened.
+	const h = makeHarness({ cwd: tempProject() });
+	const summary = h.tools.get("summary");
+
+	assert.equal(typeof summary.renderCall, "function", "summary has a call renderer");
+	assert.equal(typeof summary.renderResult, "function", "summary has a result renderer");
+
+	const called = renderRows(
+		summary.renderCall({ path: "src/big.ts" }, stubTheme, renderContext()),
+	);
+	assert.match(called, /summary/, "the call names the tool");
+	assert.match(called, /src\/big\.ts/, "and the file it is about");
+
+	// Arguments arrive a field at a time while the model is still writing the call, so a path
+	// that is not a string yet is the normal first frame, not a malformed call.
+	const streaming = renderRows(summary.renderCall({}, stubTheme, renderContext()));
+	assert.match(streaming, /summary/, "a call still streaming its arguments still renders");
+	assert.match(streaming, /\.\.\./, "with a placeholder where the path will be");
+
+	// A present argument of the wrong type is not a call still streaming, and read says so
+	// rather than showing the same placeholder forever.
+	const malformed = renderRows(summary.renderCall({ path: 42 }, stubTheme, renderContext()));
+	assert.match(malformed, /invalid arg/, "a path that is not a string is called out as invalid");
+
+	const refreshing = renderRows(
+		summary.renderCall({ path: "src/big.ts", refresh: true }, stubTheme, renderContext()),
+	);
+	assert.match(refreshing, /refresh/, "an explicit refresh is visible on the call");
+
+	// The TUI hands back the component the slot returned last time; reusing it is what keeps a
+	// streaming call from allocating a component per frame.
+	const first = summary.renderCall({ path: "src/big.ts" }, stubTheme, renderContext());
+	const second = summary.renderCall(
+		{ path: "src/other.ts" },
+		stubTheme,
+		renderContext({ lastComponent: first }),
+	);
+	assert.equal(second, first, "the previous component is reused rather than replaced");
+	assert.match(renderRows(second), /src\/other\.ts/, "and re-texted with the new arguments");
+});
+
+await check("the call links to the real file, not to the path as it is displayed", async () => {
+	// The display shortens the home directory to `~`; a link built from the shortened text
+	// resolves `~` against cwd and points at `<cwd>/~/file`, which opens nothing. pi keeps the
+	// two strings apart for this reason, so a path under $HOME is the case that catches it.
+	const root = tempProject();
+	const previous = { ...getCapabilities() };
+	try {
+		writeFileSync(join(root, "src", "a.ts"), numbered(5));
+		setCapabilities({ images: null, trueColor: false, hyperlinks: true });
+
+		const h = makeHarness({ cwd: root });
+		const summary = h.tools.get("summary");
+		const linked = (rawPath, cwd = root) =>
+			summary.renderCall({ path: rawPath }, stubTheme, renderContext({ cwd })).render(200).join("");
+
+		// A file inside cwd: the link is the absolute path, and the display is not shortened.
+		const relative = linked("src/a.ts");
+		assert.match(
+			relative,
+			new RegExp(pathToFileURL(join(root, "src", "a.ts")).href),
+			"a relative path links to the file it resolves to",
+		);
+
+		// A file under the home directory: shown as `~/...`, linked in full.
+		const inHome = join(osHomedir(), "pi-summary-home-probe.ts");
+		const rendered = linked(inHome);
+		assert.match(rendered, /~[/\\]pi-summary-home-probe\.ts/, "a home path is displayed shortened");
+		assert.match(
+			rendered,
+			new RegExp(pathToFileURL(inHome).href),
+			"and linked to the real path rather than to the `~` shown to the reader",
+		);
+		assert.doesNotMatch(
+			rendered,
+			/%7E/,
+			"no link target resolves a literal `~` against cwd",
+		);
+
+		// The leading `@` many callers write means the same here as everywhere else.
+		assert.match(
+			linked("@src/a.ts"),
+			new RegExp(pathToFileURL(join(root, "src", "a.ts")).href),
+			"and the link resolves a leading @ the way the tools do",
+		);
+
+		// A terminal that cannot open links gets the styled text alone, with no escape sequence
+		// the reader would see as noise.
+		setCapabilities({ ...previous, hyperlinks: false });
+		assert.doesNotMatch(
+			linked("src/a.ts"),
+			/\x1b\]8;;/,
+			"a terminal without hyperlink support gets plain styled text",
+		);
+	} finally {
+		setCapabilities({ ...previous });
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+await check("a summary result renders its outcome collapsed and its text expanded", async () => {
+	const root = tempProject();
+	try {
+		writeFileSync(join(root, "src", "a.ts"), numbered(500));
+		const h = makeHarness({ cwd: root });
+		const summary = h.tools.get("summary");
+		const result = await runTool(h, "summary", { path: "src/a.ts" });
+
+		const collapsed = renderRows(
+			summary.renderResult(result, { expanded: false, isPartial: false }, stubTheme, renderContext()),
+		);
+		assert.match(collapsed, /cache: miss/, "the collapsed line reports where the map came from");
+		assert.match(
+			collapsed,
+			new RegExp(`${result.details.lines} lines`),
+			"and how big the file is",
+		);
+		assert.match(collapsed, /1 range\b/, "and how many ranges it holds");
+		assert.doesNotMatch(
+			collapsed,
+			/## map/,
+			"the map itself waits for an expansion rather than burying the transcript in rows",
+		);
+
+		// `D15`: the model a file was summarized with is in the details for diagnosis, and in the
+		// transcript it would only invite the reader to second-guess a map over a model name.
+		assert.match(result.details.model, /test-model/, "the details do record the summarizer");
+
+		const expanded = renderRows(
+			summary.renderResult(result, { expanded: true, isPartial: false }, stubTheme, renderContext()),
+		);
+		assert.match(expanded, /## map/, "expanding shows the map");
+		assert.match(expanded, /Does a thing\./, "including the prose");
+		assert.doesNotMatch(expanded, /test-model/, "and no model name anywhere in it");
+
+		// A call that is still running has no details yet.
+		const pending = summary.renderResult(
+			{ content: [] },
+			{ expanded: false, isPartial: true },
+			stubTheme,
+			renderContext(),
+		);
+		assert.match(renderRows(pending), /summariz/, "a call in flight says so");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+await check("a failed summary is drawn as the whole-file fallback it is", async () => {
+	// The fallback returns the file's lines, not a map. A display that showed the usual outcome
+	// line would let a failure read as a summary.
+	const h = makeHarness({ cwd: tempProject() });
+	const summary = h.tools.get("summary");
+	const fallback = {
+		content: [{ type: "text", text: "# summary failed: no credentials\n\nline 1\nline 2" }],
+		details: {
+			path: "src/a.ts",
+			status: "failed",
+			mode: "raw",
+			lines: 2,
+			model: "",
+			extraction: "none",
+			sections: 0,
+			dbPath: "",
+			attempts: 0,
+			degraded: true,
+		},
+	};
+
+	const collapsed = renderRows(
+		summary.renderResult(fallback, { expanded: false, isPartial: false }, stubTheme, renderContext()),
+	);
+	assert.match(collapsed, /no summary/, "the collapsed line says no summary was made");
+	assert.doesNotMatch(collapsed, /cache:/, "and does not report a cache state it never reached");
+
+	const expanded = renderRows(
+		summary.renderResult(fallback, { expanded: true, isPartial: false }, stubTheme, renderContext()),
+	);
+	assert.match(expanded, /no credentials/, "expanding shows the reason");
+	assert.match(expanded, /line 1/, "and the file content that replaced the map");
+
+	// pi marks a result an error when the tool threw, and read draws its first ten lines even
+	// collapsed, because an error the caller has to expand to read is an error nobody reads.
+	// This tool throws only when the file could not be read either.
+	const failed = {
+		content: [{ type: "text", text: "summary failed: ENOENT: no such file or directory" }],
+	};
+	const asError = renderRows(
+		summary.renderResult(failed, { expanded: false, isPartial: false }, stubTheme, renderContext({ isError: true })),
+	);
+	assert.match(asError, /ENOENT/, "an error result shows its message without being expanded");
+
+	// The renderer runs inside a try/catch in the TUI, where a throw costs the display silently
+	// and leaves the generic fallback drawing the call. Nothing here may throw, including a
+	// result stripped of the fields it usually has.
+	assert.doesNotThrow(() => summary.renderCall(undefined, stubTheme, renderContext()));
+	assert.doesNotThrow(() =>
+		summary.renderResult({ content: [] }, { expanded: true, isPartial: false }, stubTheme, renderContext()),
+	);
+	assert.doesNotThrow(() =>
+		summary.renderResult({ content: [] }, { expanded: false, isPartial: false }, stubTheme, renderContext()),
+	);
+	// The error path reads the same fields as every other; an empty one must not throw either.
+	assert.doesNotThrow(() =>
+		summary.renderResult({ content: [] }, { expanded: false, isPartial: false }, stubTheme, renderContext({ isError: true })),
+	);
 });
 
 await check("a read the guard does not claim behaves exactly like the built-in read", async () => {

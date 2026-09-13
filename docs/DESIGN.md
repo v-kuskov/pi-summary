@@ -526,3 +526,38 @@ failure.
 recorded in the cache and in the tool result's `details`, where it is useful for diagnosing a
 bad map, but it tells the model nothing it can act on and invites it to reason about the map's
 trustworthiness from a model name it has no basis to judge.
+
+`D16` The `summary` tool draws its own call and result, with renderers shaped like the built-in
+`read`'s (`src/tui.ts`). pi merges a built-in renderer into any tool that does not supply one,
+but only for the eight built-in names, and `summary` is not one — so without these the call is
+drawn by the generic fallback: the tool name, the raw arguments as JSON, and the first ten
+lines of the result. The call that produced a file's map would be the one line of the
+transcript that did not show it.
+
+The two renderers follow `read`'s in the part that matters: reuse `context.lastComponent` and
+re-text it, rather than allocating a component per frame. That is the protocol pi offers — the
+slot is handed back as the previous component — and it is what keeps a streaming call from
+replacing the transcript's component on every argument.
+
+The collapsed state is one line of outcome (`cache: miss · 501 lines · 1 range`) rather than
+read's silence. read is often not the first thing a session does to a file, so an empty
+collapsed result is one of several lines; a summary is usually the first, and a call that
+shows nothing reads as a no-op. Expanding shows the text the model received, which is the
+summary verbatim — the display does not re-render the map, so what is shown and what was
+returned cannot disagree.
+
+A failed summary draws the fallback for what it is: `no summary - the whole file was returned
+instead`, with the notice leading the expanded text. Reporting the usual outcome line there
+would let a failure that returned the file's lines read as a map. That is the failure the tool
+recovers from. The one it does not is a summary that failed *and* could not read the file
+either: that throws, pi marks the result an error, and the renderer draws the message itself,
+collapsed, which is how `read` handles an error result. A thrown call whose reason is only
+visible after expanding is a reason nobody reads.
+
+Everything the renderers read may be absent — a streaming call has a partial args object, a
+running call has no result, a result may carry no `details` — and none of it may throw: the TUI
+calls renderers inside a `try/catch` and silently falls back to the generic drawing on a throw,
+which would cost the display without saying so. `D15` holds here too, so the model name appears
+in `details` and in neither rendered state. A path that is present but not a string is the one
+argument error the call line reports (`[invalid arg]`, as read does); an absent or empty one is
+a call still streaming its arguments, and shows `...`.

@@ -9,6 +9,7 @@ import { describeFailure, failureNotice, loadWholeFile } from "./fallback.ts";
 import { resolveFilePath } from "./paths.ts";
 import { renderSummary, READ_LINE_LIMIT } from "./render.ts";
 import { summarizeFile, type SummarizeOutcome } from "./summarize.ts";
+import { summaryRenderers } from "./tui.ts";
 
 export type SummaryDetails = {
 	path: string;
@@ -94,6 +95,7 @@ export function registerSummaryTool(pi: ExtensionAPI): void {
 				usage: outcome.usage,
 			};
 		},
+		...summaryRenderers,
 	});
 }
 

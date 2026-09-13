@@ -161,6 +161,10 @@ failing.
   answer. The built-in renderer, schema, description and prompt guidance are kept, so the
   swap is invisible apart from the limit.
 
+  `summary` draws its own call and result (see `D16` in `DESIGN.md`): collapsing a call shows a
+  one-line outcome, and expanding it shows the map the model received. A call that failed hard
+  enough to throw shows the reason collapsed, rather than nothing.
+
 ## Development
 
 ```bash
@@ -174,8 +178,9 @@ forced, the hash-over-mtime rule, the blob degradation, the repair loop and its 
 the `mtime_ms` migration, settings precedence, and the guard's boundaries —
 including that a cold oversized read summarizes and returns the map, that an intercepted
 read is a successful result and not an error, that the map carries every row uncut, that
-prose and extensionless files are left outside the limit, and that a failing summarizer
-lets the read through and says so.
+prose and extensionless files are left outside the limit, that a failing summarizer
+lets the read through and says so, and that `summary` draws its call and its result —
+collapsed, expanded, still running, and failed — in a terminal.
 
 Nothing checks the map's *content*. Structure and schema are validated, and a
 contiguous, well-formed map can still name the wrong lines. The defence is in the prompt
