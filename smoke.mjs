@@ -1092,8 +1092,8 @@ await check("the guard refuses a read longer than it returns", async () => {
 		const h = makeHarness({ cwd: root });
 
 		const reason = await runGuardBlock(h, { path: "src/a.ts" });
-		assert.match(reason, /read not performed/);
-		assert.match(reason, /at most 200/);
+		assert.match(reason, /longer than 200 lines/);
+		assert.match(reason, /at most 200 lines per call/);
 		assert.match(reason, /## map/, "the reason carries the map, not just a refusal");
 	} finally {
 		rmSync(root, { recursive: true, force: true });
@@ -1172,7 +1172,7 @@ await check("an oversized tail is refused and the offset named", async () => {
 		// numbered(400) counts as 401 lines, so 201..401 is 201 lines and must be refused.
 		assert.match(
 			await runGuardBlock(h, { path: "src/big.ts", offset: 201 }),
-			/read not performed/,
+			/longer than 200 lines/,
 			"one line over the limit is refused",
 		);
 	} finally {
@@ -1197,7 +1197,7 @@ await check("a cold oversized read is summarized by the guard and refused with t
 
 		const text = await runGuardBlock(h, { path: "src/a.ts" });
 		assert.equal(h.calls.length, 1, "the guard paid for one summarization");
-		assert.match(text, /read not performed/, "the read does not run");
+		assert.match(text, /longer than 200 lines/, "the read does not run");
 		assert.match(text, /SyncClient/, "the map it just made is the answer");
 
 		// The work it did is cached, so the next oversized read costs nothing.
@@ -1288,7 +1288,7 @@ await check("a read of a summarized file returns the cached map", async () => {
 
 		const text = await runGuardBlock(h, { path: "src/a.ts" });
 		assert.equal(h.calls.length, 1, "the read is answered from the cache");
-		assert.match(text, /read not performed/);
+		assert.match(text, /longer than 200 lines/);
 		assert.match(text, /## map/);
 		assert.match(text, /SyncClient/);
 		assert.match(text, /retry\(\)/);
@@ -1348,7 +1348,7 @@ await check("the guard leaves prose, notes and extensionless files to read", asy
 		// A source file beside them is refused, so the filter is the extension, not the size.
 		assert.match(
 			await runGuardBlock(h, { path: "src/a.ts" }),
-			/read not performed/,
+			/longer than 200 lines/,
 			"a .ts file of the same size returns a map instead",
 		);
 	} finally {

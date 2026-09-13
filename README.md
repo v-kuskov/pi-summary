@@ -64,8 +64,8 @@ A later `read path="src/foo.ts"` with no range is refused, and the map is all th
 back:
 
 ```
-# read not performed: this file is longer than 200 lines, and a read returns
-# at most 200. The summary is below; read one of its ranges with offset/limit.
+# this file: longer than 200 lines; this is the file's map, not its contents.
+# read one of the ranges below with offset/limit, at most 200 lines per call.
 
 # src/foo.ts  (1420 lines, 48.2KB, sha 9f2c1ab4)
 

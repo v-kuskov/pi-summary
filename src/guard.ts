@@ -117,15 +117,15 @@ export function registerReadGuard(pi: ExtensionAPI): void {
 }
 
 /**
- * The text a refused read returns: why it was not performed, then the map.
+ * The text a refused read returns: what stands in for it, then the map.
  *
  * The map is rendered with its header, so the model still sees the file's size and hash.
  */
 function renderReason(offset: number, summarized: Summarized): string {
 	const where = offset === 1 ? "this file" : `lines ${offset} onward`;
 	const banner = [
-		`# read not performed: ${where} is longer than ${READ_LINE_LIMIT} lines, and a read returns`,
-		`# at most ${READ_LINE_LIMIT}. The summary is below; read one of its ranges with offset/limit.`,
+		`# ${where}: longer than ${READ_LINE_LIMIT} lines; this is the file's map, not its contents.`,
+		`# read one of the ranges below with offset/limit, at most ${READ_LINE_LIMIT} lines per call.`,
 		"",
 	];
 	return [...banner, summarized.text].join("\n");
