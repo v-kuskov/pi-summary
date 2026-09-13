@@ -179,5 +179,10 @@ intervene in; that dilutes the trigger the tool exists for.
 
 Target source code. The summarizer will accept any text file on request; only the read path
 declines to intervene. No search across cached summaries, no project-wide refresh, no
-replacement of the read operation itself — it hooks the read rather than overriding it, so
-it composes with the host's own rendering and with anything else that wraps the same call.
+shortened read input — an oversized call is answered, not trimmed.
+
+Replacing the `read` tool does have one cost the event-handler design did not: it takes the
+`read` name outright, so another extension registering `read` and this extension are mutually
+exclusive rather than composable. The built-in renderer is not lost — the TUI merges it into a
+registered definition that omits its own renderers — but that is per-slot inheritance from the
+built-in, not composition with a third party.

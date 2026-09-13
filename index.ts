@@ -6,7 +6,7 @@ import { registerSummaryTool } from "./src/tools.ts";
  * pi-summary: file summaries a model can afford to read.
  *
  * Registers the `summary` tool, backed by a per-project SQLite cache, and replaces the
- * built-in `read` tool with one that answers any call for more than 200 lines with that
+ * built-in `read` tool with one that answers any call past `READ_LINE_LIMIT` with that
  * file's map instead of the whole file.
  *
  * Replacing `read` is what lets an intercepted call come back as a normal result rather

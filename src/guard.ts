@@ -86,7 +86,7 @@ export function registerReadTool(pi: ExtensionAPI): void {
  */
 function delegate(
 	toolCallId: string,
-	params: { path: string; offset?: number; limit?: number },
+	params: ReadInput,
 	signal: AbortSignal | undefined,
 	onUpdate: Parameters<ReturnType<typeof createReadToolDefinition>["execute"]>[3],
 	ctx: ExtensionContext,
@@ -95,6 +95,9 @@ function delegate(
 		autoResizeImages: readImageAutoResize(ctx.cwd),
 	}).execute(toolCallId, params, signal, onUpdate, ctx);
 }
+
+/** A `read` call's arguments, as the shared schema defines them. */
+type ReadInput = { path: string; offset?: number; limit?: number };
 
 /** What a `read` call should do: run normally, return the map, or run and carry a notice. */
 type Decision =
@@ -108,10 +111,7 @@ type Decision =
  * Everything here can fail on a file that is being rewritten underneath us, and a `read` must
  * not fail because the *guard* failed to look at it, so the probes are inside one try/catch.
  */
-async function decide(
-	ctx: ExtensionContext,
-	params: { path: string; offset?: number; limit?: number },
-): Promise<Decision> {
+async function decide(ctx: ExtensionContext, params: ReadInput): Promise<Decision> {
 	const absPath = resolveFilePath(params.path, ctx.cwd);
 	if (isUnguardedPath(absPath)) return { kind: "read" };
 
@@ -152,13 +152,13 @@ async function decide(
 
 	// No summary, so answering with a map would leave the model with nothing. Let the read
 	// run and say why.
-	if (summarized.error !== undefined) {
+	if (!summarized.ok) {
 		const notice = failureNotice("summary", summarized.error, "Reading the file directly.");
 		notifyUser(ctx, notice, "error");
 		return { kind: "notice", notice };
 	}
 
-	return { kind: "map", text: renderReason(offset, summarized) };
+	return { kind: "map", text: renderMapAnswer(offset, summarized.text) };
 }
 
 /**
@@ -166,18 +166,18 @@ async function decide(
  *
  * The map is rendered with its header, so the model still sees the file's size and hash.
  */
-function renderReason(offset: number, summarized: Summarized): string {
+function renderMapAnswer(offset: number, map: string): string {
 	const where = offset === 1 ? "this file" : `lines ${offset} onward`;
 	const banner = [
 		`# ${where}: longer than ${READ_LINE_LIMIT} lines; this is the file's map, not its contents.`,
 		`# read one of the ranges below with offset/limit, at most ${READ_LINE_LIMIT} lines per call.`,
 		"",
 	];
-	return [...banner, summarized.text].join("\n");
+	return [...banner, map].join("\n");
 }
 
 /** A summary to answer the read with, or the reason there is none. */
-type Summarized = { text: string; error?: undefined } | { text?: undefined; error: unknown };
+type Summarized = { ok: true; text: string } | { ok: false; error: unknown };
 
 /**
  * Get a summary from cache or by generating one.
@@ -189,7 +189,7 @@ type Summarized = { text: string; error?: undefined } | { text?: undefined; erro
 async function ensureSummary(ctx: ExtensionContext, absPath: string): Promise<Summarized> {
 	try {
 		const peek = await peekFreshSummary(ctx, absPath);
-		if (peek) return { text: renderSummary(peek.entry) };
+		if (peek) return { ok: true, text: renderSummary(peek.entry) };
 	} catch {
 		// Fall through to generating one; an unreadable cache is not fatal.
 	}
@@ -198,7 +198,7 @@ async function ensureSummary(ctx: ExtensionContext, absPath: string): Promise<Su
 	try {
 		outcome = await summarizeFile(ctx, { path: absPath });
 	} catch (error) {
-		return { error };
+		return { ok: false, error };
 	}
-	return { text: renderSummary(outcome.entry) };
+	return { ok: true, text: renderSummary(outcome.entry) };
 }
