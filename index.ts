@@ -1,12 +1,16 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { registerReadGuard } from "./src/guard.ts";
+import { registerReadTool } from "./src/guard.ts";
 import { registerSummaryTool } from "./src/tools.ts";
 
 /**
  * pi-summary: file summaries a model can afford to read.
  *
- * Registers the `summary` tool, backed by a per-project SQLite cache, and guards the
- * built-in `read` tool so a single call cannot return more than 200 lines.
+ * Registers the `summary` tool, backed by a per-project SQLite cache, and replaces the
+ * built-in `read` tool with one that answers any call for more than 200 lines with that
+ * file's map instead of the whole file.
+ *
+ * Replacing `read` is what lets an intercepted call come back as a normal result rather
+ * than as a failure; see src/guard.ts for why blocking the call could not.
  *
  * Nothing here opens a database or starts a background task at load time: the tool opens
  * the cache per call, which keeps parallel tool calls safe and stops the extension from
@@ -14,5 +18,5 @@ import { registerSummaryTool } from "./src/tools.ts";
  */
 export default function piSummary(pi: ExtensionAPI): void {
 	registerSummaryTool(pi);
-	registerReadGuard(pi);
+	registerReadTool(pi);
 }

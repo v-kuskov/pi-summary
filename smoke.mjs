@@ -8,7 +8,7 @@ import extensionFactory from "./index.ts";
 import { countLinesFrom } from "./src/hash.ts";
 import { MAX_ATTEMPTS } from "./src/summarize.ts";
 import { ensureSchema, openDb, writeSummary } from "./src/store.ts";
-import { readSummarySettings } from "./src/settings.ts";
+import { readImageAutoResize, readSummarySettings } from "./src/settings.ts";
 import { extractOverview, parseJsonAnswer } from "./src/prompt.ts";
 import { hasTopLevelShape, normalizeSections, MAX_NOTE_CHARS } from "./src/schema.ts";
 import { renderMap } from "./src/render.ts";
@@ -72,7 +72,9 @@ function makeHarness(options = {}) {
 	extensionFactory(pi);
 
 	const respond = options.respond ?? defaultAnswer;
-	const model = { provider: "test", id: "test-model" };
+	// `input` is read by the built-in read tool to decide whether to note that the model
+	// cannot see images, so the fake model needs it.
+	const model = { provider: "test", id: "test-model", input: ["text"] };
 	const ctx = {
 		cwd: options.cwd ?? "",
 		mode: "json",
@@ -93,61 +95,49 @@ function makeHarness(options = {}) {
 
 const runTool = (h, name, params) =>
 	h.tools.get(name).execute("id", params, undefined, undefined, h.ctx);
+
 /**
- * Run every tool_call handler and return the (possibly mutated) input, as pi sees it.
+ * Run the `read` tool and return its result.
  *
- * A refused read is not a mutation - the guard blocks it - so the refusal is read from
- * `runGuardBlock`. This is for the reads that are let through.
+ * The extension replaces the built-in `read` rather than blocking a call, so a read is
+executed like any other tool: it either resolves with a result or rejects. There is no
+block reason to read and no pending notice to consume.
  */
-async function runGuard(h, input) {
-	for (const { event, handler } of h.handlers) {
-		if (event !== "tool_call") continue;
-		await handler({ type: "tool_call", toolCallId: "t", toolName: "read", input }, h.ctx);
-	}
-	return input;
+const runRead = (h, params) => runTool(h, "read", params);
+
+/** The text a read returned. */
+async function readText(h, params) {
+	const { content } = await runRead(h, params);
+	return content.map((c) => c.text ?? "").join("");
+}
+
+/** The banner an intercepted read carries in place of the file's lines. */
+const MAP_BANNER = /longer than 200 lines/;
+
+/**
+ * The map text when this read was answered with one, or undefined when the read ran normally.
+ *
+ * A read that returns the file's own lines is one the guard did not claim, so the caller's
+ * assertion is the same either way: undefined means "the built-in read handled it".
+ */
+async function readMap(h, params) {
+	const text = await readText(h, params);
+	return MAP_BANNER.test(text) ? text : undefined;
 }
 
 /**
- * Run every tool_call handler and return the reason the guard refused the read, or undefined
- * when the call is left to run.
+ * Whether a read rejects, and with what.
+ *
+ * Reads the guard does not claim are the built-in tool's, including its failures: a missing
+ * file must still reject with the read tool's own message rather than being swallowed.
  */
-async function runGuardBlock(h, input) {
-	for (const { event, handler } of h.handlers) {
-		if (event !== "tool_call") continue;
-		const out = await handler(
-			{ type: "tool_call", toolCallId: "t", toolName: "read", input },
-			h.ctx,
-		);
-		if (out?.block) return out.reason;
+async function readError(h, params) {
+	try {
+		await runRead(h, params);
+		return undefined;
+	} catch (error) {
+		return error.message;
 	}
-	return undefined;
-}
-
-/** Run every tool_result handler, returning the replacement content if one was produced. */
-async function runResult(h, input, content) {
-	for (const { event, handler } of h.handlers) {
-		if (event !== "tool_result") continue;
-		const out = await handler(
-			{
-				type: "tool_result",
-				toolCallId: "t",
-				toolName: "read",
-				input,
-				content: content.map((text) => ({ type: "text", text })),
-				isError: false,
-				details: undefined,
-			},
-			h.ctx,
-		);
-		if (out?.content) return out.content;
-	}
-	return undefined;
-}
-
-/** The text the guard appended to a read result, or undefined when it appended nothing. */
-async function appendedText(h, input) {
-	const replaced = await runResult(h, input, ["BODY"]);
-	return replaced ? replaced.map((c) => c.text).join("") : undefined;
 }
 
 function tempProject() {
@@ -299,6 +289,55 @@ await check("readSummarySettings tolerates a bare string and junk values", async
 		// A corrupt settings file must not throw out of a summarization.
 		writeFileSync(join(agent, "settings.json"), "{ not json");
 		assert.deepEqual(readSummarySettings(root), {});
+	} finally {
+		if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = previous;
+		rmSync(agent, { recursive: true, force: true });
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+await check("readImageAutoResize reads pi's own setting, project scope first", async () => {
+	// The extension replaces the built-in read tool, so it has to build the delegated read
+	// itself - and that definition takes the user's images.autoResize setting. The value is
+	// not reachable from an extension context, so it is read from pi's settings files.
+	const agent = mkdtempSync(join(tmpdir(), "pi-agent-"));
+	const root = tempProject();
+	const previous = process.env.PI_CODING_AGENT_DIR;
+	const globalSettings = (value) =>
+		writeFileSync(join(agent, "settings.json"), JSON.stringify(value));
+	const projectSettings = (value) => {
+		mkdirSync(join(root, ".pi"), { recursive: true });
+		writeFileSync(join(root, ".pi", "settings.json"), JSON.stringify(value));
+	};
+	try {
+		process.env.PI_CODING_AGENT_DIR = agent;
+
+		writeFileSync(join(agent, "settings.json"), "{}");
+		assert.equal(readImageAutoResize(root), true, "absent means pi's default of on");
+
+		globalSettings({ images: { autoResize: false } });
+		assert.equal(readImageAutoResize(root), false, "the global setting is honoured");
+
+		projectSettings({ images: { autoResize: true } });
+		assert.equal(readImageAutoResize(root), true, "the project setting wins");
+
+		// Junk where the setting should be means the default, never a crash or a wrong read.
+		// Global is set to a valid value first, so this also pins the fallback order: a project
+		// file without a usable value must not shadow the global one that has it.
+		globalSettings({ images: { autoResize: true } });
+		for (const junk of [{ images: "no" }, { images: [] }, { images: { autoResize: "yes" } }, {}]) {
+			projectSettings(junk);
+			assert.equal(readImageAutoResize(root), true, `junk ${JSON.stringify(junk)} ignored`);
+		}
+
+		// With nothing valid anywhere, the default stands.
+		globalSettings({ images: { autoResize: null } });
+		projectSettings({ images: { autoResize: "yes" } });
+		assert.equal(readImageAutoResize(root), true, "no usable value anywhere means the default");
+
+		writeFileSync(join(root, ".pi", "settings.json"), "{ not json");
+		assert.equal(readImageAutoResize(root), true, "a corrupt file falls back to the default");
 	} finally {
 		if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
 		else process.env.PI_CODING_AGENT_DIR = previous;
@@ -1091,10 +1130,10 @@ await check("the guard refuses a read longer than it returns", async () => {
 		writeFileSync(join(root, "src", "a.ts"), numbered(400));
 		const h = makeHarness({ cwd: root });
 
-		const reason = await runGuardBlock(h, { path: "src/a.ts" });
+		const reason = await readMap(h, { path: "src/a.ts" });
 		assert.match(reason, /longer than 200 lines/);
 		assert.match(reason, /at most 200 lines per call/);
-		assert.match(reason, /## map/, "the reason carries the map, not just a refusal");
+		assert.match(reason, /## map/, "the map is the answer, not just a refusal");
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
@@ -1122,7 +1161,7 @@ await check("the refused map carries every row, with nothing cut off", async () 
 			respond: () => jsonResponse({ overview: "Many functions.", sections: rows }),
 		});
 
-		const text = await runGuardBlock(h, { path: "src/big.ts" });
+		const text = await readMap(h, { path: "src/big.ts" });
 		assert.ok(!text.includes("truncated"), "no truncation marker");
 		for (const index of [0, 199, 399]) {
 			assert.match(text, new RegExp(`handleThing${index}\\(\\)`), `row ${index} is present`);
@@ -1140,15 +1179,16 @@ await check("the guard leaves bounded reads and small files alone", async () => 
 		writeFileSync(join(root, "src", "big.ts"), numbered(400));
 		writeFileSync(join(root, "src", "small.ts"), numbered(20));
 		const h = makeHarness({ cwd: root });
-		const allowed = async (input, what) => assert.equal(await runGuardBlock(h, input), undefined, what);
+		const allowed = async (input, what) =>
+			assert.equal(await readMap(h, input), undefined, what);
 
 		await allowed({ path: "src/big.ts", limit: 200 }, "exactly 200 lines is a read");
 		await allowed({ path: "src/big.ts", limit: 100 }, "a smaller limit is a read");
 		await allowed({ path: "src/small.ts" }, "a small file is a read");
-		await allowed({ path: "src/nope.ts" }, "a missing file is left to the read tool");
 		await allowed({ path: "src/big.ts", offset: 401 }, "past EOF is left to the read tool");
+		// A missing file is the read tool's error to raise, and it must still be raised.
+		assert.match(await readError(h, { path: "src/nope.ts" }), /ENOENT|no such file/i);
 		assert.equal(h.calls.length, 0, "and no allowed read spends a model call");
-		assert.equal(await appendedText(h, {}), undefined, "nothing was appended either");
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
@@ -1160,27 +1200,27 @@ await check("an oversized tail is refused and the offset named", async () => {
 		writeFileSync(join(root, "src", "big.ts"), numbered(400));
 		const h = makeHarness({ cwd: root });
 
-		const tail = await runGuardBlock(h, { path: "src/big.ts", offset: 150 });
+		const tail = await readMap(h, { path: "src/big.ts", offset: 150 });
 		assert.match(tail, /lines 150 onward/);
 		assert.match(tail, /## map/);
 
 		assert.equal(
-			await runGuardBlock(h, { path: "src/big.ts", offset: 202 }),
+			await readMap(h, { path: "src/big.ts", offset: 202 }),
 			undefined,
 			"exactly 200 lines from the offset is a read",
 		);
-		// numbered(400) counts as 401 lines, so 201..401 is 201 lines and must be refused.
+		// numbered(400) counts as 401 lines, so 201..401 is 201 lines and must be intercepted.
 		assert.match(
-			await runGuardBlock(h, { path: "src/big.ts", offset: 201 }),
+			await readMap(h, { path: "src/big.ts", offset: 201 }),
 			/longer than 200 lines/,
-			"one line over the limit is refused",
+			"one line over the limit is intercepted",
 		);
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
 });
 
-await check("a cold oversized read is summarized by the guard and refused with the map", async () => {
+await check("a cold oversized read is summarized by the guard and answered with the map", async () => {
 	const root = tempProject();
 	try {
 		writeFileSync(join(root, "src", "a.ts"), numbered(500));
@@ -1195,15 +1235,34 @@ await check("a cold oversized read is summarized by the guard and refused with t
 				}),
 		});
 
-		const text = await runGuardBlock(h, { path: "src/a.ts" });
+		const result = await runRead(h, { path: "src/a.ts" });
 		assert.equal(h.calls.length, 1, "the guard paid for one summarization");
-		assert.match(text, /longer than 200 lines/, "the read does not run");
+		const text = result.content.map((c) => c.text).join("");
+		assert.match(text, /longer than 200 lines/, "the file's lines are not returned");
 		assert.match(text, /SyncClient/, "the map it just made is the answer");
+		assert.equal(result.details, undefined, "the result has the shape of a clean read");
 
 		// The work it did is cached, so the next oversized read costs nothing.
-		const again = await runGuardBlock(h, { path: "src/a.ts" });
+		const again = await readMap(h, { path: "src/a.ts" });
 		assert.equal(h.calls.length, 1, "the second read is served from cache");
 		assert.match(again, /SyncClient/);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+await check("an intercepted read is a successful result, not an error", async () => {
+	// The whole point of replacing the read tool instead of blocking the call: pi hardcodes
+	// isError:true on a blocked tool call, so the map arrived at the model as a failed call.
+	// A tool that returns the map normally produces isError:false by construction.
+	const root = tempProject();
+	try {
+		writeFileSync(join(root, "src", "a.ts"), numbered(500));
+		const h = makeHarness({ cwd: root });
+
+		const result = await runRead(h, { path: "src/a.ts" });
+		assert.ok(result.content.length > 0, "the call resolves rather than being blocked");
+		assert.equal(result.isError, undefined, "nothing marks the result as an error");
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
@@ -1220,8 +1279,9 @@ await check("a failing summarizer lets the read through and notifies", async () 
 		h.ctx.hasUI = true;
 		h.ctx.ui = { notify: (message, type) => h.notices.push({ message, type }) };
 
-		const input = await runGuard(h, { path: "src/a.ts" });
-		assert.equal(input.limit, undefined, "the read is not rewritten when there is no map");
+		const result = await runRead(h, { path: "src/a.ts" });
+		const text = result.content.map((c) => c.text).join("");
+		assert.match(text, /line 1\b/, "the file's own lines are returned instead");
 		assert.equal(h.notices.length, 1, "the failure is surfaced");
 		assert.equal(h.notices[0].type, "error");
 		assert.match(h.notices[0].message, /upstream is down/);
@@ -1229,15 +1289,7 @@ await check("a failing summarizer lets the read through and notifies", async () 
 
 		// Without a UI a notification reaches nobody, so the same notice rides the read
 		// result the model actually receives.
-		const replaced = await runResult(h, { path: "src/a.ts" }, ["LINE-1", "LINE-2"]);
-		assert.ok(replaced, "the read result is amended");
-		const appended = replaced.map((c) => c.text).join("");
-		assert.match(appended, /LINE-1/, "the original content is kept");
-		assert.match(appended, /upstream is down/);
-		assert.match(appended, /^\.*?# summary failed:/m, "and the notice is appended");
-
-		// The notice is consumed once, so a later read does not inherit it.
-		assert.equal(await runResult(h, { path: "src/a.ts" }, ["x"]), undefined);
+		assert.match(text, /^# summary failed:/m, "and the notice is on the result");
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
@@ -1249,15 +1301,14 @@ await check("the guard is silent for reads inside the limit", async () => {
 		writeFileSync(join(root, "src", "a.ts"), numbered(500));
 		const h = makeHarness({ cwd: root });
 
-		assert.equal((await runGuard(h, { path: "src/a.ts", limit: 200 })).limit, 200);
-		assert.equal((await runGuard(h, { path: "src/a.ts", limit: 50 })).limit, 50);
-		assert.equal(
-			(await runGuard(h, { path: "src/a.ts", offset: 480 })).limit,
-			undefined,
-			"20 lines left",
-		);
+		for (const input of [
+			{ path: "src/a.ts", limit: 200 },
+			{ path: "src/a.ts", limit: 50 },
+			{ path: "src/a.ts", offset: 480 },
+		]) {
+			assert.equal(await readMap(h, input), undefined, `${JSON.stringify(input)} is a read`);
+		}
 		assert.equal(h.calls.length, 0, "an allowed read never spends a model call");
-		assert.equal(await appendedText(h, {}), undefined, "and nothing is appended");
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
@@ -1286,7 +1337,7 @@ await check("a read of a summarized file returns the cached map", async () => {
 		await runTool(h, "summary", { path: "src/a.ts" });
 		assert.equal(h.calls.length, 1);
 
-		const text = await runGuardBlock(h, { path: "src/a.ts" });
+		const text = await readMap(h, { path: "src/a.ts" });
 		assert.equal(h.calls.length, 1, "the read is answered from the cache");
 		assert.match(text, /longer than 200 lines/);
 		assert.match(text, /## map/);
@@ -1318,7 +1369,7 @@ await check("the guard replaces a stale summary instead of quoting it", async ()
 
 		// The file grows, so the cached entry is stale and describes the wrong line count.
 		writeFileSync(file, numbered(600));
-		const text = await runGuardBlock(h, { path: "src/a.ts" });
+		const text = await readMap(h, { path: "src/a.ts" });
 		assert.equal(h.calls.length, 2, "a stale entry is refreshed, not quoted");
 		assert.match(text, /Generation 2\./, "the fresh overview is what is shown");
 		assert.doesNotMatch(text, /Generation 1\./, "the stale overview was not reused");
@@ -1341,13 +1392,13 @@ await check("the guard leaves prose, notes and extensionless files to read", asy
 		const h = makeHarness({ cwd: root });
 
 		for (const name of ["README.md", "notes.txt", "Makefile", ".gitignore", "LICENSE"]) {
-			assert.equal(await runGuardBlock(h, { path: name }), undefined, `${name} is a read`);
+			assert.equal(await readMap(h, { path: name }), undefined, `${name} is a read`);
 		}
 		assert.equal(h.calls.length, 0, "and none of them is summarized");
 
-		// A source file beside them is refused, so the filter is the extension, not the size.
+		// A source file beside them is intercepted, so the filter is the extension, not the size.
 		assert.match(
-			await runGuardBlock(h, { path: "src/a.ts" }),
+			await readMap(h, { path: "src/a.ts" }),
 			/longer than 200 lines/,
 			"a .ts file of the same size returns a map instead",
 		);
@@ -1373,7 +1424,7 @@ await check("the guard never touches a binary file", async () => {
 			Buffer.concat([Buffer.from([0, 1, 2]), Buffer.alloc(40000, 7)]),
 		);
 		const h = makeHarness({ cwd: root });
-		assert.equal((await runGuard(h, { path: "src/blob.bin" })).limit, undefined);
+		assert.equal(await readMap(h, { path: "src/blob.bin" }), undefined);
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
@@ -1382,8 +1433,9 @@ await check("the guard never touches a binary file", async () => {
 await check("the guard allows the read when it cannot read the file itself", async () => {
 	// The guard stats the file, then opens it to count lines. If it loses read permission in
 	// between - or the file is deleted, which is what an editor rewrite looks like - an
-	// unguarded `open` rejects and the *guard* fails the read. It must let the read through
-	// and leave reporting to the built-in tool. Read-deny via ACL gives stat=true, open=EPERM.
+	// unguarded `open` rejects and the *guard* fails the read. It must not claim the call:
+	// the read goes to the built-in tool, whose own error is what the model should see.
+	// Read-deny via ACL gives stat=true, open=EPERM.
 	const root = tempProject();
 	try {
 		const file = join(root, "src", "denied.ts");
@@ -1398,8 +1450,9 @@ await check("the guard allows the read when it cannot read the file itself", asy
 		const h = makeHarness({ cwd: root });
 		execFileSync("icacls", [file, "/deny", `${user}:(R)`], { stdio: "pipe" });
 		try {
-			const out = await runGuard(h, { path: "src/denied.ts" });
-			assert.equal(out.limit, undefined, "the guard leaves the read alone rather than refusing it");
+			// The read is left to the built-in tool, so it rejects with the real reason
+			// instead of being answered with a map the guard could not have built.
+			assert.match(await readError(h, { path: "src/denied.ts" }), /EPERM/);
 			assert.equal(h.calls.length, 0, "and never reaches the summarizer");
 		} finally {
 			execFileSync("icacls", [file, "/remove:d", user], { stdio: "pipe" });
@@ -1413,9 +1466,61 @@ await check("the guard respects the offset+limit the model already chose", async
 	try {
 		writeFileSync(join(root, "src", "big.ts"), numbered(4000));
 		const h = makeHarness({ cwd: root });
-		assert.equal((await runGuard(h, { path: "src/big.ts", offset: 500, limit: 50 })).limit, 50);
+		assert.equal(await readMap(h, { path: "src/big.ts", offset: 500, limit: 50 }), undefined);
 		// Well within an explicitly bounded span, even though the file is large.
-		assert.equal((await runGuard(h, { path: "src/big.ts", offset: 2000, limit: 200 })).limit, 200);
+		assert.equal(await readMap(h, { path: "src/big.ts", offset: 2000, limit: 200 }), undefined);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+await check("the replaced read keeps the built-in tool's surface", async () => {
+	// The extension swaps execution, not the tool's contract. pi does not inherit any of this
+	// from the built-in when a tool is overridden, so losing it silently would drop read's
+	// prompt guidance from the system prompt and its schema from the model's tool list.
+	const { createReadToolDefinition } = await import("@earendil-works/pi-coding-agent");
+	const h = makeHarness({ cwd: tempProject() });
+	const registered = h.tools.get("read");
+	const builtin = createReadToolDefinition(process.cwd());
+
+	assert.ok(registered, "a tool named read is registered, replacing the built-in");
+	assert.equal(registered.description, builtin.description, "the description is kept");
+	assert.equal(registered.promptSnippet, builtin.promptSnippet, "the prompt snippet is kept");
+	assert.deepEqual(
+		registered.promptGuidelines,
+		builtin.promptGuidelines,
+		"the prompt guidelines are kept",
+	);
+	assert.equal(
+		JSON.stringify(registered.parameters),
+		JSON.stringify(builtin.parameters),
+		"the parameter schema is kept",
+	);
+	// Renderers are resolved per slot by the TUI, so the built-in one draws our results too.
+	assert.equal(typeof registered.renderCall, "function", "the built-in call renderer is kept");
+	assert.equal(typeof registered.renderResult, "function", "the built-in result renderer is kept");
+});
+
+await check("a read the guard does not claim behaves exactly like the built-in read", async () => {
+	const root = tempProject();
+	try {
+		writeFileSync(join(root, "src", "a.ts"), numbered(20));
+		const h = makeHarness({ cwd: root });
+
+		// Reading the middle of a file, which is the shape the built-in read produces: the
+		// slice the caller asked for, its continuation note, and no truncation.
+		const result = await runRead(h, { path: "src/a.ts", offset: 5, limit: 3 });
+		assert.equal(
+			result.content[0].text,
+			"line 5\nline 6\nline 7\n\n[14 more lines in file. Use offset=8 to continue.]",
+		);
+		assert.equal(result.details, undefined, "a clean read reports no truncation");
+
+		// Past the end, the built-in read names the offset it could not honour.
+		assert.match(
+			await readError(h, { path: "src/a.ts", offset: 99 }),
+			/Offset 99 is beyond end of file/,
+		);
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}

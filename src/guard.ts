@@ -1,8 +1,7 @@
 import {
 	type ExtensionAPI,
 	type ExtensionContext,
-	isReadToolResult,
-	isToolCallEventType,
+	createReadToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { peekFreshSummary } from "./cache.ts";
 import { notifyUser } from "./error.ts";
@@ -10,114 +9,160 @@ import { failureNotice } from "./fallback.ts";
 import { countLinesFrom, looksBinary } from "./hash.ts";
 import { isRegularFile, isUnguardedPath, resolveFilePath } from "./paths.ts";
 import { READ_LINE_LIMIT, renderSummary } from "./render.ts";
+import { readImageAutoResize } from "./settings.ts";
 import { summarizeFile, type SummarizeOutcome } from "./summarize.ts";
-
-/** A notice to append to a read result, keyed by tool call id, awaiting that result. */
-const pendingNotices = new Map<string, string>();
 
 /**
  * A read either returns the lines it asked for, or it returns the file's map. Nothing else.
  *
  * A span of `READ_LINE_LIMIT` lines or fewer is left alone and returns exactly what was read.
- * A span of more than that is answered with the map instead: the call is blocked, the read
- * never runs, and the model gets the summary as the tool result. So a refused read costs
- * nothing from the file itself and nothing from the model's context.
+ * A span of more than that is answered with the map instead, and the read itself never runs.
+ *
+ * This is registered as a `read` tool, replacing the built-in one, rather than as a `tool_call`
+ * handler that blocks. Blocking cannot express this answer: pi hardcodes `isError: true` for a
+ * blocked call (`createErrorToolResult` in pi-agent-core's agent loop), and a blocked call
+ * skips the `tool_result` hook entirely, so the refusal reaches the model as a failed tool call
+ * carrying the map as its text. Registering under the same name and returning the map as
+ * ordinary content makes it a success, which is what it is: the call did what this extension
+ * promises a read of that size does.
+ *
+ * The tool's surface is the built-in's. The definition below is built by the same factory pi
+ * uses, and its description, schema, renderers and prompt metadata are kept, so the model's
+ * instructions and the TUI's syntax highlighting are unchanged. Everything the interception
+ * does not claim is handed straight to the built-in `execute`.
  *
  * The map is served from cache when one is fresh. When the file has never been summarized the
  * guard summarizes it here, so a cold oversized `read` costs up to `MAX_ATTEMPTS` model calls —
  * this is the one place in the extension that spends them without the caller naming a file to
  * `summary`.
  *
- * The call is refused rather than clamped because a clamped read is neither of the two useful
+ * Interception is the choice over clamping because a clamped read is neither of the two useful
  * answers. It spends the context of a real read and still shows a fraction of the file, and a
  * map bolted onto its tail hides that the model was cut off. `read`'s own limit is the rule:
  * ask for more than it, and the answer is the map.
  *
- * A refusal is reported to the model as a failed call — pi's core turns the reason into an error
- * tool result — which is deliberate here: the read genuinely did not happen, and the reason
- * carries the map. No `tool_result` handler runs for a refused call, so the reason is the only
- * channel out.
- *
- * When no summary can be produced the read is *not* refused: with no map to offer, refusing the
- * read would take the file away and leave nothing behind. The failure is raised as a
- * notification and, for runs with no UI, as a note appended to the read result.
+ * When no summary can be produced the read is not intercepted: with no map to offer, withholding
+ * the file would take it away and leave nothing behind. The read runs, the failure is raised
+ * as a notification, and — for runs with no UI, where a notification goes nowhere — the reason
+ * is appended to the result.
  *
  * Prose, notes and extensionless files (`.md`, `.txt`, `Makefile`) are never touched. They are
  * written to be read in order and a map of a README says nothing a skim does not, so the limit
  * buys nothing there and only cuts the file mid-section. The limit is for source files, where
  * not knowing which range holds a symbol costs a wasted call.
  */
-export function registerReadGuard(pi: ExtensionAPI): void {
-	pi.on("tool_call", async (event, ctx) => {
-		if (!isToolCallEventType("read", event)) return;
+export function registerReadTool(pi: ExtensionAPI): void {
+	pi.registerTool({
+		...createReadToolDefinition(process.cwd()),
+		async execute(toolCallId, params, signal, onUpdate, ctx) {
+			const decision = await decide(ctx, params);
 
-		const absPath = resolveFilePath(event.input.path, ctx.cwd);
-		if (isUnguardedPath(absPath)) return;
-		// Anything the guard cannot measure is left to the built-in read tool. The probe
-		// functions below open the file, and it can vanish in between - an editor rewriting
-		// it, a delete, a permission change - so they are guarded too. A read must never
-		// fail because the *guard* failed to look at the file.
-		try {
-			if (!isRegularFile(absPath)) return;
-			if (await looksBinary(absPath)) return;
-		} catch {
-			return;
-		}
+			if (decision.kind === "map") {
+				// A clean read of the built-in reports `details: undefined`, so the shape of a
+				// normal read is kept exactly.
+				return { content: [{ type: "text", text: decision.text }], details: undefined };
+			}
 
-		const rawOffset = event.input.offset;
-		const offset =
-			typeof rawOffset === "number" && Number.isFinite(rawOffset)
-				? Math.max(1, Math.trunc(rawOffset))
-				: 1;
-
-		const rawLimit = event.input.limit;
-		const limit =
-			typeof rawLimit === "number" && Number.isFinite(rawLimit) ? Math.trunc(rawLimit) : undefined;
-
-		// A non-positive limit is the built-in tool's problem, not the guard's.
-		if (limit !== undefined && limit <= 0) return;
-
-		let remaining: number;
-		try {
-			remaining = await countLinesFrom(absPath, offset, READ_LINE_LIMIT);
-		} catch {
-			return; // unreadable now: let the built-in read report it
-		}
-		if (remaining === 0) return; // offset past EOF: let the read tool raise its own error
-
-		// With an explicit limit the call is already bounded; otherwise the whole tail counts
-		// as the span the model is asking for, which is exactly the unbounded read to refuse.
-		const span = limit === undefined ? remaining : Math.min(remaining, limit);
-		if (span <= READ_LINE_LIMIT) return;
-
-		const summarized = await ensureSummary(ctx, absPath);
-
-		// No summary, so refusing the read would leave the model with nothing. Let it through
-		// and say why.
-		if (summarized.error !== undefined) {
-			const notice = failureNotice("summary", summarized.error, "Reading the file directly.");
-			notifyUser(ctx, notice, "error");
-			pendingNotices.set(event.toolCallId, `# ${notice}`);
-			return;
-		}
-
-		return { block: true, reason: renderReason(offset, summarized) };
-	});
-
-	// A notification only exists in the UI, which is absent in print and RPC runs. On the
-	// failure path the read does run, so the notice rides its result.
-	pi.on("tool_result", async (event) => {
-		if (!isReadToolResult(event)) return;
-		const notice = pendingNotices.get(event.toolCallId);
-		if (notice === undefined) return;
-		pendingNotices.delete(event.toolCallId);
-
-		return { content: [...event.content, { type: "text", text: `\n${notice}` }] };
+			const result = await delegate(toolCallId, params, signal, onUpdate, ctx);
+			if (decision.kind === "notice") {
+				return {
+					content: [...result.content, { type: "text", text: `\n# ${decision.notice}` }],
+					details: result.details,
+				};
+			}
+			return result;
+		},
 	});
 }
 
 /**
- * The text a refused read returns: what stands in for it, then the map.
+ * Run the built-in read, on the built-in's own terms.
+ *
+ * The definition is built fresh per call rather than once: `autoResizeImages` comes from pi's
+ * settings and an extension context does not expose it, and the session may have been replaced
+ * or the project switched since this tool was registered. It is built against the process cwd
+ * as a fallback only — the built-in resolves every path against the calling context's cwd,
+ * which is passed straight through.
+ */
+function delegate(
+	toolCallId: string,
+	params: { path: string; offset?: number; limit?: number },
+	signal: AbortSignal | undefined,
+	onUpdate: Parameters<ReturnType<typeof createReadToolDefinition>["execute"]>[3],
+	ctx: ExtensionContext,
+) {
+	return createReadToolDefinition(process.cwd(), {
+		autoResizeImages: readImageAutoResize(ctx.cwd),
+	}).execute(toolCallId, params, signal, onUpdate, ctx);
+}
+
+/** What a `read` call should do: run normally, return the map, or run and carry a notice. */
+type Decision =
+	| { kind: "read" }
+	| { kind: "map"; text: string }
+	| { kind: "notice"; notice: string };
+
+/**
+ * Decide what to do with a read, without reading the file.
+ *
+ * Everything here can fail on a file that is being rewritten underneath us, and a `read` must
+ * not fail because the *guard* failed to look at it, so the probes are inside one try/catch.
+ */
+async function decide(
+	ctx: ExtensionContext,
+	params: { path: string; offset?: number; limit?: number },
+): Promise<Decision> {
+	const absPath = resolveFilePath(params.path, ctx.cwd);
+	if (isUnguardedPath(absPath)) return { kind: "read" };
+
+	try {
+		if (!isRegularFile(absPath)) return { kind: "read" };
+		if (await looksBinary(absPath)) return { kind: "read" };
+	} catch {
+		return { kind: "read" };
+	}
+
+	const offset =
+		typeof params.offset === "number" && Number.isFinite(params.offset)
+			? Math.max(1, Math.trunc(params.offset))
+			: 1;
+
+	const limit =
+		typeof params.limit === "number" && Number.isFinite(params.limit)
+			? Math.trunc(params.limit)
+			: undefined;
+
+	// A non-positive limit is the built-in tool's problem, not the guard's.
+	if (limit !== undefined && limit <= 0) return { kind: "read" };
+
+	let remaining: number;
+	try {
+		remaining = await countLinesFrom(absPath, offset, READ_LINE_LIMIT);
+	} catch {
+		return { kind: "read" }; // unreadable now: let the built-in read report it
+	}
+	if (remaining === 0) return { kind: "read" }; // offset past EOF: the read tool's own error
+
+	// With an explicit limit the call is already bounded; otherwise the whole tail counts
+	// as the span the model is asking for, which is exactly the unbounded read to answer.
+	const span = limit === undefined ? remaining : Math.min(remaining, limit);
+	if (span <= READ_LINE_LIMIT) return { kind: "read" };
+
+	const summarized = await ensureSummary(ctx, absPath);
+
+	// No summary, so answering with a map would leave the model with nothing. Let the read
+	// run and say why.
+	if (summarized.error !== undefined) {
+		const notice = failureNotice("summary", summarized.error, "Reading the file directly.");
+		notifyUser(ctx, notice, "error");
+		return { kind: "notice", notice };
+	}
+
+	return { kind: "map", text: renderReason(offset, summarized) };
+}
+
+/**
+ * The text an intercepted read returns: what stands in for it, then the map.
  *
  * The map is rendered with its header, so the model still sees the file's size and hash.
  */

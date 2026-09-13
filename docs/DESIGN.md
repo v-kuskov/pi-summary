@@ -14,9 +14,9 @@ part of the file holds what before paying for all of it.
 `M1` **`summary` tool** — one model call per file, cached. Returns what the file does
 plus a line map: which region holds which declaration.
 
-`M2` **`read` guard** — `tool_call` handler on `read`. A call whose line span exceeds
-200 is refused, and the refusal carries the file's summary, so the model gets the map
-instead of a dead end. A call within the limit is returned exactly as asked.
+`M2` **`read` guard** — a replacement for the built-in `read` tool. A call whose line
+span exceeds 200 is answered with the file's summary, so the model gets the map instead of a
+dead end. A call within the limit is returned exactly as asked.
 
 Neither mechanism depends on the other. `M1` alone saves tokens on deliberate use.
 `M2` alone forces the model to work in ranges. Together, `M2` teaches and `M1` pays.
@@ -164,9 +164,9 @@ tool is for. The `summary` tool still summarizes any text file on request — on
 stops inviting it for prose.
 
 The same rule killed the bullet that described the guard: "a read longer than 200 lines is
-not performed, it returns the file's summary instead." True, and useless — it tells the
+answered with the file's summary instead." True, and useless — it tells the
 model that reading a big file costs nothing and yields the map anyway, which is precisely
-the reason not to call the tool. The guard's refusal says the same thing at the moment it
+the reason not to call the tool. The guard's interception says the same thing at the moment it
 is true, when the model has already made the mistake. The guideline list states only the
 case for calling `summary` first.
 
@@ -183,7 +183,7 @@ return number 200 or fewer:
 span = min(limit ?? Infinity, totalLines - offset + 1)
 ```
 
-So `read(big-file)` is refused and answered with the map,
+So `read(big-file)` returns the map,
 `read(big-file, offset=141, limit=200)` is allowed, `read(small-file)` is allowed, and
 `read(big-file, offset=1400, limit=10)` is allowed. A call already carrying a small
 `limit` is never touched, so the guard does not fight a model that is reading properly.
@@ -209,7 +209,7 @@ first 8000.
 
 It also skips `.md`, `.txt`, and any path with no extension — `Makefile`, `.gitignore`,
 `LICENSE`. Same reasoning: prose and notes are written to be read in order, and a map of a
-README says nothing a skim does not, so refusing one only takes the file away. The 200-line
+README says nothing a skim does not, so intercepting one only takes the file away. The 200-line
 limit is for source files, where guessing the wrong range costs a wasted call. Unguarded
 paths fall through to the built-in `read`, which has its own 2000-line cap. The `summary`
 tool itself still accepts any text file on request; only the read override skips prose. Note
@@ -218,20 +218,18 @@ that `.eslintrc.json` *is* guarded — a dotfile's leading dot is not an extensi
 `G4` A read either returns the lines it was asked for, or it returns the map. Nothing else.
 
 A span of 200 lines or fewer is left alone and returns exactly what was read. A span of more
-is **refused**: the guard returns `{ block: true, reason }`, the read never runs, and the
-reason is the map, preceded by two lines saying the read was not performed and the model
-should read one of the ranges below with `offset`/`limit`.
+returns the map as the result content, preceded by two lines saying this is the file's map
+and the model should read one of the ranges below with `offset`/`limit`. The file's own lines
+are never returned for such a call.
 
-Blocking is what makes the two answers unambiguous. The earlier design clamped
+Intercepting is what makes the two answers unambiguous. The earlier design clamped
 `input.limit` to 200 and appended the map to the result: the model then spent the context of
 a real read, still saw only a fraction of the file, and had to notice a tail it did not ask
 for to learn it had been cut. `read`'s own limit is the rule — ask for more than it and the
 answer is the map, not a shortened file with a map attached.
 
-A block is reported by pi's core as an error tool result, which is correct here: the read
-did not happen. The reason text is the only channel out, since pi skips `tool_result`
-entirely for a blocked call — which is why the map is inside the reason rather than in a
-replacement result.
+This result is a **success**, not an error. See `G8` for why that required replacing the tool
+rather than blocking the call.
 
 The map is rendered whole, uncapped. The cap that used to be here — 6000 chars, applied
 twice, once inside the renderer and again over the composed reason — was worse than the
@@ -241,16 +239,42 @@ hint was always dropped. It cut the map for a 150-row file, and the 1396-line fi
 benchmark produces 150 rows. A model that needs a map should not be handed a plausible
 partial one.
 
-`G5` The guard is implemented with `pi.on("tool_call")`, not by overriding the `read`
-tool. A second `read` registration would replace the built-in renderer and any other
-extension's `read` override; the event handler composes with both.
+`G5` The guard is implemented by registering a `read` tool, replacing the built-in one.
 
-`G6` A failed summary **lets the read through** — the call is not blocked, because with no
-map to offer a refusal would take the file away and leave nothing behind. The read proceeds
-as the model asked and keeps the built-in 2000-line cap, so a large file comes back truncated
-by that cap. The failure is reported as a notification and, since a notification does not
-exist in print or RPC runs, appended to the read result through a `tool_result` handler keyed
-by tool call id.
+This reverses what was originally decided here. The first design used
+`pi.on("tool_call")` on the grounds that a second `read` registration would replace the
+built-in renderer. That objection was wrong: built-in renderer inheritance is resolved per
+slot by the TUI (`withBuiltInRenderers` merges `renderCall`/`renderResult` into the registered
+definition), and pi's own docs describe overriding a built-in as a supported way to wrap one.
+An override that omits the renderers keeps them.
+
+What the override does *not* inherit, and must therefore be taken from
+`createReadToolDefinition` explicitly: the description, the parameter schema, `promptSnippet`
+and `promptGuidelines`. All four come from building the definition with pi's own factory, so
+the tool the model sees is the built-in's. Only the oversized span diverges; every other call
+is delegated to the built-in `execute`, errors included.
+
+`G6` A failed summary **lets the read run** — the file's lines are returned, because with no
+map to offer withholding the file would take it away and leave nothing behind. The read keeps
+the built-in 2000-line cap, so a large file comes back truncated by that cap. The failure is
+reported as a notification and, since a notification does not exist in print or RPC runs,
+appended to the read result the model receives. Because the read is performed by our own
+`execute`, the notice is appended right there — there is no need for a `tool_result` handler
+keyed by tool call id, which is what the blocking design required.
+
+`G8` An intercepted read is reported as a **successful** tool result.
+
+This is the reason for `G5`. pi hardcodes the error flag on a blocked call: `prepareToolCall`
+returns `{ result: createErrorToolResult(reason), isError: true }` for anything a `tool_call`
+handler blocks, with no way for the handler to say otherwise. A blocked call also never
+reaches `finalizeExecutedToolCall`, the only caller of `afterToolCall`, which is the only
+caller of the extension `tool_result` hook — so `tool_result` never fires for it and cannot
+correct the flag. The map therefore reached the model as a failed call, and rendered red in
+the TUI.
+
+A tool whose `execute` resolves normally produces `isError: false`. Returning the map as
+ordinary content is thus not a workaround but the accurate report: the tool did exactly what
+this extension promises a read of that size does.
 
 `G7` The guard never turns a failure into a raised error. `summary` failing is recoverable
 by definition - the file is still there - so the read path always produces a result.
@@ -406,8 +430,8 @@ where anything is.
 `D1` Storage: prose overview plus derived section rows. No stored blob, no stored
 rendered map, no FTS index.
 
-`D2` `read` guard refuses a span longer than 200 lines and returns the cached summary as the
-answer to the read.
+`D2` `read` guard answers a span longer than 200 lines with the cached summary, in place of
+the file's lines.
 
 `D3` Delivered as a publishable pi package: `package.json` with `pi.extensions`,
 `pi-package`/`pi-extension` keywords, README, tsconfig, and a `smoke.mjs` that drives
@@ -468,15 +492,19 @@ lock; with the default zero timeout a second process opening the same cache fail
 immediately with `SQLITE_BUSY` instead of waiting. Measured with 12 concurrent writers:
 the original order lost a row in 4 of 6 runs, the corrected order in 0 of 6.
 
-`D14` A read longer than 200 lines **is not performed**. The guard returns `{ block: true }`
-with the map as the reason. Two earlier designs were tried and rejected. Clamping
+`D14` A read longer than 200 lines **returns the map instead of the file's lines**, as a
+successful result, from a `read` tool that replaces the built-in one. Two earlier designs
+were tried and rejected. Clamping
 `input.limit` to 200 and appending the map was built and shipped: it spends the context of a
 real read, still shows a fraction of the file, and hides the cut in a tail the model did not
 ask for. A block that carries only an instruction, with no map, was rejected because it turns
-a read into a failure with nothing to show for it. Blocking *with* the map is the design:
-the model asked to see more than a read can return, and the map is the useful answer.
+a read into a failure with nothing to show for it. Blocking *with* the map was then built and
+shipped, and is now also rejected: pi hardcodes the error flag on a blocked call, so the map
+reached the model as a failed call and rendered red in the TUI (`G8`). The model asked to see
+more than a read can return; the map is the useful answer, and answering with it is not a
+failure.
 
-`D15` Neither the rendered summary nor the refusal text names the summarizer model. It is
+`D15` Neither the rendered summary nor the interception banner names the summarizer model. It is
 recorded in the cache and in the tool result's `details`, where it is useful for diagnosing a
 bad map, but it tells the model nothing it can act on and invites it to reason about the map's
 trustworthiness from a model name it has no basis to judge.

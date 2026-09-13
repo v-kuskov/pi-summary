@@ -21,11 +21,11 @@ Three parts, none of which requires the others:
 2. **A cache** — keyed by file path, validated by content hash. It stores the prose and the
    map as rows, never as rendered text, so the two cannot disagree with each other. A cache
    hit costs nothing.
-3. **A read guard** — intercepts every file read. If the call would return more than 200
-   lines, the read is not performed: the model gets the file's map instead, and reads one of
-   its ranges. A call asking for 200 lines or fewer is returned exactly as asked. If the file
-   was never summarized, the guard summarizes it on the spot, which turns a blind oversized
-   read into a map instead of a dead end.
+3. **A read guard** — replaces the built-in `read` tool. If the call would return more
+   than 200 lines, the file's lines are not returned: the model gets the file's map instead,
+   and reads one of its ranges. A call asking for 200 lines or fewer is returned exactly as
+   asked. If the file was never summarized, the guard summarizes it on the spot, which turns
+   a blind oversized read into a map instead of a dead end.
 
 The pieces compose in both directions: the tool alone saves tokens when the model chooses
 it; the guard alone forces range-based reading; together the guard creates the map and the
@@ -92,16 +92,30 @@ previously printed.
 
 ## The read guard
 
-Its test is **span, not file size**: how many lines the call would actually return. A call
-already asking for a small range is never touched, so the guard does not fight a model that
-is reading properly.
+It **replaces the built-in `read` tool** rather than blocking an oversized call with a
+`tool_call` handler. The test it applies is **span, not file size**: how many lines the call
+would actually return. A call already asking for a small range is never touched, so the
+guard does not fight a model that is reading properly.
 
-It refuses rather than caps, and the distinction is the point. A capped read is neither of
-the two useful answers: it spends the context of a real read, still shows a fraction of the
-file, and reports the cut in a tail the model did not ask for. `read`'s own limit is the
-rule — ask for more than it and the answer is the map. The refusal is reported by the host
-as a failed call, which is accurate: the read did not happen. The reason text is the only
-channel out of a refusal, so the map travels inside it.
+Replacing the tool is what lets the map arrive as an ordinary result. pi turns a blocked
+tool call into an error result — `isError: true` is hardcoded in the agent loop, not
+something a handler can set — and a blocked call never reaches the `tool_result` hook, so a
+refusal had no channel out except the error's own text. The model saw a failed call whose
+message happened to contain a map. Registering under the same name and returning the map as
+content produces `isError: false` by construction, which is what the call actually is: this
+extension did what it promises a read of that size does.
+
+The tool's contract is the built-in's. The override is built by pi's own
+`createReadToolDefinition`, so the schema, description, renderers and prompt metadata are the
+real ones — none of which pi inherits for an overriding tool. Only the oversized case
+diverges; everything else is delegated to the built-in `execute`, including its errors. The
+one setting that definition takes, `images.autoResize`, is re-read from pi's settings per
+call, since an extension context does not expose it.
+
+It intercepts rather than caps, and the distinction is the point. A capped read is neither
+of the two useful answers: it spends the context of a real read, still shows a fraction of
+the file, and reports the cut in a tail the model did not ask for. `read`'s own limit is the
+rule — ask for more than it and the answer is the map.
 
 The map is whole. An earlier version capped its length, which kept the *first*
 rows: a contiguous partial map is indistinguishable from a complete one, so the model could
@@ -112,12 +126,12 @@ Counting lines is bounded: the guard only needs to know whether more than 200 li
 so it streams and stops once it is past that point, and never holds a large file in memory.
 
 It declines to guard prose, notes, extensionless files, and binaries. Prose is written to
-be read in order, and a map of it says nothing a skim does not, so refusing one only takes
-the file away. A 200-line limit on an image is meaningless.
+be read in order, and a map of it says nothing a skim does not, so intercepting one only
+takes the file away. A 200-line limit on an image is meaningless.
 
 When there is no summary and none can be produced, the read is performed exactly as the
 model asked and the failure is reported to both the user and the model. With no map to
-offer, refusing the read would only take the file away.
+offer, withholding the file would only take it away.
 
 ## Guarantees
 
@@ -125,10 +139,11 @@ offer, refusing the read would only take the file away.
   Timestamps, sizes, and similar cheap signals are used only to conclude *stale* early,
   never to conclude *fresh*.
 - **A read either returns what it was asked for, or the map.** A span within the limit is
-  returned untouched; a longer span is refused, and the refusal carries the map. The guard
+  returned untouched; a longer span returns the map, as a successful result. The guard
   never fails a read it cannot answer: a file it cannot inspect, or a file whose summary
-  could not be produced, is passed through to the built-in tool. Its own file probes are
-  individually guarded, so a read cannot fail because the guard failed to inspect the file.
+  could not be produced, is passed through to the built-in tool, including that tool's own
+  errors. Its own file probes are individually guarded, so a read cannot fail because the
+  guard failed to inspect the file.
 - **A failed summary costs nothing but the failure.** The read proceeds as asked, and the
   failure is reported to the user and to the model — the latter through the result itself,
   since a UI notification does not exist in non-interactive runs.

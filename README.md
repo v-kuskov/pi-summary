@@ -7,10 +7,10 @@ Two things, working together:
 - **`summary` tool** — normally one model call per file, at most three. Returns what the
   file does and a map of which line ranges hold what. Cached in SQLite; asking again
   returns the cached result without a model call until the file's contents change.
-- **`read` guard** — `tool_call` handler that refuses any `read` longer than 200 lines and
-  returns the file's summary instead, so the model reads one of the map's ranges rather than
-  the whole file. A read of 200 lines or fewer is returned exactly as asked. A file with no
-  summary yet is summarized on the spot. Prose, notes and extensionless
+- **`read` guard** — a replacement for the built-in `read` tool that answers any `read`
+  longer than 200 lines with the file's summary instead, so the model reads one of the map's
+  ranges rather than the whole file. A read of 200 lines or fewer is returned exactly as
+  asked. A file with no summary yet is summarized on the spot. Prose, notes and extensionless
   files (`.md`, `.txt`, `Makefile`, `.gitignore`) are never touched — they read whole.
 
 ## Install
@@ -60,8 +60,8 @@ every attempt, so a test that does not set it signs with an empty key.
 # read src/foo.ts with offset/limit inside one range (max 200 lines per call).
 ```
 
-A later `read path="src/foo.ts"` with no range is refused, and the map is all that comes
-back:
+A later `read path="src/foo.ts"` with no range is answered with the map instead of the
+file's lines, as a normal successful result:
 
 ```
 # this file: longer than 200 lines; this is the file's map, not its contents.
@@ -83,10 +83,11 @@ An HTTP client for the internal Orders API. ...
 `read path="src/foo.ts" offset=141 limit=200` passes through untouched.
 
 A `read` that already carries a small `limit` is never touched, so the guard does not
-fight a model that is reading properly. `read path="src/foo.ts" limit=2000` is refused the
-same way a bare `read` is — the span that would come back is what counts, not whether
-`limit` was passed. A file whose summary cannot be produced is read as asked, with the
-failure reported instead: with no map to offer, refusing would only take the file away.
+fight a model that is reading properly. `read path="src/foo.ts" limit=2000` returns the
+map the same way a bare `read` does — the span that would come back is what counts, not
+whether `limit` was passed. A file whose summary cannot be produced is read as asked, with
+the failure reported instead: with no map to offer, withholding the file would take it away
+and leave nothing behind.
 
 Until the file is summarized, an oversized `read` costs model calls without you asking
 for them — the one place this extension spends unbounded-by-the-caller, capped at three
@@ -149,10 +150,16 @@ failing.
   X handled?" by scanning every cached file pushes toward summarizing the whole project,
   which is unbounded model spend driven by a query string.
 - **No project-wide refresh.** Same reason.
-- **No `read` tool override.** The guard is a `tool_call` handler, so it composes with
-  the built-in renderer and with other extensions that already override `read`. It refuses
-  the oversized call and puts the map in the refusal, rather than replacing the `read` tool
-  or shortening its input.
+- **No shortened `read` input.** The guard replaces the `read` tool rather than rewriting
+  an oversized call into a bounded one, so what the model asked for is either answered or
+  answered with the map — never silently trimmed.
+
+  Replacing `read` rather than blocking the call is what makes the map a *successful*
+  result. pi hardcodes an error result for a blocked tool call, and skips the `tool_result`
+  hook for it, so a refusal could only ever reach the model as a failed call. Registering
+  under the same name and returning the map as content makes it what it is: an ordinary
+  answer. The built-in renderer, schema, description and prompt guidance are kept, so the
+  swap is invisible apart from the limit.
 
 ## Development
 
@@ -161,13 +168,14 @@ npm install
 npm run check     # tsc --noEmit && node smoke.mjs
 ```
 
-`smoke.mjs` drives the real tool and the real guard with a fake `ExtensionAPI` and a
+`smoke.mjs` drives the real tools with a fake `ExtensionAPI` and a
 fake `ModelRegistry`, against a temp project directory. It covers cache hit/miss/stale/
 forced, the hash-over-mtime rule, the blob degradation, the repair loop and its cap,
 the `mtime_ms` migration, settings precedence, and the guard's boundaries —
-including that a cold oversized read summarizes and returns the map, that the map carries
-every row uncut, that prose and extensionless files are left outside the limit, and that a
-failing summarizer lets the read through and says so.
+including that a cold oversized read summarizes and returns the map, that an intercepted
+read is a successful result and not an error, that the map carries every row uncut, that
+prose and extensionless files are left outside the limit, and that a failing summarizer
+lets the read through and says so.
 
 Nothing checks the map's *content*. Structure and schema are validated, and a
 contiguous, well-formed map can still name the wrong lines. The defence is in the prompt
