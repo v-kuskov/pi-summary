@@ -46,64 +46,50 @@ export async function prepareFile(absPath: string): Promise<PreparedFile> {
 }
 
 /**
- * The summarization prompt: how to read the excerpt, the JSON contract, a worked example,
- * then the numbered file.
+ * The summarization prompt: what the map is for, how the file is laid out, the JSON
+ * contract, the limits the answer is held to, then the numbered file.
  *
- * There is no tool schema in this request, so this text is the entire contract. Two things
- * carry most of the weight:
+ * There is no tool schema in this request, so this text is the entire contract - but it is
+ * held to a goal, a shape, and a few limits, nothing more. Two things carry the weight:
  *
- * - The excerpt is **numbered**, and the prompt says to copy numbers from the left column.
- *   That turns a counting task, which models fail at over long files, into a copying task.
- * - The rows may **leave gaps** where lines do nothing, but must not **overlap** - two rows
- *   describing the same line leave the caller unable to tell which note applies. Overlap is
- *   trimmed locally rather than sent back, so it never costs a model call.
+ * - The excerpt is **numbered**, and one line says the numbers are copied from the left
+ *   column. That turns a counting task, which models fail at over long files, into a
+ *   copying task.
+ * - The `Limits` are what a model cannot infer: the `kind` vocabulary, that gaps are
+ *   legal, that numbers come from the column rather than from counting, and the two field
+ *   lengths that are cut on the way into storage.
+ *
+ * A worked example and a bullet per JSON field were both measured and dropped - together
+ * about 2400 characters, over half the prompt. Every rule they stated is either stated
+ * here once, shorter, or enforced locally by `normalizeSections` (overlap and reversed
+ * ranges) instead of asked for.
  */
 export function buildSummarizePrompt(path: string, file: PreparedFile): string {
 	return [
-		"You are indexing a source file so a later model can read only the parts it needs instead of the whole file.",
-		"Reply with a single JSON object and nothing else: no prose, no explanation, no markdown fence.",
+		"Index this file so a later model can read the parts it needs instead of the whole file.",
+		"Reply with one JSON object and nothing else - no prose, no markdown fence.",
 		"",
-		`File: ${path}`,
-		`The file is ${file.totalLines} lines, and all of it is below. Line 1 is the first line and line ${file.totalLines} is the last.`,
+		`File: ${path} (${file.totalLines} lines; line ${file.totalLines} is the last).`,
 		"",
-		"The excerpt below is numbered. Every line begins with its own line number in the left",
-		`column, then a tab, then the line:`,
+		"The excerpt is numbered, number then tab then line:",
 		"",
 		`     1${GUTTER}the first line of the file`,
 		`     2${GUTTER}the second line`,
 		"",
-		"Take every number in your answer from that column. Copy the number printed beside the",
-		"line you mean, and do not count lines yourself or compute them from a pattern.",
-		"",
 		"JSON shape:",
 		'  { "overview": string, "sections": [ { "start_line": number, "end_line": number, "kind": string, "name": string, "note": string } ] }',
 		"",
-		"overview: up to ten sentences of plain prose, and it must stand alone - it is shown without the map when there is no room for both. Say what the file is for, what its main exports are and how they relate, and anything a reader must know before changing it. Skip line numbers and restating the map.",
-		"sections: rows in line order, each one earning its place. Rows must not overlap.",
-		"  A row is one declaration and its whole body, or a run of declarations that do the same kind of thing and read as one stripe; it starts at the first and ends at the last, and it ends where the sameness ends. A row that would take a note you have already written, with only a name or a number changed, is not a new row - extend the row above over it. What a row stands for in total belongs in overview, not in the map.",
-		"  Leave gaps where nothing happens - blank runs, license headers, generated boilerplate - rather than inventing a region to cover them; skipped lines reach the caller as 'skipped', so a gap costs nothing.",
-		"  start_line / end_line: integers copied from the left column, inclusive.",
+		"overview: what the file is for, its main exports and how they relate, and anything a reader must know before changing it. Shown without the map when there is no room for both, so it must stand alone. At most ten sentences.",
+		"sections: rows in line order. A row is one declaration and its body, or a run of declarations that do the same kind of thing and read as one stripe. No two rows share a line.",
+		"  start_line / end_line: inclusive line numbers copied from the left column.",
 		`  kind: one of ${SECTION_KINDS.join(", ")}.`,
-		"  name: the declaration or symbol name, or the pattern plus how many when a row covers many; (top level) for loose statements.",
-		"  note: up to two sentences, or about 200 characters. This is the only place detail lives - the caller reads the map and then a single range - so say what the region does and any side effect or invariant that matters when editing it. Do not pad a trivia row to fill the budget.",
+		"  name: the symbol, or the pattern plus how many when a row covers many; (top level) for loose statements.",
+		"  note: what the region does, plus any side effect or invariant that matters when editing it. At most two sentences, about 200 characters.",
 		"",
-		"Example. An 8-line file and its correct rows:",
-		"",
-		`     1${GUTTER}import { readFile } from "node:fs/promises";`,
-		`     2${GUTTER}`,
-		`     3${GUTTER}const LIMIT = 10;`,
-		`     4${GUTTER}`,
-		`     5${GUTTER}export function clamp(n: number): number {`,
-		`     6${GUTTER}  return Math.min(n, LIMIT);`,
-		`     7${GUTTER}}`,
-		`     8${GUTTER}`,
-		"",
-		'{"overview":"Reads files and clamps numbers to a limit. Exports clamp, which caps a value at LIMIT; callers use it to keep pagination sizes inside the API limit. The module has no side effects, so importing it is free.","sections":[',
-		'{"start_line":1,"end_line":1,"kind":"import","name":"node/fs/promises","note":"Imported for readFile, though nothing in this file calls it - an unused import."},',
-		'{"start_line":3,"end_line":3,"kind":"const","name":"LIMIT","note":"The cap clamp applies. Lowering it silently changes every caller that relies on the default page size."},',
-		'{"start_line":5,"end_line":7,"kind":"function","name":"clamp()","note":"Returns min of n and LIMIT. Pure, and safe to call in a hot loop."}]}',
-		"",
-		"The three rows above leave lines 2, 4, and 8 unmapped on purpose: they are blank, so there is nothing to say about them. Each number was copied out of the left column.",
+		"Limits:",
+		"  - Copy line numbers from the left column; do not count lines yourself.",
+		"  - Leave gaps where lines do nothing - blank runs, license headers, boilerplate.",
+		"  - Say a thing once - a note that only renames the row above extends that row instead.",
 		"",
 		"Now map the file below the same way.",
 		"",
@@ -123,7 +109,7 @@ export function buildRepairPrompt(problems: string[]): string {
 		"",
 		"Reply with the corrected JSON object only. No prose, no markdown fence.",
 		"Re-read the numbers in the left column of the excerpt and copy them, rather than adjusting them by hand.",
-		"Rows may leave gaps for lines that do nothing; what they must not do is overlap each other.",
+		"Rows may leave gaps for lines that do nothing, and no two rows may share a line.",
 	].join("\n");
 }
 

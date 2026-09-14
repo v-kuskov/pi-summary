@@ -53,7 +53,7 @@ const errorResponse = (message) => ({
 // repair call, so helpers here build tiling answers unless a test wants otherwise.
 const lastShownLine = (context) => {
 	const prompt = context.messages[0].content[0].text;
-	return Number(prompt.match(/The file is (\d+) lines/)[1]);
+	return Number(prompt.match(/File: .*\((\d+) lines;/)[1]);
 };
 const tilingAnswer = (overview, kind = "function", name = "run()", note = "does it") =>
 	(context) =>
@@ -586,7 +586,7 @@ await check("summary asks for JSON only, with no tools, and reports nested usage
 		assert.equal(context.tools, undefined, "no tool schema is sent to the summarizer");
 		assert.deepEqual(opts.samplingParams, { response_format: { type: "json_object" } });
 		assert.equal(opts.cacheRetention, "none");
-		assert.match(context.messages[0].content[0].text, /single JSON object/);
+		assert.match(context.messages[0].content[0].text, /one JSON object and nothing else/);
 		assert.equal(result.usage.totalTokens, 15, "nested tokens are surfaced");
 		assert.equal(result.details.attempts, 1);
 		assert.equal(result.details.degraded, false);
@@ -911,8 +911,7 @@ await check("a whole file is sent, with no cap and no truncation language", asyn
 
 		const prompt = h.calls[0].context.messages[0].content[0].text;
 		// numbered(5000) is 5000 lines plus a trailing newline, so 5001 by read's counting.
-		assert.match(prompt, /The file is 5001 lines, and all of it is below/);
-		assert.match(prompt, /line 5001 is the last/);
+		assert.match(prompt, /File: src\/huge\.ts \(5001 lines; line 5001 is the last\)/);
 		assert.doesNotMatch(prompt, /continues past/, "nothing is held back");
 		assert.doesNotMatch(prompt, /left unmapped/, "no line was held back from the model");
 
@@ -938,11 +937,11 @@ await check("the excerpt is numbered so rows can be copied rather than counted",
 		const excerpt = prompt.slice(prompt.indexOf("<file>"), prompt.indexOf("</file>"));
 		// Numbered, tab-separated, starting at 1 - not raw text.
 		assert.match(excerpt, /^<file>\n 1\tline 1\n 2\tline 2/m, "lines carry their numbers");
-		assert.match(prompt, /copy the number printed beside the/i);
-		assert.match(prompt, /do not count lines yourself or compute them from a pattern/i);
+		assert.match(prompt, /Copy line numbers from the left column/i);
+		assert.match(prompt, /do not count lines yourself/i);
 
 		// The whole file is here, and the prompt says so.
-		assert.match(prompt, /The file is 13 lines/);
+		assert.match(prompt, /File: src\/a\.ts \(13 lines; line 13 is the last\)/);
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
