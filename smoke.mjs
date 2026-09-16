@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { homedir as osHomedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -1500,6 +1500,352 @@ await check("the replaced read keeps the built-in tool's surface", async () => {
 	// Renderers are resolved per slot by the TUI, so the built-in one draws our results too.
 	assert.equal(typeof registered.renderCall, "function", "the built-in call renderer is kept");
 	assert.equal(typeof registered.renderResult, "function", "the built-in result renderer is kept");
+});
+
+/**
+ * Run the `edit` locator the way pi does: execute the real built-in edit, then hand its
+ * result to the handler and return what the handler decided.
+ *
+ * The handler under test is registered by the extension itself, so this reaches it through
+ * the harness's handler list rather than importing it - the wiring is part of what is being
+ * checked.
+ */
+async function runEdit(h, path, edits) {
+	const { createEditToolDefinition } = await import("@earendil-works/pi-coding-agent");
+	const tool = createEditToolDefinition(h.ctx.cwd);
+	const result = await tool.execute("id", { path, edits }, undefined, undefined, h.ctx);
+	const locator = h.handlers.find((entry) => entry.event === "tool_result");
+	assert.ok(locator, "the extension registers a tool_result handler");
+
+	const hookResult = await locator.handler(
+		{
+			type: "tool_result",
+			toolName: "edit",
+			toolCallId: "call-1",
+			input: { path, edits },
+			content: result.content,
+			details: result.details,
+			isError: false,
+		},
+		h.ctx,
+	);
+
+	// `undefined` means the handler declined, which leaves the built-in result untouched.
+	const text = hookResult
+		? hookResult.content
+				.slice(result.content.length)
+				.map((c) => c.text)
+				.join("")
+		: "";
+	return { text, builtinText: result.content.map((c) => c.text).join(""), result, hookResult };
+}
+
+/** A 253-line file: over the read limit, so a re-read of it would be intercepted. */
+const locatorFile = (root, lines = 253) => {
+	writeFileSync(join(root, "src", "long.ts"), numbered(lines));
+	return "src/long.ts";
+};
+
+await check("the edit locator names the changed line and the file's new length", async () => {
+	const root = tempProject();
+	try {
+		// Replace the last line: 253 lines in, 253 out.
+		const path = locatorFile(root);
+		const h = makeHarness({ cwd: root });
+		const { text, builtinText } = await runEdit(h, path, [
+			{ oldText: "line 253\n", newText: "line 253 changed\n" },
+		]);
+
+		assert.match(text, /line 253/, "the changed line is named");
+		assert.match(text, /254 lines/, "the file's own length is named");
+		// The model's line numbers only line up with `read` if this holds. `read` computes
+		// `text.split("\n").length` with no popping (core/tools/read.js, `totalFileLines`),
+		// so `numbered(253)` - which ends in a newline - is 254 lines to `read`.
+		assert.equal(
+			readFileSync(join(root, path), "utf-8").split("\n").length,
+			254,
+			"the count matches read's convention",
+		);
+		assert.match(text, /the file now has 254 lines/, "the locator quotes that same number");
+		assert.match(
+			builtinText,
+			/^Successfully replaced 1 block\(s\)/,
+			"the built-in confirmation is still there",
+		);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+await check("the edit locator reports the length after an edit that adds a line", async () => {
+	const root = tempProject();
+	try {
+		const path = locatorFile(root);
+		const h = makeHarness({ cwd: root });
+		const { text } = await runEdit(h, path, [
+			{ oldText: "line 250\n", newText: "first\nsecond\n" },
+		]);
+
+		// 253 lines, one replaced by two: the file grew by one.
+		assert.match(text, /255 lines/, "the new length counts the added line");
+		assert.match(text, /lines 250-251/, "both written lines are named");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+await check("the edit locator counts lines the way read does, at the end of a file", async () => {
+	const root = tempProject();
+	try {
+		// Appending past the last line is the case where a popped count would report one line
+		// too few and an offset derived from it would land short.
+		const path = locatorFile(root);
+		const h = makeHarness({ cwd: root });
+		const { text } = await runEdit(h, path, [
+			{ oldText: "line 253\n", newText: "line 253\nappended\n" },
+		]);
+
+		assert.match(text, /line 254/, "the appended line is named as the changed line");
+		assert.match(text, /255 lines/, "the length agrees with the line just named");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+await check("the edit locator ignores a deletion as a landing position", async () => {
+	const root = tempProject();
+	try {
+		// A deletion renders as a `+` row with no text, because `diffLines` reports the empty
+		// remainder after the removed run as an addition. Counting it would name a line
+		// nothing was written to: here the insert is at line 6 and the deletion is at 250, so
+		// the phantom row would stretch the answer to `lines 6-250`.
+		const path = locatorFile(root);
+		const h = makeHarness({ cwd: root });
+		const { text } = await runEdit(h, path, [
+			{ oldText: "line 5\nline 6", newText: "line 5\ninserted\nline 6" },
+			{ oldText: "line 249\nline 250\nline 251", newText: "" },
+		]);
+
+		assert.match(text, /Edited line 6;/, "only the inserted line is named");
+		assert.doesNotMatch(text, /250/, "a deleted line is not a landing position");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+await check("the edit locator names each changed run, not the span between them", async () => {
+	const root = tempProject();
+	try {
+		// Two disjoint edits in one call. A span would say `lines 6-250`, naming 243 lines
+		// that did not change as edited; the model cannot act on that, which is the re-read
+		// this exists to prevent. Measured on one real session, 231 of 447 edits (52%) landed
+		// in two or more runs.
+		const path = locatorFile(root);
+		const h = makeHarness({ cwd: root });
+		const { text } = await runEdit(h, path, [
+			{ oldText: "line 6\n", newText: "line 6 changed\n" },
+			{ oldText: "line 250\n", newText: "line 250 changed\n" },
+		]);
+
+		assert.match(text, /lines 6 and 250;/, "both runs are named separately");
+		assert.doesNotMatch(text, /6-250/, "the unchanged lines between them are not claimed");
+		assert.match(text, /254 lines/, "the length is still reported");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+await check("the edit locator joins three runs with commas and a final and", async () => {
+	const root = tempProject();
+	try {
+		const path = locatorFile(root);
+		const h = makeHarness({ cwd: root });
+		const { text } = await runEdit(h, path, [
+			{ oldText: "line 6\n", newText: "line 6 changed\n" },
+			{ oldText: "line 40\n", newText: "line 40 changed\n" },
+			{ oldText: "line 250\n", newText: "line 250 changed\n" },
+		]);
+
+		assert.match(text, /Edited lines 6, 40 and 250;/, "every run is named, in order");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+await check("the edit locator falls back to the first line when a call only deletes", async () => {
+	const root = tempProject();
+	try {
+		// A pure deletion has no real `+` row at all: every one is the no-text phantom, so
+		// there are no runs to name. The answer is where the removed text began, which is
+		// still the line the model needs.
+		const path = locatorFile(root);
+		const h = makeHarness({ cwd: root });
+		const { text } = await runEdit(h, path, [
+			{ oldText: "line 250\nline 251\n", newText: "" },
+		]);
+
+		assert.match(text, /Edited line 250;/, "the deletion is reported at its start line");
+		assert.match(text, /252 lines/, "the length reflects the removed lines");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+await check("the edit locator returns only content, so the diff survives", async () => {
+	// pi maps the hook's return value with `details: hookResult?.details`, so returning a
+	// `details` key - even the same one - replaces what the TUI reads. The edit renderer
+	// draws the result from `details.diff`, so clobbering it would leave a successful edit
+	// with no diff on screen. Returning only `content` is what keeps that intact.
+	const root = tempProject();
+	try {
+		const path = locatorFile(root);
+		const h = makeHarness({ cwd: root });
+		const { hookResult, result } = await runEdit(h, path, [
+			{ oldText: "line 250\n", newText: "changed\n" },
+		]);
+
+		assert.ok(hookResult, "the locator is appended");
+		assert.deepEqual(
+			Object.keys(hookResult).sort(),
+			["content"],
+			"the handler sets content and nothing else",
+		);
+		assert.ok(result.details.diff, "the built-in diff is still produced");
+		assert.equal(result.details.firstChangedLine, 250, "the built-in line number is untouched");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+await check("the edit locator stays quiet when it cannot be exact", async () => {
+	const root = tempProject();
+	try {
+		const h = makeHarness({ cwd: root });
+		const locator = h.handlers.find((entry) => entry.event === "tool_result");
+		const base = {
+			type: "tool_result",
+			toolCallId: "call-1",
+			toolName: "edit",
+			input: { path: "src/long.ts", edits: [] },
+			content: [{ type: "text", text: "ok" }],
+			details: { diff: "", patch: "", firstChangedLine: 5 },
+			isError: false,
+		};
+
+		// A different tool's result is not ours to edit.
+		assert.equal(
+			await locator.handler({ ...base, toolName: "write", details: undefined }, h.ctx),
+			undefined,
+			"a write result is left alone",
+		);
+		// An error has no landing position to report. The file exists here on purpose: with a
+		// missing one the handler would decline anyway, and the test would pass without the
+		// isError check being there at all.
+		const real = locatorFile(root);
+		assert.equal(
+			await locator.handler(
+				{ ...base, input: { path: real, edits: [] }, isError: true },
+				h.ctx,
+			),
+			undefined,
+			"a failed edit is left alone",
+		);
+		// `firstChangedLine` is optional in pi's own type, so an absent one is expected. The
+		// file exists here so the handler cannot decline merely because it could not read it.
+		const present = locatorFile(root);
+		assert.equal(
+			await locator.handler(
+				{
+					...base,
+					input: { path: present, edits: [] },
+					details: { diff: "", patch: "" },
+				},
+				h.ctx,
+			),
+			undefined,
+			"an edit with no line number is left alone",
+		);
+		// A line number past the end of the file means the file on disk is not the one that
+		// was edited, so nothing derived from it can be trusted.
+		assert.equal(
+			await locator.handler(
+				{
+					...base,
+					input: { path: present, edits: [] },
+					details: { diff: "", patch: "", firstChangedLine: 9999 },
+				},
+				h.ctx,
+			),
+			undefined,
+			"a line number past the end of the file is left alone",
+		);
+		// The edit succeeded but the file is gone by the time the hook looks.
+		assert.equal(
+			await locator.handler({ ...base, input: { path: "src/gone.ts" } }, h.ctx),
+			undefined,
+			"an unreadable file leaves the result alone",
+		);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+await check("the edit locator says line, not lines, when the file is emptied", async () => {
+	const root = tempProject();
+	try {
+		// `read` counts an empty file as 1 line, so deleting a file's only line lands on the
+		// singular. Getting this wrong reads as "1 lines".
+		writeFileSync(join(root, "src", "one.ts"), "only line\n");
+		const h = makeHarness({ cwd: root });
+		const { text } = await runEdit(h, "src/one.ts", [
+			{ oldText: "only line\n", newText: "" },
+		]);
+
+		assert.match(text, /now has 1 line\./, "the singular is used for a one-line file");
+		assert.doesNotMatch(text, /1 lines/, "not the plural");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+await check("the edit locator declines a line number that is not a positive integer", async () => {
+	const root = tempProject();
+	try {
+		// `firstChangedLine` is typed as an optional number, so only the `undefined` case is
+		// guaranteed by the type. A zero, a fraction or a negative would name a line that
+		// cannot exist, which is the one thing this must never do.
+		const path = locatorFile(root);
+		const h = makeHarness({ cwd: root });
+		const locator = h.handlers.find((entry) => entry.event === "tool_result");
+		const base = {
+			type: "tool_result",
+			toolCallId: "call-1",
+			toolName: "edit",
+			input: { path, edits: [] },
+			content: [{ type: "text", text: "ok" }],
+			details: { diff: "", patch: "" },
+			isError: false,
+		};
+
+		for (const bad of [0, -3, 2.5, Number.NaN]) {
+			assert.equal(
+				await locator.handler(
+					{ ...base, details: { diff: "", patch: "", firstChangedLine: bad } },
+					h.ctx,
+				),
+				undefined,
+				`a firstChangedLine of ${bad} is refused`,
+			);
+		}
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+await check("the edit locator is registered once", async () => {
+	const h = makeHarness({ cwd: tempProject() });
+	const registered = h.handlers.filter((entry) => entry.event === "tool_result");
+	assert.equal(registered.length, 1, "one handler appends one locator, never two");
 });
 
 /**

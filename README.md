@@ -93,6 +93,34 @@ Until the file is summarized, an oversized `read` costs model calls without you 
 for them — the one place this extension spends unbounded-by-the-caller, capped at three
 calls per file and cached afterwards.
 
+## After an edit
+
+A successful `edit` gains one line the model would otherwise have no way to learn:
+
+```
+Successfully replaced 1 block(s) in src/foo.ts. Edited line 250; the file now has 253 lines.
+```
+
+When one call lands in several places, each run is named — `Edited lines 6, 40 and 251; the
+file now has 253 lines.` A span from the first run to the last would name the unchanged lines
+between them as edited, which is worse than saying nothing.
+
+pi computes the diff and the first changed line for every edit, but hands them to the TUI
+and the session transcript rather than to the model — `details` is a rendering channel, and
+no provider adapter reads it. So the model was told an edit succeeded and never told where it
+landed, and the only way to find out was to read the file back. When that file is past the
+read limit, every such read-back is intercepted by the guard and pays for a fresh summary:
+measured over one session of 49 edits, a 253-line file was read 25 times and 23 of those reads
+were ranged — cheap, but the whole-file ones are what pay.
+
+The locator answers that question directly, so the re-read has no reason to happen. It is
+appended rather than substituted — the confirmation and its block count are kept — and it is
+empty when it cannot be exact, since a wrong line number is worse than none. The count uses
+`read`'s own convention, so `offset` from it lands where the model expects.
+
+This is model-facing only. The TUI draws an edit result from the diff, so the transcript
+looks the same as it did before.
+
 ## Cache
 
 `<projectRoot>/.pi/summaries.db`, where the project root is the nearest ancestor

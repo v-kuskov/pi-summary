@@ -1,5 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { registerReadTool } from "./src/guard.ts";
+import { registerEditLocator } from "./src/locator.ts";
 import { registerSummaryTool } from "./src/tools.ts";
 
 /**
@@ -12,6 +13,10 @@ import { registerSummaryTool } from "./src/tools.ts";
  * Replacing `read` is what lets an intercepted call come back as a normal result rather
  * than as a failure; see src/guard.ts for why blocking the call could not.
  *
+ * It also tells the model where each `edit` landed, because the line numbers an edit
+ * produces are otherwise visible only to the TUI; see src/locator.ts for why that was
+ * making an editing session re-read whole files.
+ *
  * Nothing here opens a database or starts a background task at load time: the tool opens
  * the cache per call, which keeps parallel tool calls safe and stops the extension from
  * holding a file handle in a project the user only walked through.
@@ -19,4 +24,5 @@ import { registerSummaryTool } from "./src/tools.ts";
 export default function piSummary(pi: ExtensionAPI): void {
 	registerSummaryTool(pi);
 	registerReadTool(pi);
+	registerEditLocator(pi);
 }

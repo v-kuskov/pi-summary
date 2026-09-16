@@ -4,8 +4,8 @@ import { open, readFile, stat } from "node:fs/promises";
 /** How many hex characters of the sha256 we keep. Enough to detect change, short to print. */
 const HASH_CHARS = 16;
 
-/** Chunk size for the bounded line count. 64KB keeps a 200-line probe to one or two reads. */
-const BYTES_PER_CHUNK = 64 * 1024;
+/** Chunk size for a streamed line count. 64KB keeps a 200-line probe to one or two reads. */
+export const BYTES_PER_CHUNK = 64 * 1024;
 
 export type FileFingerprint = {
 	hash: string;

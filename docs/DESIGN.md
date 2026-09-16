@@ -561,3 +561,64 @@ which would cost the display without saying so. `D15` holds here too, so the mod
 in `details` and in neither rendered state. A path that is present but not a string is the one
 argument error the call line reports (`[invalid arg]`, as read does); an absent or empty one is
 a call still streaming its arguments, and shows `...`.
+
+`D17` A successful `edit` appends a line locator to its result, naming every run of lines the
+edit changed: `Edited lines 250-251; the file now has 254 lines.` Nothing else about the edit
+result changes — the built-in confirmation is kept, not replaced.
+
+The gap this closes is that the model is told an edit succeeded and never told where it landed.
+`EditToolDetails` carries `diff`, `patch` and `firstChangedLine`, and the `tool_result` hook
+receives all three, but `details` is a rendering channel: it is read by the TUI renderers, the
+HTML exporter and the session transcript, and by **no provider adapter**. Only `content`
+reaches the model. The hook's return value replaces that content, so appending a text block is
+the whole mechanism — no new channel needed inventing.
+
+Measured on one session (the reference session: 49 edits), a 253-line file was read 25 times,
+and 23 of those reads were ranged. The waste is real but narrower than a bare read count
+suggests, and it is worth stating precisely because it changes what "fixed" means. A ranged
+read costs nothing: `read(path, offset=140, limit=45)` has span 45, is never intercepted, and
+never touches the cache. The model was not checking its spelling; it was looking up line
+numbers it had no other way to learn, and it did so with whole-file reads. The re-read is the
+symptom, so the fix is the missing information rather than an instruction not to look.
+
+Three alternatives were rejected, each for a measured reason:
+
+- **Appending the diff.** Over the reference session's 49 edits: median 703 chars, max 14,152.
+  The median is harmless and the tail is not, and the content is largely the model's own
+  `edits[].newText` echoed back. Only the landing position is new information.
+- **Deriving the file's length from `patch` or `diff`.** Both truncate every unchanged run to
+  ±4 context lines, so a hunk header reports the hunk's extent, not the file's. Measured: a
+  one-region edit to a 254-line file derives a length of 11.
+- **`promptGuidelines` on a shadowed `edit`.** A guideline whose main verb is `read` reads as an
+  instruction to read. The missing information is the defect, so the prompt is the wrong tool.
+  The built-in guidelines are also asserted byte-identical to preserve for the shadowed `read`,
+  and that invariant has no place here.
+
+Four details are load-bearing.
+
+The line count is `read`'s convention because the number exists to choose an `offset`, and an
+off-by-one would send the next read past the end. That convention is the **raw** split: pi's
+`read` computes `text.split("\n").length` with no popping (`core/tools/read.js`, its
+`totalFileLines`), so a file of `a\nb\nc\n` is 4 lines. `splitLinesForCounting` pops the
+trailing empty element, but it belongs to `truncate.js` and decides whether to truncate; it is
+not how `read` counts a file. `fingerprint` in hash.ts states the same `newlines + 1` rule.
+
+The locator names every changed run rather than the span between the first and the last. A span
+would name the unchanged lines between the runs as edited: measured over the reference session,
+25 of 49 edits (51%) landed in two or more disjoint runs, and over every recorded session 230
+of 437 (53%). A model told its change is "somewhere in 18-86" has learned nothing it can act
+on, which is the re-read this exists to prevent. Naming every run stays cheap — median 53
+characters per locator, max 227 across all sessions — against a 703-character median diff.
+
+The locator is not appended at all when it cannot be computed exactly: a wrong line number is
+worse than none, because the model would act on it.
+
+A no-op `edit` needs no guard of its own. The built-in tool throws on identical replacement
+rather than returning a result, and although pi catches that throw and still runs the hook, it
+arrives as an error result and is declined by the `isError` check.
+
+The locator is emitted on every successful `edit`, not only above the read limit. An edit at
+line 5 of a 253-line file still precedes an unbounded re-read of 253 lines, so gating on where
+the edit landed would suppress the locator exactly where the file is large enough for the
+re-read to be intercepted. The only edit that changes nothing is one against a file small
+enough that no read of it was ever intercepted.
