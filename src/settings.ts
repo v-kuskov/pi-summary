@@ -25,13 +25,10 @@ export type SummarySettings = {
  * A malformed or unreadable config is reported as "not configured" rather than thrown:
  * the caller falls back to the session model, which is a working configuration.
  */
-export function readSummarySettings(
-	cwd: string,
-	manager?: SettingsManager,
-): SummarySettings {
+export function readSummarySettings(cwd: string): SummarySettings {
 	let settings: SettingsManager;
 	try {
-		settings = manager ?? SettingsManager.create(cwd);
+		settings = SettingsManager.create(cwd);
 	} catch {
 		return {};
 	}
@@ -70,10 +67,10 @@ function pick(raw: unknown): SummarySettings {
  *
  * Anything unreadable means the default, which is what pi uses when the key is absent.
  */
-export function readImageAutoResize(cwd: string, manager?: SettingsManager): boolean {
+export function readImageAutoResize(cwd: string): boolean {
 	let settings: SettingsManager;
 	try {
-		settings = manager ?? SettingsManager.create(cwd);
+		settings = SettingsManager.create(cwd);
 	} catch {
 		return true;
 	}

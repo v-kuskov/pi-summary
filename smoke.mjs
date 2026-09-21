@@ -440,10 +440,11 @@ await check("openDb sets busy_timeout before switching to WAL", async () => {
 	}
 });
 
-await check("the cached schema carries no mtime column, and an old database is migrated", async () => {
-	// `mtime_ms` was stored until the freshness check stopped consulting it. A database from
-	// an earlier version still has it, NOT NULL, so dropping it is a migration and not just a
-	// schema edit: without it every insert fails the constraint.
+await check("the cached schema carries neither retired column, and an old database is migrated", async () => {
+	// `mtime_ms` was stored until the freshness check stopped consulting it, and `created_at`
+	// until nothing was left that read it. A database from an earlier version still has both,
+	// NOT NULL, so dropping them is a migration and not just a schema edit: without it every
+	// insert fails the constraint.
 	const root = tempProject();
 	try {
 		const dbPath = join(root, ".pi", "summaries.db");
@@ -473,6 +474,7 @@ await check("the cached schema carries no mtime column, and an old database is m
 		ensureSchema(db);
 		const columns = db.prepare("PRAGMA table_info(file_summary)").all().map((c) => c.name);
 		assert.ok(!columns.includes("mtime_ms"), "the stale column is dropped");
+		assert.ok(!columns.includes("created_at"), "the unread timestamp is dropped too");
 		assert.equal(
 			db.prepare("SELECT overview FROM file_summary WHERE path = ?").get("src/old.ts").overview,
 			"kept",
@@ -768,7 +770,6 @@ await check("a bad first answer is repaired into a good map without degrading", 
 		const result = await runTool(h, "summary", { path: "src/a.ts" });
 		assert.equal(h.calls.length, 2, "one repair, then success");
 		assert.equal(result.details.mode, "mapped");
-		assert.equal(result.details.extraction, "json");
 		assert.equal(result.details.degraded, false);
 		assert.equal(result.details.attempts, 2);
 		assert.equal(result.details.sections, 1);
@@ -1125,9 +1126,8 @@ await check("the cache lives in the project's .pi dir and is keyed from the root
 		const h = makeHarness({ cwd: join(root, "src") });
 
 		const result = await runTool(h, "summary", { path: "a.ts" });
-		// The database path lives in `details`, which the model never sees - it is not worth
-		// a line of context to tell the model where the cache file is.
-		assert.match(result.details.dbPath, /\.pi[\\/]summaries\.db$/);
+		// The cache file is an implementation detail of this extension, so its path is not part
+		// of the result at all - not in `details`, and not worth a line of context to the model.
 		assert.doesNotMatch(result.content[0].text, /summaries\.db/, "no cache path in the text");
 		assert.equal(result.details.path, "src/a.ts", "keyed relative to the project root");
 	} finally {
@@ -1318,6 +1318,36 @@ await check("a failing summarizer lets the read through and notifies", async () 
 		// Without a UI a notification reaches nobody, so the same notice rides the read
 		// result the model actually receives.
 		assert.match(text, /^# summary failed:/m, "and the notice is on the result");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+await check("an unusable cache falls back to the whole file, and the reason names the store", async () => {
+	// The uncovered route into the fallback: the model answered fine, but the answer could not
+	// be stored. `.pi` is created as a *file*, so `openDb`'s `mkdirSync` of the cache directory
+	// fails with EEXIST before any model call - the storage failure `summarizeFile` reports as
+	// `failed to store the summary`. Walking that to the user-visible result is what proves the
+	// fallback closes over the store as well as the model, which is the invariant the read
+	// guard rests on: an intercepted read is a success even when nothing could be cached.
+	const root = tempProject();
+	try {
+		writeFileSync(join(root, "src", "a.ts"), numbered(500));
+		writeFileSync(join(root, ".pi"), "not a directory");
+		const h = makeHarness({ cwd: root });
+
+		const result = await runRead(h, { path: "src/a.ts" });
+		const text = result.content.map((c) => c.text ?? "").join("");
+		assert.equal(await readMap(h, { path: "src/a.ts" }), undefined, "no map was claimed");
+		assert.match(text, /line 1\b/, "the file's own lines are returned");
+		assert.match(text, /^# summary failed:/m, "the failure rides the result");
+		assert.match(text, /EEXIST|file already exists/, "and names the storage failure");
+
+		// `summary` itself must not throw either: it hands back the file the same way.
+		const direct = await runTool(h, "summary", { path: "src/a.ts" });
+		assert.equal(direct.details.status, "failed");
+		assert.match(direct.content[0].text, /Returning the whole file instead/);
+		assert.match(direct.content[0].text, /line 1/, "the file body follows");
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
@@ -2079,9 +2109,7 @@ await check("a failed summary is drawn as the whole-file fallback it is", async 
 			mode: "raw",
 			lines: 2,
 			model: "",
-			extraction: "none",
 			sections: 0,
-			dbPath: "",
 			attempts: 0,
 			degraded: true,
 		},

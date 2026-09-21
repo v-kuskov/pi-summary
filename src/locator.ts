@@ -1,7 +1,6 @@
-import { open } from "node:fs/promises";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { isEditToolResult } from "@earendil-works/pi-coding-agent";
-import { BYTES_PER_CHUNK } from "./hash.ts";
+import { countLinesFrom } from "./hash.ts";
 import { resolveFilePath } from "./paths.ts";
 
 /**
@@ -44,8 +43,13 @@ export function registerEditLocator(pi: ExtensionAPI): void {
 	pi.on("tool_result", async (event, ctx) => {
 		if (!isEditToolResult(event) || event.isError) return;
 
-		// `firstChangedLine` is optional in `EditToolDetails`, so this is a real absence
-		// rather than a defensive check.
+		// `firstChangedLine` is optional in `EditToolDetails`, so `undefined` is a real absence
+		// rather than a defensive check. The rest of the predicate is not decoration either: a
+		// zero, a fraction or a negative would name a line that cannot exist, and `NaN` is the
+		// case that makes `Number.isInteger` necessary rather than redundant - `NaN < 1` is
+		// false, so a `< 1` test alone lets it through into the sort below, where it would come
+		// out as a line number that is not a number. See the smoke suite's `firstChangedLine`
+		// case for the four values this refuses.
 		const first = event.details?.firstChangedLine;
 		if (typeof first !== "number" || !Number.isInteger(first) || first < 1) return;
 
@@ -150,32 +154,12 @@ function nameRuns(runs: [number, number][]): string {
  * the same `newlines + 1` rule `fingerprint` states in hash.ts, and the one the guard's
  * boundary arithmetic depends on.
  *
- * pi's `splitLinesForCounting` pops the trailing empty element, but it belongs to
- * `truncate.js` and decides whether to truncate; it is not how `read` counts a file, so it
- * is not the convention to follow here.
- *
- * Streamed and stopped at EOF rather than delegated to `fingerprint`, which reads the whole
- * file into memory and hashes it, and rather than `countLinesFrom`, whose count is capped by
- * a `stopAfter` the caller must already know.
+ * `countLinesFrom` already streams this way and returns exactly `newlines + 1` when it is
+ * allowed to run to EOF, so the cap is lifted by asking for more lines than any file has.
+ * An earlier version of this function duplicated that loop; measured against it over empty
+ * files, files with and without a trailing newline, CRLF and a 5000-line file, the two
+ * agreed on every case.
  */
 async function countLines(absPath: string): Promise<number> {
-	const handle = await open(absPath, "r");
-	try {
-		const buffer = Buffer.allocUnsafe(BYTES_PER_CHUNK);
-		let position = 0;
-		let newlines = 0;
-
-		for (;;) {
-			const { bytesRead } = await handle.read(buffer, 0, buffer.length, position);
-			if (bytesRead === 0) break;
-			for (let i = 0; i < bytesRead; i++) {
-				if (buffer[i] === 10) newlines++;
-			}
-			position += bytesRead;
-		}
-
-		return newlines + 1;
-	} finally {
-		await handle.close();
-	}
+	return countLinesFrom(absPath, 1, Number.POSITIVE_INFINITY);
 }

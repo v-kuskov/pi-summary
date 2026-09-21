@@ -23,17 +23,16 @@ export function formatBytes(bytes: number): string {
  * branch and closing brace would bury the rows that carry information. A gap is read as
  * "nothing mapped here".
  *
- * A blob entry has no rows, and the output says so rather than fabricating a region that
+ * A blob entry has no rows, and the empty block says so rather than fabricating a region that
  * spans the file — the caller cannot tell an invented row from a real one, so a fake row
- * would be trusted.
+ * would be trusted. The mode line and the closing hint live in `renderSummary`, which is the
+ * only production caller, so this block carries no second copy of them.
  */
 export function renderMap(sections: Section[]): string {
 	if (sections.length === 0) {
 		return [
 			"## map",
 			"  (none) this file was summarized as a single blob; no line detail is available.",
-			"  Use grep to locate a symbol in it, or read it in ranges of at most " +
-				`${READ_LINE_LIMIT} lines.`,
 		].join("\n");
 	}
 
@@ -50,10 +49,12 @@ export function renderMap(sections: Section[]): string {
 
 export type RenderOptions = {
 	/**
-	 * Cache state shown in the header. Includes the two states that only exist right after
-	 * a model call: `miss` (nothing was cached) and `forced` (an explicit refresh).
+	 * Cache state shown in the header. `miss` (nothing was cached) and `forced` (an explicit
+	 * refresh) only exist right after a model call; the rest are `freshnessOf`'s verdicts.
+	 * `missing` is deliberately absent: it means the file could not be compared at all, and
+	 * it is never what a caller renders.
 	 */
-	freshness?: Freshness | "miss" | "forced";
+	freshness?: Exclude<Freshness, "missing"> | "miss" | "forced";
 };
 
 /**

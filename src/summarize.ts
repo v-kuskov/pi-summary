@@ -56,9 +56,6 @@ export type SummarizeOutcome = {
 	entry: CachedSummary;
 	status: SummarizeStatus;
 	usage?: Usage;
-	dbPath: string;
-	/** How the model's answer was read: validated JSON, or salvaged prose. */
-	extraction: "json" | "blob";
 	/** True when the answer never became valid JSON and the map is missing. */
 	degraded: boolean;
 	/** Model calls spent, including repairs. */
@@ -128,7 +125,7 @@ async function runSummarize(
 
 	const root = findProjectRoot(ctx.cwd);
 	const key = cacheKey(absPath, root);
-	const { db, dbPath } = openDb(ctx.cwd);
+	const { db } = openDb(ctx.cwd);
 	try {
 		ensureSchema(db);
 		const cached = readSummary(db, key);
@@ -138,8 +135,6 @@ async function runSummarize(
 				return {
 					entry: cached,
 					status: "fresh",
-					dbPath,
-					extraction: cached.mode === "mapped" ? "json" : "blob",
 					degraded: cached.mode === "blob",
 					attempts: 0,
 				};
@@ -169,8 +164,6 @@ async function runSummarize(
 			entry: stored,
 			status,
 			usage: result.usage,
-			dbPath,
-			extraction: result.mode === "mapped" ? "json" : "blob",
 			degraded: result.mode === "blob",
 			attempts: result.attempts,
 		};
@@ -306,13 +299,15 @@ function truncateOverview(overview: string): string {
 	return `${lastStop > 0 ? cut.slice(0, lastStop + 1) : cut} …`;
 }
 
-/** What to tell the model was wrong. Precise when the shape was parseable, blunt when not. */
+/** What to tell the model was wrong: the schema violations, or an unparseable answer. */
 function describeProblems(parsed: unknown): string[] {
 	if (parsed === undefined) {
 		return ["the answer was not parseable as a JSON object"];
 	}
-	const errors = describeSchemaErrors(parsed);
-	return errors.length > 0 ? errors : ['"sections" contained no usable region'];
+	// `hasTopLevelShape` has already failed for this payload, and every way it can fail is a
+	// type or required-property violation the schema reports, so there is always at least one
+	// error to name. Nothing here needs a fallback message of its own.
+	return describeSchemaErrors(parsed);
 }
 
 function userMessage(text: string): Record<string, unknown> {

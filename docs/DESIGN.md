@@ -65,7 +65,6 @@ CREATE TABLE file_summary (
   model         TEXT NOT NULL,     -- "provider/model"
   mode          TEXT NOT NULL,     -- 'mapped' | 'blob'
   overview      TEXT NOT NULL,     -- prose: what the file does
-  created_at    TEXT NOT NULL
 );
 
 CREATE TABLE file_section (
@@ -113,6 +112,10 @@ content. Hashing one file is cheap next to the model call the shortcut was tryin
 so both the shortcut and the column are gone. A database from that version is migrated by
 `ensureSchema`, which drops the column — `CREATE TABLE IF NOT EXISTS` would otherwise leave
 it in place as `NOT NULL` and fail every insert.
+
+`created_at` is gone the same way, for a simpler reason: it was stamped on every write and
+read back into the entry, but nothing ever consulted it. The cache is content-addressed, so
+an age decides nothing; the migration for it is the same `ensureSchema` drop.
 
 `F5` `summary(path)` on a stale entry re-summarizes and replaces, and says so. The
 caller never has to know the difference; asking for a summary always returns a summary

@@ -155,6 +155,18 @@ async function decide(ctx: ExtensionContext, params: ReadInput): Promise<Decisio
 			? Math.max(1, Math.trunc(params.offset))
 			: 1;
 
+	// `Math.trunc` here and `Math.max(1, ...)` above are load-bearing; the `isFinite` guards are
+	// not, and neither is the `typeof` check. pi's read schema declares both fields as a bare
+	// `{"type":"number"}` with no integer or minimum constraint, so a fractional `offset` and a
+	// zero or negative one are all schema-valid and do reach here. What cannot reach here is a
+	// non-number, `NaN` or an infinity: `validateToolArguments` runs before `execute` and throws
+	// on anything the schema rejects, and that throw is caught in pi's own loop and returned as
+	// an immediate error result rather than being passed along (verified in the installed
+	// `@earendil-works/pi-agent-core` `agent-loop.js`, where the call sits inside the same `try`
+	// whose `catch` builds the error result). The guards are kept as defence in depth: they are
+	// one comparison each, and a future pi that stopped validating would otherwise send `NaN`
+	// into `countLinesFrom`, which is a byte offset arithmetic path.
+
 	const limit =
 		typeof params.limit === "number" && Number.isFinite(params.limit)
 			? Math.trunc(params.limit)

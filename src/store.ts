@@ -30,7 +30,6 @@ export type CachedSummary = {
 	model: string;
 	mode: SummaryMode;
 	overview: string;
-	createdAt: string;
 	sections: Section[];
 };
 
@@ -56,8 +55,7 @@ CREATE TABLE IF NOT EXISTS file_summary (
   bytes         INTEGER NOT NULL,
   model         TEXT NOT NULL,
   mode          TEXT NOT NULL,
-  overview      TEXT NOT NULL,
-  created_at    TEXT NOT NULL
+  overview      TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS file_section (
@@ -99,6 +97,13 @@ export function ensureSchema(db: DatabaseSync): void {
 	if (columns.some((c) => c.name === "mtime_ms")) {
 		db.exec("ALTER TABLE file_summary DROP COLUMN mtime_ms");
 	}
+
+	// `created_at` was stamped on every write and read back into the entry, but nothing ever
+	// consumed it: the cache is keyed by content hash, so an age is not what decides anything.
+	// It is NOT NULL in an older database, so the same drop is the migration.
+	if (columns.some((c) => c.name === "created_at")) {
+		db.exec("ALTER TABLE file_summary DROP COLUMN created_at");
+	}
 }
 
 /**
@@ -128,7 +133,6 @@ export function readSummary(db: DatabaseSync, path: string): CachedSummary | und
 		model: String(row.model),
 		mode: row.mode === "mapped" ? "mapped" : "blob",
 		overview: String(row.overview),
-		createdAt: String(row.created_at),
 		sections: sections.map((s) => ({
 			seq: Number(s.seq),
 			startLine: Number(s.start_line),
@@ -180,8 +184,8 @@ export function writeSummary(db: DatabaseSync, input: SummaryInput): void {
 	try {
 		db.prepare(
 			`INSERT INTO file_summary
-			   (path, abs_path, hash, lines, bytes, model, mode, overview, created_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+			   (path, abs_path, hash, lines, bytes, model, mode, overview)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 			 ON CONFLICT(path) DO UPDATE SET
 			   abs_path = excluded.abs_path,
 			   hash = excluded.hash,
@@ -189,8 +193,7 @@ export function writeSummary(db: DatabaseSync, input: SummaryInput): void {
 			   bytes = excluded.bytes,
 			   model = excluded.model,
 			   mode = excluded.mode,
-			   overview = excluded.overview,
-			   created_at = excluded.created_at`,
+			   overview = excluded.overview`,
 		).run(
 			input.path,
 			input.absPath,
@@ -200,7 +203,6 @@ export function writeSummary(db: DatabaseSync, input: SummaryInput): void {
 			input.model,
 			input.mode,
 			input.overview,
-			new Date().toISOString(),
 		);
 
 		db.prepare("DELETE FROM file_section WHERE path = ?").run(input.path);

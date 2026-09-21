@@ -31,29 +31,23 @@ export const MAX_OVERVIEW_CHARS = 2400;
  * prose and the answer is validated here. A flat `{overview, sections[]}` is deliberate —
  * it keeps every provider's native JSON mode usable, since strict modes reject `$ref`,
  * `allOf`, `oneOf`, and object unions.
+ *
+ * The types carry no `description`s on purpose. This schema is never sent to a provider —
+ * the request hand-builds `response_format: { type: "json_object" }` — and its only reader
+ * is `Value.Errors` below, whose messages are built from the failing keyword rather than
+ * from prose. The field-by-field contract lives in `buildSummarizePrompt`, which is the
+ * text the model actually sees and the one place a change has to be made.
  */
 export const emitSummarySchema = Type.Object({
-	overview: Type.String({
-		description:
-			"Up to ten sentences: what the file is for, its main exports and how they relate, and what a reader must know before changing it.",
-	}),
+	overview: Type.String(),
 	sections: Type.Array(
 		Type.Object({
-			start_line: Type.Integer({ description: "Inclusive 1-indexed first line of the region." }),
-			end_line: Type.Integer({ description: "Inclusive 1-indexed last line of the region." }),
-			kind: StringEnum(SECTION_KINDS, { description: "What kind of declaration this region is." }),
-			name: Type.String({
-				description: "Declaration or symbol name; use (top level) for loose statements.",
-			}),
-			note: Type.String({
-				description:
-					"Up to two sentences on what the region does, including a side effect or invariant a reader needs before editing it.",
-			}),
+			start_line: Type.Integer(),
+			end_line: Type.Integer(),
+			kind: StringEnum(SECTION_KINDS),
+			name: Type.String(),
+			note: Type.String(),
 		}),
-		{
-			description:
-				"Regions in line order. They must not overlap, and they may leave gaps where lines do nothing.",
-		},
 	),
 });
 
@@ -92,7 +86,8 @@ export function describeSchemaErrors(value: unknown): string[] {
 	return errors;
 }
 
-export function truncateNote(note: string, max = MAX_NOTE_CHARS): string {
+export function truncateNote(note: string): string {
+	const max = MAX_NOTE_CHARS;
 	if (note.length <= max) return note;
 	const cut = note.slice(0, max);
 	const lastSpace = cut.lastIndexOf(" ");

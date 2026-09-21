@@ -17,9 +17,7 @@ export type SummaryDetails = {
 	mode: string;
 	lines: number;
 	model: string;
-	extraction: string;
 	sections: number;
-	dbPath: string;
 	/** Model calls spent on this result, including repairs. 0 on a cache hit. */
 	attempts: number;
 	/** True when the model never returned a usable line map and only prose was stored. */
@@ -106,9 +104,7 @@ function summarizeDetails(outcome: SummarizeOutcome): SummaryDetails {
 		mode: outcome.entry.mode,
 		lines: outcome.entry.lines,
 		model: outcome.entry.model,
-		extraction: outcome.extraction,
 		sections: outcome.entry.sections.length,
-		dbPath: outcome.dbPath,
 		attempts: outcome.attempts,
 		degraded: outcome.degraded,
 	};
@@ -122,9 +118,7 @@ function failedDetails(absPath: string): SummaryDetails {
 		mode: "raw",
 		lines: 0,
 		model: "",
-		extraction: "none",
 		sections: 0,
-		dbPath: "",
 		attempts: 0,
 		degraded: true,
 	};
