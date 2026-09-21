@@ -1,5 +1,5 @@
 import { uuidv7 } from "@earendil-works/pi-ai";
-import { assistantText, notifyUser, SummaryError } from "./error.ts";
+import { assistantText, SummaryError } from "./error.ts";
 import { fingerprint } from "./hash.ts";
 import { cacheKey, findProjectRoot, isRegularFile, resolveFilePath } from "./paths.ts";
 import {
@@ -339,6 +339,10 @@ function isProviderError(response: AssistantMessage): boolean {
  * Pick the summarizer, in order: explicit `provider/model`, the `summary.model` setting,
  * else the session's current model. Auth is checked up front so a missing credential
  * reads as a clear message rather than a provider error.
+ *
+ * Only an *absent* setting falls through to the session model. A setting that is present
+ * and unusable raises instead: it names the model the user chose, and quietly spending a
+ * different one hides that their choice is not being honoured.
  */
 function resolveSummarizerModel(ctx: ExtensionContext, explicit: string | undefined): AnyModel {
 	return resolveNamedModel(ctx, explicit) ?? configuredModel(ctx) ?? sessionModel(ctx);
@@ -355,7 +359,7 @@ function resolveNamedModel(ctx: ExtensionContext, explicit: string | undefined):
 	if (!parsed) {
 		throw new SummaryError(
 			`model "${explicit}" is not in provider/model form`,
-			"Pass model as provider/model, for example: routeai/deepseek/deepseek-v4.1-flash, or omit it to summarize with the current session model.",
+			"Pass model as provider/model, or omit it to summarize with the current session model.",
 		);
 	}
 	const found = ctx.modelRegistry.find(parsed.provider, parsed.modelId);
@@ -375,50 +379,38 @@ function resolveNamedModel(ctx: ExtensionContext, explicit: string | undefined):
 }
 
 /**
- * The `summary.model` setting, if set.
+ * The `summary.model` setting, if one is set.
  *
- * A setting that names a model the registry does not know is skipped rather than thrown:
- * an unreadable config should not make the tool unusable, and falling back to the session
- * model keeps `summary` working. The fallback is announced once, because a silently
- * ignored setting is indistinguishable from one that is being honoured - the summarizer
- * just quietly costs a different amount than intended.
+ * `undefined` means the setting is absent, which is the documented default: summarize
+ * with the session's current model. A setting that *is* present but unusable raises, so
+ * the caller reports why rather than silently billing a model the user did not choose.
+ * Unparseable settings are covered too - a typo that cannot be read is exactly the case
+ * where silently succeeding looks like the setting was honoured.
  */
 function configuredModel(ctx: ExtensionContext): AnyModel | undefined {
 	const configured = readSummarySettings(ctx.cwd).model;
 	if (!configured) return undefined;
 	const parsed = parseProviderModel(configured);
 	if (!parsed) {
-		warnOnce(ctx, configured, `summary.model "${configured}" is not in provider/model form`);
-		return undefined;
+		throw new SummaryError(
+			`summary.model "${configured}" is not in provider/model form`,
+			'Fix it in settings, or remove the key to summarize with the current session model.',
+		);
 	}
 	const found = ctx.modelRegistry.find(parsed.provider, parsed.modelId);
 	if (!found) {
-		warnOnce(
-			ctx,
-			configured,
-			`summary.model "${configured}" names no known model; using the session model instead`,
+		throw new SummaryError(
+			`summary.model "${configured}" names no known model`,
+			'Fix it in settings, or remove the key to summarize with the current session model.',
 		);
-		return undefined;
 	}
 	if (!ctx.modelRegistry.hasConfiguredAuth(found)) {
-		warnOnce(
-			ctx,
-			configured,
-			`summary.model "${configured}" has no configured credentials; using the session model instead`,
+		throw new SummaryError(
+			`summary.model "${configured}" has no configured credentials`,
+			'Fix it in settings, or remove the key to summarize with the current session model.',
 		);
-		return undefined;
 	}
 	return found;
-}
-
-/** Settings values already reported, so a recurring fallback does not repeat itself. */
-const warned = new Set<string>();
-
-/** Announce a bad `summary.model` once per value, when there is a UI to announce it in. */
-function warnOnce(ctx: ExtensionContext, key: string, message: string): void {
-	if (warned.has(key)) return;
-	warned.add(key);
-	notifyUser(ctx, message, "warning");
 }
 
 /**
@@ -438,7 +430,7 @@ function sessionModel(ctx: ExtensionContext): AnyModel {
 	if (!current) {
 		throw new SummaryError(
 			"no current model available to summarize with",
-			'Pass model, for example: model="routeai/deepseek/deepseek-v4.1-flash", or set it with {"summary":{"model":"..."}} in settings.',
+			'Pass model as provider/model, or set it with {"summary":{"model":"..."}} in settings.',
 		);
 	}
 	if (!ctx.modelRegistry.hasConfiguredAuth(current)) {

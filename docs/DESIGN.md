@@ -62,7 +62,7 @@ CREATE TABLE file_summary (
   hash          TEXT NOT NULL,     -- sha256 of contents, first 16 hex chars
   lines         INTEGER NOT NULL,  -- line count at summarize time (drives the guard)
   bytes         INTEGER NOT NULL,
-  model         TEXT NOT NULL,     -- "routeai/deepseek/deepseek-v4.1-flash"
+  model         TEXT NOT NULL,     -- "provider/model"
   mode          TEXT NOT NULL,     -- 'mapped' | 'blob'
   overview      TEXT NOT NULL,     -- prose: what the file does
   created_at    TEXT NOT NULL
@@ -312,20 +312,25 @@ The placeholders `current`, `default`, `auto`, `session`, `none`, `null` are tre
 the literal string. Auth is checked with `hasConfiguredAuth` before the call, so a missing
 credential produces a clear message instead of a provider error.
 
+Only an **absent** setting falls through to the session model. A setting that is present and
+unusable — malformed, naming an unknown model, or naming one with no credentials — raises,
+and both callers already turn that into the right thing: the `summary` tool reports it and
+returns the whole file, and the read guard reports it and lets the read through. Falling back
+instead would spend a different model than the user chose while looking like the setting was
+honoured; the cost of a summary is exactly what the setting exists to control, so a silently
+substituted model is the one outcome the setting cannot survive.
+
 The setting is read from pi's own settings through `SettingsManager.create(cwd)`, checking
 project scope first so a project can pin its own summarizer:
 
 ```json
-{ "summary": { "model": "routeai/deepseek/deepseek-v4.1-flash" } }
+{ "summary": { "model": "provider/model" } }
 ```
 
 Global settings come from `<agentDir>/settings.json`, project settings from
 `<cwd>/.pi/settings.json`. A bare string (`"summary": "provider/model"`) is also accepted.
 pi's `Settings` interface has no field for extension config, but the file is not filtered:
-unknown top-level keys survive load and write, which is what makes this safe. A setting that
-names an unknown model, is malformed, or sits in an unparseable file is skipped in favour of
-the session model rather than thrown — an unreadable config should not make the tool
-unusable.
+unknown top-level keys survive load and write, which is what makes this safe.
 
 `S2` **The call requests structured output as JSON, with no tools.** The prompt states the
 contract in prose and the answer is validated locally against a flat schema whose shape is
@@ -472,7 +477,10 @@ cost is bounded by `D5`'s ceiling — and per file rather than per read, since c
 of one file share a single summarization (`C2`).
 
 `D7` The summarizer model is configurable through a `summary.model` key in pi's settings
-file, project scope winning over global, defaulting to the session model.
+file, project scope winning over global, defaulting to the session model. A present setting
+that cannot be used is an error, never a fallback: the setting exists to control what a
+summary costs, so spending a model the user did not name — while reporting success — defeats
+the only reason to write the key.
 
 `D8` A failed `summary` call returns the whole file rather than raising an error, with the
 failure in a notification and in a `#` comment above the content. The caller asked for the

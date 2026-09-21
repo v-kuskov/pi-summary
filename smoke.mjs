@@ -16,6 +16,22 @@ import { hasTopLevelShape, normalizeSections, MAX_NOTE_CHARS } from "./src/schem
 import { renderMap } from "./src/render.ts";
 import { isUnguardedPath } from "./src/paths.ts";
 
+/**
+ * Isolation from the developer's own pi install.
+ *
+ * The extension reads `summary.model` out of pi's settings, and a read with no project
+ * settings falls all the way through to the global file at `<agentDir>/settings.json`.
+ * That makes the suite depend on whatever the machine running it happens to have
+ * configured: a `summary.model` naming a model the fake harness cannot resolve now fails
+ * the summary, so a working setting would be honoured and a typo would break unrelated
+ * cases. Point `<agentDir>` at an empty directory before anything reads it, so every case
+ * starts from the same unconfigured state and only the cases that write settings
+ * deliberately are affected. Cases that set `PI_CODING_AGENT_DIR` themselves still win,
+ * since they assign it inside their own try block.
+ */
+const isolatedAgentDir = mkdtempSync(join(tmpdir(), "pi-agent-isolated-"));
+process.env.PI_CODING_AGENT_DIR = isolatedAgentDir;
+
 let failures = 0;
 let passed = 0;
 async function check(name, fn) {
@@ -277,8 +293,8 @@ await check("readSummarySettings tolerates a bare string and junk values", async
 	try {
 		process.env.PI_CODING_AGENT_DIR = agent;
 
-		write("deepseek/deepseek-v4-flash");
-		assert.deepEqual(readSummarySettings(root), { model: "deepseek/deepseek-v4-flash" });
+		write("provider/model");
+		assert.deepEqual(readSummarySettings(root), { model: "provider/model" });
 
 		write({ model: "  spaced/model  " });
 		assert.deepEqual(readSummarySettings(root), { model: "spaced/model" }, "trimmed");
@@ -364,8 +380,10 @@ await check("the summary.model setting picks the summarizer, and model= override
 		const result = await runTool(h, "summary", { path: "src/a.ts" });
 		assert.equal(result.details.model, "test/test-model", "the configured model was used");
 
-		// An unknown configured model is skipped rather than failing the tool, and since a
-		// silently ignored setting looks exactly like an honoured one, it is announced.
+		// A present setting that names no known model is an error, not a silent substitution:
+		// the setting exists to control what a summary costs, so spending the session model
+		// instead would defeat it while looking like it was honoured. The file is still
+		// readable, so the caller gets the file and the reason.
 		writeFileSync(
 			join(agent, "settings.json"),
 			JSON.stringify({ summary: { model: "nope/missing" } }),
@@ -373,16 +391,25 @@ await check("the summary.model setting picks the summarizer, and model= override
 		h.ctx.hasUI = true;
 		h.ctx.ui = { notify: (message, type) => h.notices.push({ message, type }) };
 
-		const fallback = await runTool(h, "summary", { path: "src/a.ts", refresh: true });
-		assert.equal(fallback.details.model, "test/test-model", "fell back to the session model");
-		assert.equal(h.notices.length, 1, "the ignored setting is reported");
-		assert.equal(h.notices[0].type, "warning");
-		assert.match(h.notices[0].message, /nope\/missing/);
-		assert.match(h.notices[0].message, /names no known model/);
+		const bad = await runTool(h, "summary", { path: "src/a.ts", refresh: true });
+		assert.equal(bad.details.status, "failed", "a bad setting does not summarize");
+		assert.match(bad.content[0].text, /nope\/missing/, "the offending value is named");
+		assert.match(bad.content[0].text, /names no known model/);
+		assert.match(bad.content[0].text, /line 1/, "the file body still follows");
+		assert.equal(h.notices.length, 1, "it is reported");
+		assert.equal(h.notices[0].type, "error");
 
-		// Reported once, not on every call.
+		// Meaningful on every call, because it is a failure rather than a note about which
+		// of two working models was picked.
 		await runTool(h, "summary", { path: "src/a.ts", refresh: true });
-		assert.equal(h.notices.length, 1, "the warning does not repeat");
+		assert.equal(h.notices.length, 2, "the failure is reported each time");
+
+		// Only an absent setting means the session model. That is the documented default, not
+		// a fallback, so it is not announced.
+		writeFileSync(join(agent, "settings.json"), JSON.stringify({}));
+		const unset = await runTool(h, "summary", { path: "src/a.ts", refresh: true });
+		assert.equal(unset.details.model, "test/test-model", "the session model is the default");
+		assert.equal(h.notices.length, 2, "the default needs no announcement");
 	} finally {
 		if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
 		else process.env.PI_CODING_AGENT_DIR = previous;
@@ -777,7 +804,7 @@ await check("a rejected JSON mode is retried without it, and stays within the ca
 		writeFileSync(join(root, "src", "a.ts"), numbered(10));
 		const h = makeHarness({
 			cwd: root,
-			// RouteAI-style provider that rejects response_format but answers fine without it.
+			// An OpenAI-compatible provider that rejects response_format but answers fine without it.
 			respond: (_context, opts) =>
 				opts?.samplingParams ? errorResponse("response_format is not supported") : defaultAnswer(_context, opts),
 		});
@@ -2270,4 +2297,5 @@ await check("an image read gets pi's own images.autoResize setting", async () =>
 });
 
 console.log(`\n${passed} passed, ${failures} failed`);
+rmSync(isolatedAgentDir, { recursive: true, force: true });
 process.exit(failures === 0 ? 0 : 1);

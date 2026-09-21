@@ -162,15 +162,16 @@ The summarizer defaults to the current session model. To pin a cheaper or faster
 it to pi's settings file — project scope wins over global:
 
 ```json
-{ "summary": { "model": "routeai/deepseek/deepseek-v4.1-flash" } }
+{ "summary": { "model": "provider/model" } }
 ```
 
 - Global: `<agentDir>/settings.json` (`~/.pi/agent/settings.json`)
 - Project: `<projectRoot>/.pi/settings.json`
 
-A bare string works too: `{ "summary": "routeai/deepseek/deepseek-v4.1-flash" }`. If the
-named model is unknown or the file cannot be parsed, the session model is used instead of
-failing.
+A bare string works too: `{ "summary": "provider/model" }`. A setting that is present but
+unusable — malformed, naming an unknown model, or naming one with no credentials — fails
+the summary and reports why, rather than quietly charging a different model. Only an absent
+setting means the session model.
 
 ## Deliberate non-goals
 

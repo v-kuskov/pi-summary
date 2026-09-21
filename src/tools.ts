@@ -50,7 +50,7 @@ export function registerSummaryTool(pi: ExtensionAPI): void {
 			model: Type.Optional(
 				Type.String({
 					description:
-						'Summarizer as "provider/model", for example "routeai/deepseek/deepseek-v4.1-flash". Defaults to the configured summarizer, or the current session model.',
+						'Summarizer as "provider/model". Defaults to the configured summarizer, or the current session model.',
 				}),
 			),
 			refresh: Type.Optional(
