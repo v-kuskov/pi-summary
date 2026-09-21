@@ -223,4 +223,5 @@ designs.
 
 ## License
 
-MIT
+GNU General Public License, version 3 or any later version. The full text is in
+[`LICENSE`](LICENSE), as published by the Free Software Foundation.

@@ -12,7 +12,7 @@
     "tokens",
     "context"
   ],
-  "license": "MIT",
+  "license": "GPL-3.0-or-later",
   "author": "Vladimir Kuskov <v.kuskov@hotmail.com>",
   "repository": {
     "type": "git",
