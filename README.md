@@ -32,8 +32,9 @@ Or load a local checkout directly:
 pi -e /path/to/pi-summary/index.ts
 ```
 
-The extension declares its entry point in `package.json` under `pi.extensions`, and its
-only runtime dependency is `typebox` (resolved by pi's extension loader).
+The extension declares its entry point in `package.json` under `pi.extensions`. It has no
+runtime dependencies: `typebox` is supplied by pi to every extension, and is declared as an
+optional peer so the manifest asks for nothing pi does not already provide.
 
 ## What the model sees
 
