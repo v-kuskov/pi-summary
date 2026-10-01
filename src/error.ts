@@ -10,6 +10,17 @@ export class SummaryError extends Error {
 	}
 }
 
+/**
+ * The summarizer's model call failed: the provider errored, or no answer validated within
+ * the attempt budget.
+ *
+ * Separate from `SummaryError` because the two callers want opposite things from it.
+ * `summary` fails with it - the model asked for a map and must be told it has none - while
+ * the guarded `read` swallows it and reads the file directly, because withholding the file
+ * would be a worse answer than a missing summary.
+ */
+export class ModelCallError extends SummaryError {}
+
 /** Concatenated text blocks of an assistant message, trimmed. */
 export function assistantText(message: {
 	content: Array<{ type: string; text?: string }>;

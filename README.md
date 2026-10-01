@@ -24,8 +24,9 @@ pi install git:github.com/v-kuskov/pi-summary    # or npm:pi-summary once publis
 
 The summarizer is a plain completion with **no tools**: it is asked for JSON, the answer is
 validated, and output that is not the agreed shape is sent back to the model with the
-specific violations, up to three attempts in total, before the result degrades to a
-prose-only blob. It never chooses its own next step and is never given a tool to call.
+specific violations, up to three attempts in total; an answer that never validates fails the
+call rather than being stored as prose. It never chooses its own next step and is never given
+a tool to call.
 
 Or load a local checkout directly:
 
@@ -62,7 +63,7 @@ every attempt, so a test that does not set it signs with an empty key.
 ```
 
 The call also returns `structuredContent` — `{path, lines, overview, sections}` for
-codemode scripts, which receive data instead of the rendered text; a failed call's arm
+codemode scripts, which receive data instead of the rendered text; a call that fell back
 carries the whole file it fell back to. Cache state, the summarizer model and the attempt
 count are internal bookkeeping: they live in the result's `details`, and reach neither the
 model nor the display.
@@ -100,9 +101,9 @@ map the same way a bare `read` does — the span that would come back is what co
 whether `limit` was passed. Every intercepted read also raises a toast —
 `Read of src/foo.ts intercepted and replaced with the file's summary (over 200 lines).` —
 because the result is drawn as ordinary tool output and never says on its own that the
-lines you asked for were not the lines you got. A file whose summary cannot be produced
-the failure reported instead: with no map to offer, withholding the file would take it away
-and leave nothing behind.
+lines you asked for were not the lines you got. A failed model call fails the `summary` tool
+outright, but on the read side it is only ever the failure reported: with no map to offer, a
+read that could not be summarized hands back the file itself.
 
 Until the file is summarized, an oversized `read` costs model calls without you asking
 for them — the one place this extension spends unbounded-by-the-caller, capped at three
@@ -224,7 +225,8 @@ including that a cold oversized read summarizes and returns the map, that an int
 read is a successful result, not an error, and that it tells the user it was replaced by a
 summary, that the map carries every row uncut, that
 prose and extensionless files are left outside the limit, that a failing summarizer
-lets the read through and says so, and that `summary` draws its call and its result —
+lets the read through and says so, that a failed model call fails `summary` outright rather
+than standing a file in for the answer, and that `summary` draws its call and its result —
 collapsed, expanded, still running, and failed — in a terminal. It also checks that
 `structuredContent` matches the output schema and carries the summary and no generation
 history, and that a read issued by another tool passes through untouched while the model's

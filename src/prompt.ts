@@ -139,26 +139,6 @@ export function parseJsonAnswer(text: string): unknown | undefined {
 	return undefined;
 }
 
-/**
- * Salvage prose from an answer that never became valid JSON.
- *
- * Tries the `overview` field first, since a truncated object often still contains it
- * verbatim, then falls back to the whole answer with fences stripped. This is what a blob
- * entry stores, so it should read as prose rather than as a half-written JSON fragment.
- */
-export function extractOverview(text: string): string {
-	const cleaned = stripFences(text);
-	const match = cleaned.match(/"overview"\s*:\s*"((?:[^"\\]|\\.)*)"/);
-	if (match) {
-		try {
-			return JSON.parse(`"${match[1]}"`).trim();
-		} catch {
-			return match[1]!.trim();
-		}
-	}
-	return cleaned.trim();
-}
-
 /** Drop a leading/trailing ``` fence so an otherwise-valid answer still parses. */
 function stripFences(text: string): string {
 	return text

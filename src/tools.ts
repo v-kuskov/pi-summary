@@ -4,7 +4,7 @@ import type {
 	ExtensionAPI,
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import { notifyUser, SummaryError } from "./error.ts";
+import { ModelCallError, notifyUser, SummaryError } from "./error.ts";
 import { describeFailure, failureNotice, loadWholeFile } from "./fallback.ts";
 import { resolveFilePath } from "./paths.ts";
 import { renderSummary, READ_LINE_LIMIT } from "./render.ts";
@@ -76,7 +76,12 @@ export function registerSummaryTool(pi: ExtensionAPI): void {
 					signal,
 				});
 			} catch (error) {
-				// Summarizing is a convenience; the file itself is the answer. Hand back the
+				// A failed model call is the tool's failure. The model asked for a summary and must
+				// see why it has none, rather than receive a substitute dressed as an answer.
+				if (error instanceof ModelCallError) throw error;
+
+				// Every other failure means no call happened or the answer could not be stored:
+				// summarizing is a convenience, and the file itself is the answer. Hand back the
 				// whole file so the model can still work, and surface the failure as a
 				// notification and a visible comment rather than an error result.
 				return wholeFileFallback(ctx, params.path, error);
@@ -120,13 +125,15 @@ function failedDetails(absPath: string): SummaryDetails {
 }
 
 /**
- * Fallback for a failed `summary` call: return the file whole, with the error in a notice.
+ * Fallback for a `summary` call that failed without a model answer to show: return the file
+ * whole, with the error in a notice.
  *
- * The failure is reported three ways, because each one reaches a different reader: a UI
- * notification for the person watching, a `#` comment the model sees at the top of the
- * content, and the tool result's `details` for anything reading the session transcript.
- * The result is deliberately not an error - the model asked for the file's contents and it
- * got them, so there is nothing for it to recover from.
+ * Only failures where no call happened or the answer could not be stored reach here - a failed
+ * model call throws instead. The failure is reported three ways, because each one reaches a
+ * different reader: a UI notification for the person watching, a `#` comment the model sees at
+ * the top of the content, and the tool result's `details` for anything reading the session
+ * transcript. The result is deliberately not an error - the model asked for the file's
+ * contents and it got them, so there is nothing for it to recover from.
  */
 async function wholeFileFallback(
 	ctx: ExtensionContext,

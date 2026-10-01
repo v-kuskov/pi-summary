@@ -1,12 +1,11 @@
 import { uuidv7 } from "@earendil-works/pi-ai";
-import { assistantText, SummaryError } from "./error.ts";
+import { assistantText, ModelCallError, SummaryError } from "./error.ts";
 import { fingerprint } from "./hash.ts";
 import { cacheKey, findProjectRoot, isRegularFile, resolveFilePath } from "./paths.ts";
 import {
 	type PreparedFile,
 	buildRepairPrompt,
 	buildSummarizePrompt,
-	extractOverview,
 	modelLabel,
 	parseJsonAnswer,
 	prepareFile,
@@ -39,7 +38,7 @@ type AnyModel = Model<any>;
  *
  * The cap is the whole reason this loop can exist under the extension's cost filter, which
  * otherwise promises a single call per file. A model that cannot produce the shape in
- * three tries is not going to produce it in ten, and the answer degrades to a blob.
+ * three tries is not going to produce it in ten, and the call fails.
  */
 export const MAX_ATTEMPTS = 3;
 
@@ -56,7 +55,7 @@ export type SummarizeOutcome = {
 	entry: CachedSummary;
 	status: SummarizeStatus;
 	usage?: Usage;
-	/** True when the answer never became valid JSON and the map is missing. */
+	/** True when the answer carried no usable line map, so only prose was stored. */
 	degraded: boolean;
 	/** Model calls spent, including repairs. */
 	attempts: number;
@@ -192,8 +191,9 @@ type SummaryResult = {
  *   violations and asking again. This is a fix-up loop over one prompt, not an agentic
  *   cycle: the summarizer never chooses what to do next, and it is never given tools.
  *
- * When the cap runs out the answer is salvaged as prose and stored as a blob. That is an
- * honest map-less entry rather than a fabricated one — see `renderMap`.
+ * When the cap runs out the call fails. Prose stored under the summary's name would claim a
+ * map the model never gave, and the caller - unlike the read guard, which reads the file
+ * itself - has no other way to learn why it has nothing.
  */
 async function requestSummary(
 	ctx: ExtensionContext,
@@ -212,7 +212,6 @@ async function requestSummary(
 	// JSON mode is best effort: providers that support it return valid JSON, and providers
 	// that reject the parameter get the same prompt without it.
 	let jsonMode = true;
-	let last: AssistantMessage | undefined;
 	let lastText = "";
 	let problems: string[] = [];
 
@@ -229,13 +228,12 @@ async function requestSummary(
 				jsonMode = false;
 				continue;
 			}
-			throw new SummaryError(
+			throw new ModelCallError(
 				`the summarizer call failed for ${key}: ${response.errorMessage ?? response.stopReason}`,
 				"That is the provider's error rather than a summary problem, so retrying may not help.",
 			);
 		}
 
-		last = response;
 		lastText = assistantText(response);
 
 		const parsed = parseJsonAnswer(lastText);
@@ -277,13 +275,14 @@ async function requestSummary(
 		}
 	}
 
-	return {
-		overview: truncateOverview(extractOverview(lastText) || "(the summarizer returned no usable answer)"),
-		sections: [],
-		mode: "blob",
-		usage: last?.usage,
-		attempts: MAX_ATTEMPTS,
-	};
+	// The budget is spent and nothing validated. Salvaging the prose as a blob would dress a
+	// guess up as the summary that was asked for, so the call fails and says what happened.
+	// The action goes in the message because pi drops `hint` from a thrown tool error, while
+	// the diagnosis goes in the hint, where the read guard's notice can still show it.
+	throw new ModelCallError(
+		`the summarizer never produced a usable answer for ${key} after ${MAX_ATTEMPTS} attempts; name a different one with model=provider/model`,
+		`The last answer was rejected for: ${problems.join("; ") || "it did not match the required shape"}.`,
+	);
 }
 
 /**

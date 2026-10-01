@@ -11,7 +11,7 @@ import { countLinesFrom } from "./src/hash.ts";
 import { MAX_ATTEMPTS } from "./src/summarize.ts";
 import { ensureSchema, openDb, writeSummary } from "./src/store.ts";
 import { readImageAutoResize, readSummarySettings } from "./src/settings.ts";
-import { extractOverview, parseJsonAnswer } from "./src/prompt.ts";
+import { parseJsonAnswer } from "./src/prompt.ts";
 import { Value } from "typebox/value";
 import {
 	hasTopLevelShape,
@@ -254,14 +254,6 @@ await check("parseJsonAnswer tolerates a fence and surrounding prose", async () 
 	assert.deepEqual(parseJsonAnswer("Sure!\n" + JSON.stringify(payload) + "\nHope that helps."), payload);
 	assert.equal(parseJsonAnswer("not json at all"), undefined);
 	assert.equal(parseJsonAnswer(""), undefined);
-});
-
-await check("extractOverview salvages prose from a truncated answer", async () => {
-	assert.equal(
-		extractOverview('{"overview":"Implements the sync client.","sections":[{"start_line":1'),
-		"Implements the sync client.",
-	);
-	assert.equal(extractOverview("```\nA plain prose answer.\n```"), "A plain prose answer.");
 });
 
 await check("readSummarySettings reads the object form and prefers project over global", async () => {
@@ -753,7 +745,7 @@ await check("refresh forces a new summary", async () => {
 	}
 });
 
-await check("a prose-only answer is repaired twice, then stored as an honest blob", async () => {
+await check("a prose-only answer is repaired twice, then the call fails", async () => {
 	const root = tempProject();
 	try {
 		writeFileSync(join(root, "src", "a.ts"), numbered(400));
@@ -763,20 +755,13 @@ await check("a prose-only answer is repaired twice, then stored as an honest blo
 				textResponse("This file implements the sync client and its retry loop."),
 		});
 
-		const result = await runTool(h, "summary", { path: "src/a.ts" });
-		assert.equal(h.calls.length, MAX_ATTEMPTS, "spend is capped, not unbounded");
-		assert.equal(result.details.mode, "blob");
-		assert.equal(result.details.sections, 0);
-		assert.equal(result.details.degraded, true);
-		assert.equal(result.details.attempts, MAX_ATTEMPTS);
-		assert.match(result.content[0].text, /map: none/);
-		assert.match(result.content[0].text, /no line detail/);
-		assert.match(result.content[0].text, /implements the sync client/);
-		assert.doesNotMatch(
-			result.content[0].text,
-			/^\s*1-\s*401\s/m,
-			"must not fabricate a region spanning the file",
+		// The budget is spent and nothing validated: prose stored as a summary would claim a map
+		// the model never gave, so the call fails and says so.
+		await assert.rejects(
+			() => runTool(h, "summary", { path: "src/a.ts" }),
+			/never produced a usable answer/,
 		);
+		assert.equal(h.calls.length, MAX_ATTEMPTS, "spend is capped, not unbounded");
 
 		// The repair turn carries the model's own answer and the specific complaint.
 		const repair = h.calls[1].context.messages;
@@ -854,7 +839,7 @@ await check("a rejected JSON mode is retried without it, and stays within the ca
 	}
 });
 
-await check("a provider that rejects JSON mode every time returns the file, not an error", async () => {
+await check("a provider that fails every time fails the call and names the reason", async () => {
 	const root = tempProject();
 	try {
 		const file = join(root, "src", "a.ts");
@@ -864,40 +849,13 @@ await check("a provider that rejects JSON mode every time returns the file, not 
 			respond: () => errorResponse("upstream exploded"),
 		});
 
-		const result = await runTool(h, "summary", { path: "src/a.ts" });
-		assert.equal(result.details.status, "failed");
-		assert.equal(result.details.mode, "raw");
-		assert.match(result.content[0].text, /summary failed:/);
-		assert.match(result.content[0].text, /upstream exploded/);
-		assert.match(result.content[0].text, /Returning the whole file instead/);
-		assert.match(result.content[0].text, /line 1/, "the file body follows");
-
-		// pi resolves an outputSchema tool to structuredContent alone, so a fallback that
-		// omitted it would hand a script nothing where the model got a file.
-		assert.ok(
-			Value.Check(summaryOutputSchema, result.structuredContent),
-			"the fallback arm still matches the schema",
+		// A failed model call is the tool's failure: the model asked for a summary and gets the
+		// reason, not a file standing in for one.
+		await assert.rejects(
+			() => runTool(h, "summary", { path: "src/a.ts" }),
+			/upstream exploded/,
 		);
-		assert.match(result.structuredContent.content, /^line 1\n/, "and carries the file as its payload");
-		assert.equal("overview" in result.structuredContent, false, "with no summary to claim");
-		assert.equal(result.structuredContent.lines, 11, "counted the way read counts");
-	} finally {
-		rmSync(root, { recursive: true, force: true });
-	}
-});
-
-await check("a failed summary notifies the user", async () => {
-	const root = tempProject();
-	try {
-		writeFileSync(join(root, "src", "a.ts"), numbered(10));
-		const h = makeHarness({ cwd: root, respond: () => errorResponse("no balance") });
-		h.ctx.hasUI = true;
-		h.ctx.ui = { notify: (message, type) => h.notices.push({ message, type }) };
-
-		await runTool(h, "summary", { path: "src/a.ts" });
-		assert.equal(h.notices.length, 1);
-		assert.equal(h.notices[0].type, "error");
-		assert.match(h.notices[0].message, /no balance/);
+		assert.equal(h.calls.length, 2, "JSON mode is retried once, then it fails");
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
@@ -1470,6 +1428,15 @@ await check("an unusable cache falls back to the whole file, and the reason name
 		assert.equal(direct.details.status, "failed");
 		assert.match(direct.content[0].text, /Returning the whole file instead/);
 		assert.match(direct.content[0].text, /line 1/, "the file body follows");
+
+		// pi resolves an outputSchema tool to structuredContent alone, so a fallback that
+		// omitted it would hand a script nothing where the model got a file.
+		assert.ok(
+			Value.Check(summaryOutputSchema, direct.structuredContent),
+			"the fallback arm still matches the schema",
+		);
+		assert.match(direct.structuredContent.content, /^line 1\n/, "and carries the file as its payload");
+		assert.equal("overview" in direct.structuredContent, false, "with no summary to claim");
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
@@ -2251,7 +2218,7 @@ await check("a failed summary is drawn as the whole-file fallback it is", async 
 
 	// pi marks a result an error when the tool threw, and read draws its first ten lines even
 	// collapsed, because an error the caller has to expand to read is an error nobody reads.
-	// This tool throws only when the file could not be read either.
+	// This tool throws when the model call failed, or when the file could not be read either.
 	const failed = {
 		content: [{ type: "text", text: "summary failed: ENOENT: no such file or directory" }],
 	};
