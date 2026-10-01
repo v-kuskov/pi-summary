@@ -97,7 +97,10 @@ programmatic read of a 5000-line file costs exactly a read and nothing else.
 A `read` that already carries a small `limit` is never touched, so the guard does not
 fight a model that is reading properly. `read path="src/foo.ts" limit=2000` returns the
 map the same way a bare `read` does — the span that would come back is what counts, not
-whether `limit` was passed. A file whose summary cannot be produced is read as asked, with
+whether `limit` was passed. Every intercepted read also raises a toast —
+`Read of src/foo.ts intercepted and replaced with the file's summary (over 200 lines).` —
+because the result is drawn as ordinary tool output and never says on its own that the
+lines you asked for were not the lines you got. A file whose summary cannot be produced
 the failure reported instead: with no map to offer, withholding the file would take it away
 and leave nothing behind.
 
@@ -218,7 +221,8 @@ fake `ModelRegistry`, against a temp project directory. It covers cache hit/miss
 forced, the hash-over-mtime rule, the blob degradation, the repair loop and its cap,
 the `mtime_ms` migration, settings precedence, and the guard's boundaries —
 including that a cold oversized read summarizes and returns the map, that an intercepted
-read is a successful result and not an error, that the map carries every row uncut, that
+read is a successful result, not an error, and that it tells the user it was replaced by a
+summary, that the map carries every row uncut, that
 prose and extensionless files are left outside the limit, that a failing summarizer
 lets the read through and says so, and that `summary` draws its call and its result —
 collapsed, expanded, still running, and failed — in a terminal. It also checks that

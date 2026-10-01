@@ -85,6 +85,17 @@ export function registerReadTool(pi: ExtensionAPI): void {
 			const decision = await decide(ctx, params);
 
 			if (decision.kind === "map") {
+				// The model asked for lines and got a map, but nothing it returns says so to the
+				// person watching: `content` is drawn as ordinary tool output and `details` must stay
+				// `undefined` for the result to keep a clean read's shape. The toast is the only place
+				// the interception is visible, so it is worth saying on every one — a silent swap of
+				// the file for a summary looks exactly like a read that happened. Kept to one line
+				// free of newlines because it renders as a toast.
+				notifyUser(
+					ctx,
+					`Read of ${params.path} intercepted and replaced with the file's summary (over ${READ_LINE_LIMIT} lines).`,
+					"info",
+				);
 				// A clean read of the built-in reports `details: undefined`, so the shape of a
 				// normal read is kept exactly.
 				return { content: [{ type: "text", text: decision.text }], details: undefined };

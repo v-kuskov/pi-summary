@@ -1391,6 +1391,33 @@ await check("an intercepted read is a successful result, not an error", async ()
 	}
 });
 
+await check("an intercepted read tells the user it was replaced by a summary", async () => {
+	// The result itself looks like any other read output in the transcript, so without a
+	// toast the swap of the file for a summary is invisible to the person watching.
+	const root = tempProject();
+	try {
+		writeFileSync(join(root, "src", "a.ts"), numbered(500));
+		const h = makeHarness({ cwd: root });
+		h.ctx.hasUI = true;
+		h.ctx.ui = { notify: (message, type) => h.notices.push({ message, type }) };
+
+		await runRead(h, { path: "src/a.ts" });
+		assert.equal(h.notices.length, 1, "the interception is announced");
+		assert.equal(h.notices[0].type, "info", "a note, not a failure");
+		assert.match(h.notices[0].message, /intercepted/);
+		assert.match(h.notices[0].message, /summary/);
+		assert.match(h.notices[0].message, /src\/a\.ts/, "the path is named");
+		assert.equal(h.notices[0].message.trim(), h.notices[0].message, "one toast line");
+
+		// The toast marks the swap, not the tool being called: a read that passed through
+		// has nothing to report.
+		await runRead(h, { path: "src/a.ts", limit: 10 });
+		assert.equal(h.notices.length, 1, "a bounded read is not announced");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
 await check("a failing summarizer lets the read through and notifies", async () => {
 	const root = tempProject();
 	try {
