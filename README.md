@@ -11,7 +11,8 @@ Two things, working together:
   longer than 200 lines with the file's summary instead, so the model reads one of the map's
   ranges rather than the whole file. A read of 200 lines or fewer is returned exactly as
   asked. A file with no summary yet is summarized on the spot. Prose, notes and extensionless
-  files (`.md`, `.txt`, `Makefile`, `.gitignore`) are never touched — they read whole.
+  files (`.md`, `.txt`, `Makefile`, `.gitignore`) are never touched — they read whole — and
+neither is a read issued by another tool, such as a codemode script.
 
 ## Install
 
@@ -44,7 +45,6 @@ summary path="src/foo.ts"
 
 ```
 # src/foo.ts  (1420 lines, 48.2KB, sha 9f2c1ab4)
-cache: miss
 
 An HTTP client for the internal Orders API. Wraps node fetch with signed requests,
 retry with jitter, and a rate limiter shared per host. Exports FooClient and the
@@ -60,6 +60,12 @@ every attempt, so a test that does not set it signs with an empty key.
 
 # read src/foo.ts with offset/limit inside one range (max 200 lines per call).
 ```
+
+The call also returns `structuredContent` — `{path, lines, overview, sections}` for
+codemode scripts, which receive data instead of the rendered text; a failed call's arm
+carries the whole file it fell back to. Cache state, the summarizer model and the attempt
+count are internal bookkeeping: they live in the result's `details`, and reach neither the
+model nor the display.
 
 A later `read path="src/foo.ts"` with no range is answered with the map instead of the
 file's lines, as a normal successful result:
@@ -82,6 +88,11 @@ An HTTP client for the internal Orders API. ...
 ```
 
 `read path="src/foo.ts" offset=141 limit=200` passes through untouched.
+
+A `read` issued by *another tool* — a codemode script, anything calling `ctx.executeTool()` —
+is never intercepted, whatever its size: a script processes contents, and a map in place of
+the file would silently corrupt its work. Only the model's own reads are guarded, so a
+programmatic read of a 5000-line file costs exactly a read and nothing else.
 
 A `read` that already carries a small `limit` is never touched, so the guard does not
 fight a model that is reading properly. `read path="src/foo.ts" limit=2000` returns the
@@ -191,7 +202,7 @@ setting means the session model.
   answer. The built-in renderer, schema, description and prompt guidance are kept, so the
   swap is invisible apart from the limit.
 
-  `summary` draws its own call and result (see `D16` in `DESIGN.md`): collapsing a call shows a
+  `summary` draws its own call and result: collapsing a call shows a
   one-line outcome, and expanding it shows the map the model received. A call that failed hard
   enough to throw shows the reason collapsed, rather than nothing.
 
@@ -210,7 +221,10 @@ including that a cold oversized read summarizes and returns the map, that an int
 read is a successful result and not an error, that the map carries every row uncut, that
 prose and extensionless files are left outside the limit, that a failing summarizer
 lets the read through and says so, and that `summary` draws its call and its result —
-collapsed, expanded, still running, and failed — in a terminal.
+collapsed, expanded, still running, and failed — in a terminal. It also checks that
+`structuredContent` matches the output schema and carries the summary and no generation
+history, and that a read issued by another tool passes through untouched while the model's
+own read stays guarded.
 
 Nothing checks the map's *content*. Structure and schema are validated, and a
 contiguous, well-formed map can still name the wrong lines. The defence is in the prompt
@@ -218,9 +232,6 @@ itself: the excerpt is line-numbered and the model is told to copy numbers out o
 left column rather than count lines. That was measured, not assumed — given raw
 unnumbered text one model invented a spacing rule and drifted a mean of 24 lines on a
 1396-line file, while another counted accurately.
-
-`docs/DESIGN.md` records the reasoning, including the cost filter and the rejected
-designs.
 
 ## License
 

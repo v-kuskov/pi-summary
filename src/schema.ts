@@ -1,7 +1,7 @@
-import { Type } from "typebox";
+import { Type, type Static } from "typebox";
 import { Value } from "typebox/value";
 import { StringEnum } from "@earendil-works/pi-ai";
-import type { Section } from "./store.ts";
+import type { CachedSummary, Section } from "./store.ts";
 
 /** Vocabulary for the `kind` field, shared by the schema, the prompt, and the validator. */
 export const SECTION_KINDS = [
@@ -165,4 +165,61 @@ export function normalizeSections(raw: unknown, shownLines: number): Section[] |
 	}
 
 	return tiled.map((section, index) => ({ ...section, seq: index }));
+}
+
+/**
+ * The `summary` tool's `outputSchema`: the summary and nothing else.
+ *
+ * Cache state, the summarizer model, the attempt count and the degradation flag are
+ * generation history — they stay in the result's `details`, for diagnosis, and are not part
+ * of what a caller came for. The second arm exists because pi resolves a tool that
+ * declares an `outputSchema` to its `structuredContent` *instead of* the text: a call that
+ * fell back to the whole file has no summary, so the file itself is the payload, and
+ * omitting the field would hand scripts nothing where the model got a file.
+ *
+ * Unlike `emitSummarySchema` above, this schema does reach callers: codemode declarations
+ * render it for scripts.
+ */
+export const summaryOutputSchema = Type.Union([
+	Type.Object({
+		path: Type.String(),
+		lines: Type.Integer(),
+		overview: Type.String(),
+		sections: Type.Array(
+			Type.Object({
+				startLine: Type.Integer(),
+				endLine: Type.Integer(),
+				kind: Type.String(),
+				name: Type.String(),
+				note: Type.String(),
+			}),
+		),
+	}),
+	Type.Object({
+		path: Type.String(),
+		lines: Type.Integer(),
+		content: Type.String(),
+	}),
+]);
+
+export type SummaryOutput = Static<typeof summaryOutputSchema>;
+
+/**
+ * Project a stored entry into the tool's structured result.
+ *
+ * `seq` is storage ordering and stays behind this seam; the array order already carries it.
+ */
+export function summaryOutputOf(entry: CachedSummary): SummaryOutput {
+	return {
+		path: entry.path,
+		lines: entry.lines,
+		overview: entry.overview,
+		sections: entry.sections.map((section) => ({
+			startLine: section.startLine,
+			endLine: section.endLine,
+			kind: section.kind,
+			name: section.name,
+			note: section.note,
+		})),
+	};
 }

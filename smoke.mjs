@@ -12,7 +12,13 @@ import { MAX_ATTEMPTS } from "./src/summarize.ts";
 import { ensureSchema, openDb, writeSummary } from "./src/store.ts";
 import { readImageAutoResize, readSummarySettings } from "./src/settings.ts";
 import { extractOverview, parseJsonAnswer } from "./src/prompt.ts";
-import { hasTopLevelShape, normalizeSections, MAX_NOTE_CHARS } from "./src/schema.ts";
+import { Value } from "typebox/value";
+import {
+	hasTopLevelShape,
+	normalizeSections,
+	MAX_NOTE_CHARS,
+	summaryOutputSchema,
+} from "./src/schema.ts";
 import { renderMap } from "./src/render.ts";
 import { isUnguardedPath } from "./src/paths.ts";
 
@@ -590,7 +596,7 @@ await check("summary calls the model once, then serves the cache", async () => {
 		const first = await runTool(h, "summary", { path: "src/a.ts" });
 		assert.equal(h.calls.length, 1, "one model call");
 		assert.equal(first.details.status, "miss");
-		assert.match(first.content[0].text, /cache: miss/);
+		assert.doesNotMatch(first.content[0].text, /cache:/, "cache state is internal, not model-facing");
 		assert.match(first.content[0].text, /## map/);
 		assert.match(first.content[0].text, /run\(\)/);
 		assert.match(first.content[0].text, /401 lines/);
@@ -598,7 +604,34 @@ await check("summary calls the model once, then serves the cache", async () => {
 		const second = await runTool(h, "summary", { path: "src/a.ts" });
 		assert.equal(h.calls.length, 1, "no second model call");
 		assert.equal(second.details.status, "fresh");
-		assert.match(second.content[0].text, /cache: fresh/);
+		assert.doesNotMatch(second.content[0].text, /cache:/, "and a served cache says no more than a fresh one");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+await check("the structured result carries the summary and nothing else", async () => {
+	// Scripts receive structuredContent instead of the text, so this is their whole view of
+	// the tool: the file, its prose and its map. Generation history — model, cache state,
+	// attempts, degradation — is internal and must not appear.
+	const root = tempProject();
+	try {
+		writeFileSync(join(root, "src", "a.ts"), numbered(400));
+		const h = makeHarness({ cwd: root });
+
+		const first = await runTool(h, "summary", { path: "src/a.ts" });
+		assert.ok(Value.Check(summaryOutputSchema, first.structuredContent), "matches the schema");
+		const out = first.structuredContent;
+		assert.equal(out.path, "src/a.ts", "the summary names the file");
+		assert.equal(out.lines, first.details.lines, "and its length");
+		assert.equal(out.overview, "Does a thing.", "the prose is there");
+		assert.equal(out.sections.length, 1, "and the map rows");
+		assert.equal(out.sections[0].startLine, 1, "from the first line");
+		assert.equal(out.sections[0].endLine, out.lines, "to the last");
+		assert.equal(out.sections[0].kind, "function", "with the row's fields");
+		for (const field of ["model", "status", "attempts", "degraded", "mode", "seq"]) {
+			assert.equal(field in out, false, `${field} is generation history, not summary`);
+		}
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
@@ -838,6 +871,16 @@ await check("a provider that rejects JSON mode every time returns the file, not 
 		assert.match(result.content[0].text, /upstream exploded/);
 		assert.match(result.content[0].text, /Returning the whole file instead/);
 		assert.match(result.content[0].text, /line 1/, "the file body follows");
+
+		// pi resolves an outputSchema tool to structuredContent alone, so a fallback that
+		// omitted it would hand a script nothing where the model got a file.
+		assert.ok(
+			Value.Check(summaryOutputSchema, result.structuredContent),
+			"the fallback arm still matches the schema",
+		);
+		assert.match(result.structuredContent.content, /^line 1\n/, "and carries the file as its payload");
+		assert.equal("overview" in result.structuredContent, false, "with no summary to claim");
+		assert.equal(result.structuredContent.lines, 11, "counted the way read counts");
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
@@ -1162,6 +1205,58 @@ await check("the guard refuses a read longer than it returns", async () => {
 		assert.match(reason, /longer than 200 lines/);
 		assert.match(reason, /at most 200 lines per call/);
 		assert.match(reason, /## map/, "the map is the answer, not just a refusal");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+await check("a read issued by another tool is answered with the file, not the map", async () => {
+	// Codemode scripts and any ctx.executeTool() caller process contents; a map in place of
+	// the file would silently corrupt their work. The parent id rides only on the tool_call
+	// hook, so the test fires that hook the way pi does before execute.
+	const root = tempProject();
+	try {
+		writeFileSync(join(root, "src", "big.ts"), numbered(400));
+		const h = makeHarness({ cwd: root });
+		const read = h.tools.get("read");
+		const fireToolCall = (toolCallId, parentToolCallId) => {
+			for (const { event, handler } of h.handlers) {
+				if (event !== "tool_call") continue;
+				handler({
+					type: "tool_call",
+					toolName: "read",
+					toolCallId,
+					parentToolCallId,
+					input: { path: "src/big.ts" },
+				});
+			}
+		};
+
+		fireToolCall("call-1/1", "call-1");
+		const nested = await read.execute(
+			"call-1/1",
+			{ path: "src/big.ts" },
+			undefined,
+			undefined,
+			h.ctx,
+		);
+		assert.doesNotMatch(nested.content[0].text, /longer than 200 lines/, "the map is not substituted");
+		assert.match(nested.content[0].text, /line 400\b/, "the file's own lines come back");
+		assert.equal(h.calls.length, 0, "and nothing was summarized to answer it");
+
+		// The id is consumed on lookup, so one hook event buys one passthrough: the same id
+		// arriving again unannounced is a read pi would have issued itself.
+		const again = await read.execute(
+			"call-1/1",
+			{ path: "src/big.ts" },
+			undefined,
+			undefined,
+			h.ctx,
+		);
+		assert.match(again.content[0].text, /longer than 200 lines/, "the next read is guarded as usual");
+
+		// The model's own read of the same file stays intercepted.
+		assert.match(await readMap(h, { path: "src/big.ts" }), /longer than 200 lines/);
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
@@ -2059,7 +2154,7 @@ await check("a summary result renders its outcome collapsed and its text expande
 		const collapsed = renderRows(
 			summary.renderResult(result, { expanded: false, isPartial: false }, stubTheme, renderContext()),
 		);
-		assert.match(collapsed, /cache: miss/, "the collapsed line reports where the map came from");
+		assert.doesNotMatch(collapsed, /cache:/, "cache state is internal and never drawn");
 		assert.match(
 			collapsed,
 			new RegExp(`${result.details.lines} lines`),
@@ -2072,7 +2167,7 @@ await check("a summary result renders its outcome collapsed and its text expande
 			"the map itself waits for an expansion rather than burying the transcript in rows",
 		);
 
-		// `D15`: the model a file was summarized with is in the details for diagnosis, and in the
+		// The model a file was summarized with is in the details for diagnosis, and in the
 		// transcript it would only invite the reader to second-guess a map over a model name.
 		assert.match(result.details.model, /test-model/, "the details do record the summarizer");
 

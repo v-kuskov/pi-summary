@@ -8,6 +8,7 @@ import { notifyUser, SummaryError } from "./error.ts";
 import { describeFailure, failureNotice, loadWholeFile } from "./fallback.ts";
 import { resolveFilePath } from "./paths.ts";
 import { renderSummary, READ_LINE_LIMIT } from "./render.ts";
+import { summaryOutputOf, summaryOutputSchema } from "./schema.ts";
 import { summarizeFile, type SummarizeOutcome } from "./summarize.ts";
 import { summaryRenderers } from "./tui.ts";
 
@@ -57,6 +58,7 @@ export function registerSummaryTool(pi: ExtensionAPI): void {
 				}),
 			),
 		}),
+		outputSchema: summaryOutputSchema,
 		executionMode: "parallel",
 		async execute(
 			_id,
@@ -79,16 +81,9 @@ export function registerSummaryTool(pi: ExtensionAPI): void {
 				// notification and a visible comment rather than an error result.
 				return wholeFileFallback(ctx, params.path, error);
 			}
-			const lines: string[] = [];
-			lines.push(renderSummary(outcome.entry, { freshness: outcome.status }));
-			if (outcome.degraded) {
-				lines.push(
-					`# the summarizer did not return a usable line map after ${outcome.attempts} attempts, so only the prose above is cached`,
-				);
-			}
-
 			return {
-				content: [{ type: "text", text: lines.join("\n") }],
+				content: [{ type: "text", text: renderSummary(outcome.entry) }],
+				structuredContent: summaryOutputOf(outcome.entry),
 				details: summarizeDetails(outcome),
 				usage: outcome.usage,
 			};
@@ -160,6 +155,11 @@ async function wholeFileFallback(
 
 	return {
 		content: [{ type: "text", text: `# ${notice}\n\n${body}` }],
+		// The failure itself is generation history and stays out of the structured arm; what a
+		// script needs is the file the model also got. Because pi resolves an `outputSchema`
+		// tool to `structuredContent` alone, this field is the only way a script receives the
+		// fallback body at all — leaving it out would hand scripts nothing.
+		structuredContent: { path: absPath, lines: details.lines, content: body },
 		details,
 	};
 }

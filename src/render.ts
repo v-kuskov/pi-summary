@@ -1,4 +1,4 @@
-import type { CachedSummary, Freshness, Section } from "./store.ts";
+import type { CachedSummary, Section } from "./store.ts";
 
 /**
  * Hard limit on lines a single `read` may return. Larger spans must be split.
@@ -47,30 +47,22 @@ export function renderMap(sections: Section[]): string {
 	return `## map\n${lines.join("\n")}`;
 }
 
-export type RenderOptions = {
-	/**
-	 * Cache state shown in the header. `miss` (nothing was cached) and `forced` (an explicit
-	 * refresh) only exist right after a model call; the rest are `freshnessOf`'s verdicts.
-	 * `missing` is deliberately absent: it means the file could not be compared at all, and
-	 * it is never what a caller renders.
-	 */
-	freshness?: Exclude<Freshness, "missing"> | "miss" | "forced";
-};
-
 /**
  * Render a cached summary as the text the model sees. The map is always derived from the
  * section rows, so the prose and the line numbers cannot drift apart.
  *
- * The header is always shown, and it never names the summarizer model (`D15`): the model a
- * file was summarized with is not something the caller can act on.
+ * The header is always shown, and it never names the summarizer model: the model a
+ * file was summarized with is not something the caller can act on. Cache state is not shown
+ * either: freshness decides re-use inside the cache and means nothing to a reader
+ * who already holds the answer, so this is a pure transform of the entry — one source for
+ * the model's text and for the structured result a script receives.
  */
-export function renderSummary(entry: CachedSummary, options: RenderOptions = {}): string {
+export function renderSummary(entry: CachedSummary): string {
 	const parts: string[] = [];
 
 	parts.push(
 		`# ${entry.path}  (${entry.lines} lines, ${formatBytes(entry.bytes)}, sha ${entry.hash})`,
 	);
-	if (options.freshness) parts.push(`cache: ${options.freshness}`);
 	if (entry.mode === "blob") {
 		parts.push("map: none - summarized as a single blob, so there is no line detail");
 	}

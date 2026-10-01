@@ -16,7 +16,7 @@ import type { SummaryDetails } from "./tools.ts";
  *
  * The collapsed state is a single line of outcome rather than read's silence: a summary is
  * usually the *first* thing a session does to a file, so a call that shows nothing at all
- * reads as a no-op. What the line may not contain is the summarizer model (`D15`) — it is
+ * reads as a no-op. What the line may not contain is the summarizer model — it is
  * in the result's `details` for whoever needs to diagnose a bad map, and it tells the
  * person watching nothing they can act on.
  *
@@ -47,7 +47,7 @@ type RenderContext = {
  * there cannot drift from what gets drawn. It is a type-only import and erases at compile
  * time, so it does not make the tool module and this one import each other.
  */
-type ResultDetails = Pick<SummaryDetails, "status" | "mode" | "lines" | "sections" | "degraded">;
+type ResultDetails = Pick<SummaryDetails, "status" | "mode" | "lines" | "sections">;
 
 type RenderResult = {
 	content: Array<{ type: string; text?: string }>;
@@ -130,7 +130,7 @@ function withHint(cells: string[], theme: Theme): string {
 	return cells.join(theme.fg("dim", " · "));
 }
 
-/** One line saying what this call produced, without naming a model (`D15`). */
+/** One line saying what this call produced, without naming a model. */
 function formatOutcome(
 	details: ResultDetails | undefined,
 	isPartial: boolean,
@@ -149,14 +149,16 @@ function formatOutcome(
 		);
 	}
 
-	const parts = [`cache: ${details.status}`, `${details.lines} lines`];
+	// Cache state and generation history are internal: the line reports what the
+	// caller can act on — the file and its map. `status` survives only to tell the fallback
+	// branch above from a real summary.
+	const parts = [`${details.lines} lines`];
 	// "1 ranges" is not English, and a one-row map is common enough to be worth the branch.
 	parts.push(
 		details.mode === "blob"
 			? "no line map"
 			: `${details.sections} ${details.sections === 1 ? "range" : "ranges"}`,
 	);
-	if (details.degraded) parts.push("prose only");
 
 	// Every part but the trailing hint is muted chrome; the hint carries its own styling, and
 	// is absent outside the interactive TUI.

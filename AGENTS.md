@@ -3,9 +3,8 @@
 pi-summary is a pi extension that summarizes a source file once, caches the result, and
 answers any `read` of more than 200 lines with the file's **map** instead of its contents.
 
-`README.md` is the user-facing description. `docs/DESIGN.md` is the reasoning: read it
-before changing behavior — every load-bearing choice (cost bounds, hash freshness, blob
-degradation, the read override) is recorded there with the alternatives that were rejected.
+`README.md` is the user-facing description; the reasoning behind each choice lives in the
+comment next to it.
 
 ## Commands
 
@@ -23,9 +22,11 @@ the smoke suite.
 
 `index.ts` is the pi entry point: it registers three things and opens nothing at load time.
 
-- `src/tools.ts` — the `summary` tool (one model call per file, at most three).
-- `src/guard.ts` — replaces the built-in `read`; `decide()` is the single place that decides
-  whether a span is answered with the map or passed through.
+- `src/tools.ts` — the `summary` tool (one model call per file, at most three), with an
+  `outputSchema` whose `structuredContent` is the summary alone.
+- `src/guard.ts` — replaces the built-in `read`; a read issued by another tool passes
+  through untouched, and `decide()` is the single place that decides whether a remaining
+  span is answered with the map or passed through.
 - `src/locator.ts` — appends the changed line numbers to a successful `edit`.
 
 Support: `src/summarize.ts` (the model call, validation, repair loop), `src/prompt.ts`,
@@ -35,13 +36,16 @@ Support: `src/summarize.ts` (the model call, validation, repair loop), `src/prom
 
 ## Invariants
 
-These are deliberate and have regressed before; do not weaken one without reading its
-`D`-numbered decision in `docs/DESIGN.md` first.
+These are deliberate and have regressed before; do not weaken one without stating the
+reason where the change is made.
 
 - **Bounded model spend.** Summarizing costs one call normally, three at most; the guard
   never spends unbounded by the caller. No project-wide refresh, no search across summaries.
 - **Freshness is the content hash, never mtime.** A size mismatch may short-circuit to
   stale; every other case goes through sha256.
+- **Generation history stays internal.** Cache state, the summarizer model, the attempt
+  count and the degradation flag live only in `details`; the model's text, the TUI outcome
+  and `structuredContent` carry the summary alone.
 - **The map is derived, not stored.** The database holds the overview and one row per
   region; the `## map` text is rendered from those rows, so prose and line numbers cannot
   drift apart. Gaps are legal; rows must not overlap.

@@ -1,6 +1,7 @@
 import {
 	type ExtensionAPI,
 	type ExtensionContext,
+	type ExtensionToolContext,
 	createReadToolDefinition,
 	detectSupportedImageMimeTypeFromFile,
 } from "@earendil-works/pi-coding-agent";
@@ -51,11 +52,36 @@ import { summarizeFile, type SummarizeOutcome } from "./summarize.ts";
  * written to be read in order and a map of a README says nothing a skim does not, so the limit
  * buys nothing there and only cuts the file mid-section. The limit is for source files, where
  * not knowing which range holds a symbol costs a wasted call.
+ *
+ * A read another tool issued — a codemode script, anything calling `ctx.executeTool()` — is
+ * never intercepted. A programmatic caller processes contents, and a map in place of
+ * the file silently corrupts its work. The parent id rides only on the `tool_call` event,
+ * never on `execute()`'s arguments, so that event is what remembers it.
  */
 export function registerReadTool(pi: ExtensionAPI): void {
+	// Ids of reads issued by another tool, recorded by the `tool_call` hook — the one place
+	// pi exposes `parentToolCallId` before `execute` runs (the hook event spreads it in the
+	// installed agent-session.js). Cleanup is the lookup in `execute`, which deletes the id
+	// it matches, so only ids in flight sit here. A call that never reaches `execute` —
+	// blocked, or failing validation in between — leaves its id behind, which the cap bounds:
+	// nested ids embed their caller's id, so a stale entry can never match a model-issued
+	// read, and clearing the set only ever drops entries whose window has already closed.
+	const nestedReads = new Set<string>();
+	pi.on("tool_call", (event) => {
+		if (event.toolName !== "read" || !event.parentToolCallId) return;
+		if (nestedReads.size >= 1024) nestedReads.clear();
+		nestedReads.add(event.toolCallId);
+	});
+
 	pi.registerTool({
 		...createReadToolDefinition(process.cwd()),
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
+			// Answered as asked: no probes, no summarizing, no model call — a script reading a
+			// 5000-line file pays exactly what a read of it costs.
+			if (nestedReads.delete(toolCallId)) {
+				return delegate(toolCallId, params, signal, onUpdate, ctx);
+			}
+
 			const decision = await decide(ctx, params);
 
 			if (decision.kind === "map") {
@@ -96,7 +122,7 @@ async function delegate(
 	params: ReadInput,
 	signal: AbortSignal | undefined,
 	onUpdate: Parameters<ReturnType<typeof createReadToolDefinition>["execute"]>[3],
-	ctx: ExtensionContext,
+	ctx: ExtensionToolContext,
 ) {
 	const options = (await looksLikeImage(params.path, ctx.cwd))
 		? { autoResizeImages: readImageAutoResize(ctx.cwd) }
