@@ -29,7 +29,7 @@ import {
 } from "./store.ts";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AssistantMessage, Model, Usage } from "@earendil-works/pi-ai";
-import { readSummarySettings } from "./settings.ts";
+import { SETTINGS_FILE, readSettings } from "./settings.ts";
 
 type AnyModel = Model<any>;
 
@@ -330,7 +330,7 @@ function isProviderError(response: AssistantMessage): boolean {
 }
 
 /**
- * Pick the summarizer, in order: explicit `provider/model`, the `summary.model` setting,
+ * Pick the summarizer, in order: explicit `provider/model`, the settings file's `model`,
  * else the session's current model. Auth is checked up front so a missing credential
  * reads as a clear message rather than a provider error.
  *
@@ -373,7 +373,7 @@ function resolveNamedModel(ctx: ExtensionContext, explicit: string | undefined):
 }
 
 /**
- * The `summary.model` setting, if one is set.
+ * The `model` setting, if one is set.
  *
  * `undefined` means the setting is absent, which is the documented default: summarize
  * with the session's current model. A setting that *is* present but unusable raises, so
@@ -382,26 +382,26 @@ function resolveNamedModel(ctx: ExtensionContext, explicit: string | undefined):
  * where silently succeeding looks like the setting was honoured.
  */
 function configuredModel(ctx: ExtensionContext): AnyModel | undefined {
-	const configured = readSummarySettings(ctx.cwd).model;
+	const configured = readSettings(ctx.cwd).model;
 	if (!configured) return undefined;
 	const parsed = parseProviderModel(configured);
 	if (!parsed) {
 		throw new SummaryError(
-			`summary.model "${configured}" is not in provider/model form`,
-			'Fix it in settings, or remove the key to summarize with the current session model.',
+			`${SETTINGS_FILE}: "${configured}" is not in provider/model form`,
+			`Fix ${SETTINGS_FILE}, or remove the key to summarize with the current session model.`,
 		);
 	}
 	const found = ctx.modelRegistry.find(parsed.provider, parsed.modelId);
 	if (!found) {
 		throw new SummaryError(
-			`summary.model "${configured}" names no known model`,
-			'Fix it in settings, or remove the key to summarize with the current session model.',
+			`${SETTINGS_FILE}: "${configured}" names no known model`,
+			`Fix ${SETTINGS_FILE}, or remove the key to summarize with the current session model.`,
 		);
 	}
 	if (!ctx.modelRegistry.hasConfiguredAuth(found)) {
 		throw new SummaryError(
-			`summary.model "${configured}" has no configured credentials`,
-			'Fix it in settings, or remove the key to summarize with the current session model.',
+			`${SETTINGS_FILE}: "${configured}" has no configured credentials`,
+			`Fix ${SETTINGS_FILE}, or remove the key to summarize with the current session model.`,
 		);
 	}
 	return found;
@@ -424,7 +424,7 @@ function sessionModel(ctx: ExtensionContext): AnyModel {
 	if (!current) {
 		throw new SummaryError(
 			"no current model available to summarize with",
-			'Pass model as provider/model, or set it with {"summary":{"model":"..."}} in settings.',
+			`Pass model as provider/model, or set one in ${SETTINGS_FILE}.`,
 		);
 	}
 	if (!ctx.modelRegistry.hasConfiguredAuth(current)) {

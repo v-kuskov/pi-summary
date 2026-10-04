@@ -1,13 +1,14 @@
 import type { CachedSummary, Section } from "./store.ts";
 
 /**
- * Hard limit on lines a single `read` may return. Larger spans must be split.
+ * Line limit a `read` may span before the guard answers with the map.
  *
- * The guard enforces it and the model-facing text quotes it, so it lives here - next to the
- * strings that have to agree with it - rather than in the guard, where a change to the
- * limit would silently leave every message quoting the old number.
+ * It is a parameter rather than a constant because it is a setting: the guard enforces it
+ * and the model-facing text quotes it, so every string quoting a number takes the same one
+ * the decision was made with. A constant here would let a configured limit divert a read
+ * while the messages still promised 200.
  */
-export const READ_LINE_LIMIT = 200;
+export type LineLimit = number;
 
 export function formatBytes(bytes: number): string {
 	if (bytes < 1024) return `${bytes}B`;
@@ -57,7 +58,7 @@ export function renderMap(sections: Section[]): string {
  * who already holds the answer, so this is a pure transform of the entry — one source for
  * the model's text and for the structured result a script receives.
  */
-export function renderSummary(entry: CachedSummary): string {
+export function renderSummary(entry: CachedSummary, limit: LineLimit): string {
 	const parts: string[] = [];
 
 	parts.push(
@@ -74,8 +75,8 @@ export function renderSummary(entry: CachedSummary): string {
 	parts.push("");
 	parts.push(
 		entry.mode === "blob"
-			? `# read ${entry.path} in ranges (max ${READ_LINE_LIMIT} lines per call), or grep it for a symbol.`
-			: `# read ${entry.path} with offset/limit inside one range above (max ${READ_LINE_LIMIT} lines per call).`,
+			? `# read ${entry.path} in ranges (max ${limit} lines per call), or grep it for a symbol.`
+			: `# read ${entry.path} with offset/limit inside one range above (max ${limit} lines per call).`,
 	);
 	return parts.join("\n");
 }

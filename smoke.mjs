@@ -10,7 +10,8 @@ import extensionFactory from "./index.ts";
 import { countLinesFrom } from "./src/hash.ts";
 import { MAX_ATTEMPTS } from "./src/summarize.ts";
 import { ensureSchema, openDb, writeSummary } from "./src/store.ts";
-import { readImageAutoResize, readSummarySettings } from "./src/settings.ts";
+import { readImageAutoResize, readSettings, DEFAULT_TRAP, DEFAULT_TRAP_LIMIT } from "./src/settings.ts";
+import { registerSummaryTool } from "./src/tools.ts";
 import { parseJsonAnswer } from "./src/prompt.ts";
 import { Value } from "typebox/value";
 import {
@@ -25,15 +26,17 @@ import { isUnguardedPath } from "./src/paths.ts";
 /**
  * Isolation from the developer's own pi install.
  *
- * The extension reads `summary.model` out of pi's settings, and a read with no project
- * settings falls all the way through to the global file at `<agentDir>/settings.json`.
- * That makes the suite depend on whatever the machine running it happens to have
- * configured: a `summary.model` naming a model the fake harness cannot resolve now fails
- * the summary, so a working setting would be honoured and a typo would break unrelated
- * cases. Point `<agentDir>` at an empty directory before anything reads it, so every case
- * starts from the same unconfigured state and only the cases that write settings
- * deliberately are affected. Cases that set `PI_CODING_AGENT_DIR` themselves still win,
- * since they assign it inside their own try block.
+ * The extension reads its settings from `<projectRoot>/.pi/pi-summary.json` and, when that
+ * says nothing, from `<agentDir>/pi-summary.json`. It also reads pi's own `images.autoResize`
+ * out of pi's settings, whose global file lives at `<agentDir>/settings.json`. Left alone,
+ * the suite would depend on whatever the machine running it happens to have configured: a
+ * `model` naming a model the fake harness cannot resolve fails the summary, and a stray
+ * `trap` would change whether reads are intercepted at all. Point `<agentDir>` at an empty
+ * directory before anything reads it, so every case starts from the same unconfigured state
+ * and only the cases that write settings deliberately are affected. Cases that set
+ * `PI_CODING_AGENT_DIR` themselves still win, since they assign it inside their own try
+ * block. The real-model suite deliberately puts it back, because the provider it needs is
+ * registered by a package in the developer's own install.
  */
 const isolatedAgentDir = mkdtempSync(join(tmpdir(), "pi-agent-isolated-"));
 process.env.PI_CODING_AGENT_DIR = isolatedAgentDir;
@@ -150,6 +153,18 @@ async function readMap(h, params) {
 }
 
 /**
+ * Whether a read was answered with a map, at a `trap_limit` other than the default.
+ *
+ * The banner quotes the limit the guard was configured with, so a case that changes the
+ * limit has to assert against that number rather than against the default one - which is
+ * itself the property under test: a guard enforcing 50 while saying 200 is wrong.
+ */
+async function readMapAt(h, params, limit) {
+	const text = await readText(h, params);
+	return new RegExp(`longer than ${limit} lines`).test(text) ? text : undefined;
+}
+
+/**
  * Whether a read rejects, and with what.
  *
  * Reads the guard does not claim are the built-in tool's, including its failures: a missing
@@ -171,8 +186,84 @@ function tempProject() {
 	return root;
 }
 
+/**
+ * Write this extension's settings file into `dir` (a project root or an agent dir).
+ *
+ * Every settings case goes through this, so the file name and the directory convention live
+ * in one place: a case that wrote `settings.json` by hand would be testing pi's file, not
+ * ours, and would pass for the wrong reason.
+ */
+function writeSettings(dir, settings) {
+	mkdirSync(dir, { recursive: true });
+	writeFileSync(join(dir, "pi-summary.json"), JSON.stringify(settings));
+}
+
 const numbered = (lines) =>
 	Array.from({ length: lines }, (_, i) => `line ${i + 1}`).join("\n") + "\n";
+
+/**
+ * A file with the shape of real code, for the cases that run a real model.
+ *
+ * `numbered` is what the fake harness is driven with: every line differs, so a map's rows are
+ * checkable without the model. A real model needs something it has not been fitted to, and
+ * what the cases then assert is structure - rows in range, in order, inside the file - rather
+ * than a particular answer. Repetitive declarations keep the file's size predictable while
+ * still giving the model something a line-numbered excerpt can be mapped as.
+ */
+function realClientSource(lines) {
+	const parts = [
+		"/** A small HTTP client for the internal Orders API. */",
+		'import { createHmac } from "node:crypto";',
+		"",
+		"export type RetryPolicy = { attempts: number; baseDelayMs: number };",
+		"",
+		"const DEFAULT_POLICY: RetryPolicy = { attempts: 3, baseDelayMs: 50 };",
+		"",
+		"export class OrdersClient {",
+		"\tconstructor(private readonly baseUrl: string, private readonly secret: string) {}",
+		"",
+		"\tprivate sign(body: string, nonce: string): string {",
+		'\t\treturn createHmac("sha256", this.secret).update(`${nonce}.${body}`).digest("hex");',
+		"\t}",
+		"",
+		"\tasync post(path: string, body: unknown): Promise<unknown> {",
+		"\t\tconst payload = JSON.stringify(body);",
+		"\t\tconst nonce = String(this.attempt++);",
+		"\t\tconst response = await fetch(`${this.baseUrl}${path}`, {",
+		'\t\t\tmethod: "POST",',
+		'\t\t\theaders: { "content-type": "application/json", "x-signature": this.sign(payload, nonce) },',
+		"\t\t\tbody: payload,",
+		"\t\t});",
+		"\t\tif (!response.ok) throw new OrdersError(response.status, await response.text());",
+		"\t\treturn response.json();",
+		"\t}",
+		"",
+		"\tattempt = 0;",
+		"}",
+		"",
+		"export class OrdersError extends Error {",
+		"\tconstructor(readonly status: number, readonly detail: string) {",
+		'\t\tsuper(`Orders API ${status}: ${detail}`);',
+		"\t}",
+		"}",
+		"",
+	];
+	// Pad with distinguishable declarations so the file reaches the requested size while every
+	// region the model can name remains real code.
+	let index = 0;
+	while (parts.length < lines) {
+		parts.push(
+			`/** Handles ${index}. */`,
+			`export function handler${index}(input: string): string {`,
+			`\tconst trimmed = input.trim().toLowerCase();`,
+			`\treturn trimmed.length > ${index} ? trimmed.slice(${index}) : trimmed;`,
+			"}",
+			"",
+		);
+		index++;
+	}
+	return parts.slice(0, lines).join("\n") + "\n";
+}
 
 // ------------------------------------------------------------------ units
 
@@ -256,24 +347,40 @@ await check("parseJsonAnswer tolerates a fence and surrounding prose", async () 
 	assert.equal(parseJsonAnswer(""), undefined);
 });
 
-await check("readSummarySettings reads the object form and prefers project over global", async () => {
+await check("the settings file is read from the project, then the agent dir", async () => {
 	const agent = mkdtempSync(join(tmpdir(), "pi-agent-"));
 	const root = tempProject();
 	const previous = process.env.PI_CODING_AGENT_DIR;
 	try {
 		process.env.PI_CODING_AGENT_DIR = agent;
-		writeFileSync(
-			join(agent, "settings.json"),
-			JSON.stringify({ summary: { model: "global/model" } }),
-		);
-		assert.deepEqual(readSummarySettings(root), { model: "global/model" });
 
-		mkdirSync(join(root, ".pi"), { recursive: true });
+		// Nothing anywhere means the documented defaults, which are what the extension did
+		// before the file existed. This is the case every other settings case is measured
+		// against, so it is asserted first.
+		assert.deepEqual(readSettings(root), {
+			model: undefined,
+			trap: DEFAULT_TRAP,
+			trapLimit: DEFAULT_TRAP_LIMIT,
+		});
+		assert.equal(DEFAULT_TRAP, "normal", "the default trap is the behaviour that shipped");
+		assert.equal(DEFAULT_TRAP_LIMIT, 200, "the default limit is the one that shipped");
+
+		writeSettings(agent, { model: "global/model", trap_limit: 111 });
+		assert.equal(readSettings(root).model, "global/model");
+		assert.equal(readSettings(root).trapLimit, 111);
+
+		writeSettings(join(root, ".pi"), { model: "project/model", trap: "none" });
+		const merged = readSettings(root);
+		assert.equal(merged.model, "project/model", "the project's model wins");
+		assert.equal(merged.trapLimit, 111, "a key the project omits falls through to the agent dir");
+		assert.equal(merged.trap, "none", "and a key it sets is taken from it");
+
+		// The settings are a file of this extension's own, not a key inside pi's settings.json.
 		writeFileSync(
 			join(root, ".pi", "settings.json"),
-			JSON.stringify({ summary: { model: "project/model" } }),
+			JSON.stringify({ summary: { model: "pi-settings/model" } }),
 		);
-		assert.deepEqual(readSummarySettings(root), { model: "project/model" }, "project wins");
+		assert.equal(readSettings(root).model, "project/model", "pi's settings.json is not consulted");
 	} finally {
 		if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
 		else process.env.PI_CODING_AGENT_DIR = previous;
@@ -282,29 +389,48 @@ await check("readSummarySettings reads the object form and prefers project over 
 	}
 });
 
-await check("readSummarySettings tolerates a bare string and junk values", async () => {
+await check("an unusable settings file falls back to the defaults rather than throwing", async () => {
+	// Every one of these is a file a user can produce by editing. None may fail a read, so
+	// each means "nothing configured at this scope" and the defaults decide.
 	const agent = mkdtempSync(join(tmpdir(), "pi-agent-"));
 	const root = tempProject();
 	const previous = process.env.PI_CODING_AGENT_DIR;
-	const write = (value) =>
-		writeFileSync(join(agent, "settings.json"), JSON.stringify({ summary: value }));
+	const defaults = { model: undefined, trap: DEFAULT_TRAP, trapLimit: DEFAULT_TRAP_LIMIT };
 	try {
 		process.env.PI_CODING_AGENT_DIR = agent;
+		mkdirSync(join(root, ".pi"), { recursive: true });
 
-		write("provider/model");
-		assert.deepEqual(readSummarySettings(root), { model: "provider/model" });
-
-		write({ model: "  spaced/model  " });
-		assert.deepEqual(readSummarySettings(root), { model: "spaced/model" }, "trimmed");
-
-		for (const junk of [null, 42, [], {}, { model: 7 }, { model: "" }, ""]) {
-			write(junk);
-			assert.deepEqual(readSummarySettings(root), {}, `junk ${JSON.stringify(junk)} ignored`);
+		for (const junk of ["{ not json", "[]", "\"a string\"", "null", "42"]) {
+			writeFileSync(join(agent, "pi-summary.json"), junk);
+			assert.deepEqual(readSettings(root), defaults, `junk file ${junk} ignored`);
 		}
 
-		// A corrupt settings file must not throw out of a summarization.
-		writeFileSync(join(agent, "settings.json"), "{ not json");
-		assert.deepEqual(readSummarySettings(root), {});
+		// A key of the wrong type is ignored on its own, so the rest of the file still applies.
+		for (const junk of [null, 42, [], {}, "", "   "]) {
+			writeSettings(agent, { model: junk });
+			assert.equal(readSettings(root).model, undefined, `junk model ${JSON.stringify(junk)} ignored`);
+		}
+		writeSettings(agent, { model: "  spaced/model  " });
+		assert.equal(readSettings(root).model, "spaced/model", "a model is trimmed");
+
+		for (const junk of ["off", "yes", "Normal", "", true, 1, null, ["none"]]) {
+			writeSettings(agent, { trap: junk });
+			assert.equal(readSettings(root).trap, DEFAULT_TRAP, `junk trap ${JSON.stringify(junk)} ignored`);
+		}
+		for (const trap of ["none", "normal", "always"]) {
+			writeSettings(agent, { trap });
+			assert.equal(readSettings(root).trap, trap);
+		}
+
+		// A limit is a count of lines. Anything that is not a positive whole number is a typo,
+		// and honouring it would mean either a trap that fires on every file or one that never
+		// can, which is what `trap` is for.
+		for (const junk of [0, -1, 1.5, "300", null, true, NaN, Infinity, []]) {
+			writeSettings(agent, { trap_limit: junk });
+			assert.equal(readSettings(root).trapLimit, DEFAULT_TRAP_LIMIT, `junk limit ${String(junk)} ignored`);
+		}
+		writeSettings(agent, { trap_limit: 49 });
+		assert.equal(readSettings(root).trapLimit, 49, "a limit below 50 is honoured, not clamped");
 	} finally {
 		if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
 		else process.env.PI_CODING_AGENT_DIR = previous;
@@ -362,16 +488,13 @@ await check("readImageAutoResize reads pi's own setting, project scope first", a
 	}
 });
 
-await check("the summary.model setting picks the summarizer, and model= overrides it", async () => {
+await check("the model setting picks the summarizer, and model= overrides it", async () => {
 	const agent = mkdtempSync(join(tmpdir(), "pi-agent-"));
 	const root = tempProject();
 	const previous = process.env.PI_CODING_AGENT_DIR;
 	try {
 		process.env.PI_CODING_AGENT_DIR = agent;
-		writeFileSync(
-			join(agent, "settings.json"),
-			JSON.stringify({ summary: { model: "test/test-model" } }),
-		);
+		writeSettings(agent, { model: "test/test-model" });
 		writeFileSync(join(root, "src", "a.ts"), numbered(10));
 		const h = makeHarness({ cwd: root });
 
@@ -382,10 +505,7 @@ await check("the summary.model setting picks the summarizer, and model= override
 		// the setting exists to control what a summary costs, so spending the session model
 		// instead would defeat it while looking like it was honoured. The file is still
 		// readable, so the caller gets the file and the reason.
-		writeFileSync(
-			join(agent, "settings.json"),
-			JSON.stringify({ summary: { model: "nope/missing" } }),
-		);
+		writeSettings(agent, { model: "nope/missing" });
 		h.ctx.hasUI = true;
 		h.ctx.ui = { notify: (message, type) => h.notices.push({ message, type }) };
 
@@ -404,7 +524,7 @@ await check("the summary.model setting picks the summarizer, and model= override
 
 		// Only an absent setting means the session model. That is the documented default, not
 		// a fallback, so it is not announced.
-		writeFileSync(join(agent, "settings.json"), JSON.stringify({}));
+		writeFileSync(join(agent, "pi-summary.json"), JSON.stringify({}));
 		const unset = await runTool(h, "summary", { path: "src/a.ts", refresh: true });
 		assert.equal(unset.details.model, "test/test-model", "the session model is the default");
 		assert.equal(h.notices.length, 2, "the default needs no announcement");
@@ -1163,6 +1283,288 @@ await check("the guard refuses a read longer than it returns", async () => {
 		assert.match(reason, /longer than 200 lines/);
 		assert.match(reason, /at most 200 lines per call/);
 		assert.match(reason, /## map/, "the map is the answer, not just a refusal");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+await check("with no settings file the trap behaves exactly as it did before there was one", async () => {
+	// The whole point of adding the settings file is that an install which never writes one is
+	// unaffected. This case is the one that would fail if a default drifted: the map is still
+	// served, the limit is still 200, and a bounded read still passes through. The text below is
+	// pinned byte for byte because that text is prompt surface - an install with no settings gets
+	// the same words as before, and "7 reads" in place of "seven reads" would be the same claim
+	// and a different prompt.
+	const root = tempProject();
+	try {
+		writeFileSync(join(root, "src", "a.ts"), numbered(400));
+		writeFileSync(join(root, "src", "small.ts"), numbered(150));
+		const h = makeHarness({ cwd: root });
+
+		const map = await readMap(h, { path: "src/a.ts" });
+		assert.ok(
+			map.startsWith(
+				"# this file: longer than 200 lines; this is the file's map, not its contents.\n" +
+					"# read one of the ranges below with offset/limit, at most 200 lines per call.\n",
+			),
+			`the default banner is unchanged, got: ${map.slice(0, 200)}`,
+		);
+		assert.equal(await readMap(h, { path: "src/small.ts" }), undefined, "150 lines is still a read");
+		assert.equal(await readMap(h, { path: "src/a.ts", limit: 200 }), undefined);
+
+		// And the summary the model reads quotes the same number, so the two agree on an
+		// unconfigured install exactly as they did before the setting existed.
+		const summary = await runTool(h, "summary", { path: "src/a.ts" });
+		assert.match(
+			summary.content[0].text,
+			/# read .* \(max 200 lines per call\)\.$/,
+			"the closing hint still names 200",
+		);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+await check("trap: none turns the guard off, and reads cost nothing", async () => {
+	const root = tempProject();
+	try {
+		writeFileSync(join(root, "src", "a.ts"), numbered(4000));
+		writeSettings(join(root, ".pi"), { trap: "none" });
+		const h = makeHarness({ cwd: root });
+
+		const result = await runRead(h, { path: "src/a.ts" });
+		const text = result.content.map((c) => c.text).join("");
+		assert.doesNotMatch(text, MAP_BANNER, "the file's own lines come back instead of a map");
+		assert.match(text, /line 1\b/);
+		assert.equal(h.calls.length, 0, "and no summarization was paid for");
+
+		// `summary` itself is not the trap: the tool the model asks for by name still works.
+		const direct = await runTool(h, "summary", { path: "src/a.ts" });
+		assert.equal(direct.details.status, "miss", "the summary tool is unaffected by the trap");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+await check("trap: always intercepts a read another tool issued", async () => {
+	// `normal` passes a nested read through, because a script processes contents. `always`
+	// overrides that, and the case is written as the same read under both modes so the setting
+	// is the only difference between them.
+	const root = tempProject();
+	try {
+		writeFileSync(join(root, "src", "big.ts"), numbered(400));
+		const h = makeHarness({ cwd: root });
+		const read = h.tools.get("read");
+		const nestedRead = (toolCallId, parentToolCallId) => {
+			for (const { event, handler } of h.handlers) {
+				if (event !== "tool_call") continue;
+				handler({
+					type: "tool_call",
+					toolName: "read",
+					toolCallId,
+					parentToolCallId,
+					input: { path: "src/big.ts" },
+				});
+			}
+			return read.execute(toolCallId, { path: "src/big.ts" }, undefined, undefined, h.ctx);
+		};
+
+		const normal = await nestedRead("call-1/1", "call-1");
+		assert.doesNotMatch(
+			normal.content[0].text,
+			MAP_BANNER,
+			"under normal a script's read is answered with the file",
+		);
+
+		writeSettings(join(root, ".pi"), { trap: "always" });
+		const always = await nestedRead("call-2/1", "call-2");
+		assert.match(always.content[0].text, MAP_BANNER, "under always it is answered with the map");
+		assert.equal(h.calls.length, 1, "and the map was paid for once");
+
+		// The id is consumed whichever way the decision went, so the next unannounced read is
+		// the model's own and is guarded as usual.
+		assert.match(await readMap(h, { path: "src/big.ts" }), MAP_BANNER);
+		assert.equal(h.calls.length, 1, "from the cache that was just written");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+await check("trap_limit moves the size at which a read becomes a map", async () => {
+	const root = tempProject();
+	try {
+		// 150 lines: a read under the default limit, a map under a limit of 50.
+		writeFileSync(join(root, "src", "mid.ts"), numbered(150));
+		const h = makeHarness({ cwd: root });
+		assert.equal(await readMap(h, { path: "src/mid.ts" }), undefined, "200 leaves it a read");
+
+		writeSettings(join(root, ".pi"), { trap_limit: 50 });
+		const text = await readMapAt(h, { path: "src/mid.ts" }, 50);
+		assert.match(text, /longer than 50 lines/, "the banner quotes the configured limit");
+		assert.match(text, /at most 50 lines per call/);
+		assert.doesNotMatch(text, /200/, "and never the one the build shipped with");
+		assert.match(text, /## map/);
+
+		// At the limit is still a read, one over it is not - the boundary moves with the setting.
+		assert.equal(await readMapAt(h, { path: "src/mid.ts", limit: 50 }, 50), undefined);
+		assert.match(
+			await readMapAt(h, { path: "src/mid.ts", limit: 51 }, 50),
+			/longer than 50 lines/,
+		);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+await check("a trap_limit above the file's size leaves it a read", async () => {
+	const root = tempProject();
+	try {
+		writeFileSync(join(root, "src", "a.ts"), numbered(400));
+		writeSettings(join(root, ".pi"), { trap_limit: 1000 });
+		const h = makeHarness({ cwd: root });
+
+		assert.equal(await readMapAt(h, { path: "src/a.ts" }, 1000), undefined);
+		assert.equal(h.calls.length, 0, "and nothing was summarized to answer it");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+await check("the summary tool quotes the configuration it was loaded with", async () => {
+	// pi takes a description once, when the tool is registered, so it can only ever quote the
+	// settings in force then. What it must not do is quote a *different* number than the trap
+	// enforces: a model told 200 while every read of 50 lines is diverted has been misled by
+	// the tool that exists to keep it out of files. The wiring from the settings file to that
+	// number is index.ts's, and this is the contract it has to satisfy.
+	const registered = new Map();
+	const register = (settings) => {
+		registerSummaryTool({ registerTool: (def) => registered.set(def.name, def) }, settings);
+		return registered.get("summary").description;
+	};
+
+	const at50 = register({ model: undefined, trap: "normal", trapLimit: 50 });
+	assert.match(at50, /at most 50 lines per call/);
+	assert.match(at50, /costs 28 reads or one summary/, "the example follows the limit");
+	assert.doesNotMatch(at50, /\b200\b/);
+
+	// A description is read by a model that then decides whether to spend a call, so the trap
+	// mode has to reach it too: with the trap off, no read is ever diverted and promising the
+	// map as a way to avoid oversized reads would sell summaries of files the model could read
+	// whole. The limit is meaningless there and must not be asserted at all.
+	const off = register({ model: undefined, trap: "none", trapLimit: 50 });
+	assert.doesNotMatch(off, /at most 50 lines per call/);
+	assert.doesNotMatch(off, /\b200\b/);
+	assert.match(off, /returns whole files/);
+
+	// The default description is the documented one, unchanged by the setting existing. Spelled
+	// out byte for byte, because "seven reads" and "7 reads" are the same claim and different
+	// prompts: this is the only case in the suite that would catch that drift.
+	const atDefault = register({
+		model: undefined,
+		trap: DEFAULT_TRAP,
+		trapLimit: DEFAULT_TRAP_LIMIT,
+	});
+	assert.equal(
+		atDefault,
+		"Map a code file's line ranges without reading it. Returns what the file does plus every range that holds what. Call it before reading a source file you have not seen, then read one range instead of the whole file. `read` returns at most 200 lines per call, so a 1400-line file costs seven reads or one summary plus one read. The first call on a file runs a model; later calls on the same unchanged file are free from cache.",
+		"the unconfigured description is exactly the one that shipped",
+	);
+
+	// The description is what the extension loaded with; the result text is what the call's own
+	// settings say, so a project switched mid-session is answered with the number it is held to.
+	const root = tempProject();
+	try {
+		writeFileSync(join(root, "src", "a.ts"), numbered(400));
+		writeSettings(join(root, ".pi"), { trap_limit: 50 });
+		const h = makeHarness({ cwd: root });
+
+		const result = await runTool(h, "summary", { path: "src/a.ts" });
+		assert.match(result.content[0].text, /max 50 lines per call/);
+		assert.doesNotMatch(result.content[0].text, /\b200\b/);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+await check("the extension itself wires the settings into the summary tool", async () => {
+	// The case above proves the description is right for the settings it is handed. This one
+	// proves the extension hands it the right ones - a wrong key, a wrong scope or a hardcoded
+	// value in index.ts would pass every other case in this file.
+	const root = tempProject();
+	const cwd = process.cwd();
+	try {
+		writeSettings(join(root, ".pi"), { trap_limit: 77 });
+		process.chdir(root);
+		const registered = new Map();
+		extensionFactory({ registerTool: (def) => registered.set(def.name, def), on: () => {} });
+
+		assert.match(
+			registered.get("summary").description,
+			/at most 77 lines per call/,
+			"the description quotes the project's own settings file",
+		);
+
+		// And a project that sets nothing gets the number that shipped.
+		rmSync(join(root, ".pi"), { recursive: true, force: true });
+		registered.clear();
+		extensionFactory({ registerTool: (def) => registered.set(def.name, def), on: () => {} });
+		assert.match(registered.get("summary").description, /at most 200 lines per call/);
+	} finally {
+		process.chdir(cwd);
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+await check("a settings path that cannot be resolved falls back to the defaults", async () => {
+	// `readSettings` is called from inside a read and from the middle of a summarize, so a
+	// settings problem must degrade to the defaults rather than turn a read that would have
+	// succeeded into an error. The paths behind it walk the filesystem and read the
+	// environment, so both are exercised here rather than assumed safe.
+	const root = tempProject();
+	try {
+		writeFileSync(join(root, "src", "a.ts"), numbered(10));
+		assert.deepEqual(readSettings(root), {
+			model: undefined,
+			trap: DEFAULT_TRAP,
+			trapLimit: DEFAULT_TRAP_LIMIT,
+		});
+
+		// An agent dir that cannot name a directory: the global scope yields nothing and the
+		// project's own file still applies - so a broken global scope cannot take a project's
+		// settings with it.
+		const previous = process.env.PI_CODING_AGENT_DIR;
+		try {
+			process.env.PI_CODING_AGENT_DIR = "\0not-a-directory";
+			assert.equal(readSettings(root).trapLimit, DEFAULT_TRAP_LIMIT);
+
+			writeSettings(join(root, ".pi"), { trap_limit: 33 });
+			assert.equal(readSettings(root).trapLimit, 33, "the project's setting survives");
+		} finally {
+			if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = previous;
+		}
+
+		// And a read still succeeds while that is going on.
+		const h = makeHarness({ cwd: root });
+		const result = await runRead(h, { path: "src/a.ts" });
+		assert.match(result.content[0].text, /line 1\b/);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+await check("a malformed settings file leaves the defaults in force", async () => {
+	// Either the file parses and its values apply, or the defaults do - never half of each.
+	// The property that matters is that a read still succeeds rather than being refused over a
+	// stray comma in a config file.
+	const root = tempProject();
+	try {
+		writeFileSync(join(root, "src", "a.ts"), numbered(400));
+		mkdirSync(join(root, ".pi"), { recursive: true });
+		writeFileSync(join(root, ".pi", "pi-summary.json"), "{ trap: none, }");
+		const h = makeHarness({ cwd: root });
+
+		assert.match(await readMap(h, { path: "src/a.ts" }), /longer than 200 lines/);
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
@@ -2412,6 +2814,232 @@ await check("an image read gets pi's own images.autoResize setting", async () =>
 		rmSync(agent, { recursive: true, force: true });
 	}
 });
+
+// ------------------------------------------------------------------ real model
+
+/**
+ * The model the end-to-end cases summarize with, and the only one they may use.
+ *
+ * The fake harness above proves the wiring; it cannot prove that a real model returns
+ * something this extension accepts, or that a configured model is the one actually billed.
+ * These cases close that gap, and they are the reason the suite has a flag at all: they
+ * spend real tokens against a real provider.
+ */
+const LLM_MODEL = "routerai/deepseek/deepseek-v4.1-flash";
+
+/**
+ * Run the end-to-end cases only when asked, because they cost money and need credentials.
+ *
+ * `node smoke.mjs --llm`. Without the flag the suite stays hermetic, which is what
+ * `npm run check` must be: a gate that cannot pass on a machine with no API key is not a gate.
+ */
+const runLlm = process.argv.includes("--llm");
+
+if (runLlm) {
+	// The real provider catalogue is registered by the developer's own install, so the isolated
+	// `<agentDir>` is put aside for exactly as long as it takes to build the services. Settings
+	// are then read from the isolated dir again, which keeps these cases independent of whatever
+	// `pi-summary.json` the developer has and does not weaken the assertions below: every value
+	// under test is written into the temp project's own `.pi`.
+	const { ModelRegistry, createAgentSessionServices, getAgentDir } = await import(
+		"@earendil-works/pi-coding-agent"
+	);
+	const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+	let services;
+	try {
+		delete process.env.PI_CODING_AGENT_DIR;
+		services = await createAgentSessionServices({
+			cwd: tempProject(),
+			agentDir: getAgentDir(),
+		});
+	} finally {
+		process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+	}
+
+	// The extension talks to a `ModelRegistry` - `find`, `hasConfiguredAuth`, `complete` - and
+	// the services hand back the `ModelRuntime` underneath it, so the facade is rebuilt here.
+	// That is exactly what a session does, which is why the end-to-end cases are a session's
+	// path rather than the fake harness's.
+	const registry = new ModelRegistry(services.modelRuntime);
+	const llmModel = registry.find("routerai", "deepseek/deepseek-v4.1-flash");
+	if (!llmModel) {
+		console.log(`\nSKIP real-model cases: ${LLM_MODEL} is not in the model catalogue`);
+	}
+
+	/**
+	 * A harness wired to the real registry: every completion reaches the provider.
+	 *
+	 * The registry is wrapped rather than replaced so the extension calls exactly what it would
+	 * in a session - auth resolution, provider composition and all - while the cases still get
+	 * to see which model each call named. That is the only way to tell "the setting was honoured"
+	 * from "the request happened to look the same".
+	 */
+	function makeLlmHarness(options = {}) {
+		const tools = new Map();
+		const handlers = [];
+		const calls = [];
+		const registryWithCalls = new Proxy(registry, {
+			get(target, property, receiver) {
+				if (property === "complete") {
+					return async (model, context, opts) => {
+						calls.push({ model, context, opts });
+						return target.complete(model, context, opts);
+					};
+				}
+				const value = Reflect.get(target, property, receiver);
+				return typeof value === "function" ? value.bind(target) : value;
+			},
+		});
+
+		extensionFactory({ registerTool: (def) => tools.set(def.name, def), on: (e, h) => handlers.push({ event: e, handler: h }) });
+
+		const ctx = {
+			cwd: options.cwd,
+			mode: "json",
+			hasUI: false,
+			model: llmModel,
+			modelRegistry: registryWithCalls,
+		};
+		return { tools, handlers, calls, ctx };
+	}
+
+	await check("the real summarizer maps a real file", async () => {
+		if (!llmModel) return;
+		const root = tempProject();
+		try {
+			// Real code, not "line N": the point is to see what a real model does with the prompt
+			// against a file it has no fixture-shaped answers for.
+			writeFileSync(join(root, "src", "client.ts"), realClientSource(360));
+			const h = makeLlmHarness({ cwd: root });
+
+			const result = await runTool(h, "summary", { path: "src/client.ts" });
+			assert.equal(result.details.status, "miss");
+			// Not "exactly one attempt": whether the first answer validates is the model's business,
+			// and it is not stable run to run. What the extension guarantees is the budget - at most
+			// MAX_ATTEMPTS calls - and that a usable map came back within it.
+			assert.ok(result.details.attempts >= 1, "at least one call was made");
+			assert.ok(
+				result.details.attempts <= MAX_ATTEMPTS,
+				`${MAX_ATTEMPTS} attempts at most, took ${result.details.attempts}`,
+			);
+			assert.equal(result.details.degraded, false, "and it mapped the file rather than degrading");
+			assert.ok(result.details.sections > 0, "there is a map to read");
+			assert.match(result.content[0].text, /## map/);
+			assert.equal(result.details.model, LLM_MODEL, "the model that ran is the one named");
+
+			// Every stored row has to be inside the file, or the map sends the model past the end.
+			// The bounds come from the result rather than the fixture, so the assertion is about
+			// the map and not about how this fixture happens to count lines.
+			assert.ok(
+				Value.Check(summaryOutputSchema, result.structuredContent),
+				"the real answer matches the output schema a script receives",
+			);
+			const sections = result.structuredContent.sections;
+			const total = result.structuredContent.lines;
+			assert.ok(sections.length > 0);
+			for (const s of sections) {
+				assert.ok(s.startLine >= 1, `row ${s.name} starts at ${s.startLine}`);
+				assert.ok(s.endLine <= total, `row ${s.name} ends at ${s.endLine}, file is ${total}`);
+				assert.ok(s.startLine <= s.endLine, `row ${s.name} is not reversed`);
+			}
+			// Rows are stored in line order and never overlap, which is what makes the rendered
+			// map readable as a sequence of regions rather than a pile of claims.
+			for (let i = 1; i < sections.length; i++) {
+				assert.ok(
+					sections[i].startLine > sections[i - 1].endLine,
+					`row ${i} starts after row ${i - 1} ends`,
+				);
+			}
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	await check("the real guard serves a real map and reads it back through the limit", async () => {
+		if (!llmModel) return;
+		const root = tempProject();
+		try {
+			writeFileSync(join(root, "src", "client.ts"), realClientSource(360));
+			writeSettings(join(root, ".pi"), { model: LLM_MODEL, trap_limit: 50 });
+			const h = makeLlmHarness({ cwd: root });
+
+			// A real end-to-end interception at a non-default limit: the guard pays for one real
+			// summarization and answers with the map.
+			const text = await readMapAt(h, { path: "src/client.ts" }, 50);
+			assert.match(text, /longer than 50 lines/);
+			assert.match(text, /## map/);
+			// The count is whatever the model needed within the budget, so the cache assertions below
+			// measure against what it actually spent rather than against a number a repair changes.
+			assert.ok(h.calls.length >= 1, "the oversized read paid for a real summarization");
+			assert.ok(h.calls.length <= MAX_ATTEMPTS, `within the budget, took ${h.calls.length}`);
+			assert.equal(h.calls[0].model.id, "deepseek/deepseek-v4.1-flash", "the configured model ran");
+
+			// The next read is the cache, so the same map costs nothing.
+			const spent = h.calls.length;
+			assert.match(await readMapAt(h, { path: "src/client.ts" }, 50), /## map/);
+			assert.equal(h.calls.length, spent, "the second read is served from cache");
+
+			// And a read inside the limit the same settings set is left alone, still at no cost.
+			assert.equal(await readMapAt(h, { path: "src/client.ts", limit: 50 }, 50), undefined);
+			assert.equal(h.calls.length, spent);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	await check("an absent model setting summarizes with the session's own model", async () => {
+		if (!llmModel) return;
+		const root = tempProject();
+		try {
+			writeFileSync(join(root, "src", "client.ts"), realClientSource(80));
+			const h = makeLlmHarness({ cwd: root });
+
+			// No settings file at all: the documented default is the model the session is using,
+			// which is the one this harness hands the context.
+			assert.equal(readSettings(root).model, undefined);
+			const result = await runTool(h, "summary", { path: "src/client.ts" });
+			assert.equal(result.details.model, LLM_MODEL, "the session model was used");
+			assert.ok(h.calls.length >= 1, "and it was really called");
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	await check("trap: none spends nothing, even on a real oversized read", async () => {
+		if (!llmModel) return;
+		const root = tempProject();
+		try {
+			writeFileSync(join(root, "src", "client.ts"), realClientSource(360));
+			writeSettings(join(root, ".pi"), { trap: "none" });
+			const h = makeLlmHarness({ cwd: root });
+
+			const result = await runRead(h, { path: "src/client.ts" });
+			const text = result.content.map((c) => c.text).join("");
+			assert.doesNotMatch(text, /longer than/);
+			assert.equal(h.calls.length, 0, "the trap being off costs no model call at all");
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	await check("an unusable model setting is reported, not silently substituted", async () => {
+		if (!llmModel) return;
+		const root = tempProject();
+		try {
+			writeFileSync(join(root, "src", "client.ts"), realClientSource(80));
+			writeSettings(join(root, ".pi"), { model: "routerai/definitely-not-a-model" });
+			const h = makeLlmHarness({ cwd: root });
+
+			const result = await runTool(h, "summary", { path: "src/client.ts" });
+			assert.equal(result.details.status, "failed");
+			assert.match(result.content[0].text, /definitely-not-a-model/);
+			assert.match(result.content[0].text, /names no known model/);
+			assert.equal(h.calls.length, 0, "and nothing was billed to a model nobody chose");
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+}
 
 console.log(`\n${passed} passed, ${failures} failed`);
 rmSync(isolatedAgentDir, { recursive: true, force: true });

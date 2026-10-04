@@ -1,7 +1,7 @@
 {
   "name": "pi-summary",
   "version": "0.1.0",
-  "description": "Pi Coding Agent extension — summarizes a file once with a model, caches the result in local SQLite, and answers any `read` of more than 200 lines with that file's map instead of the whole file.",
+  "description": "Pi Coding Agent extension — summarizes a file once with a model, caches the result in local SQLite, and answers any `read` of more than `trap_limit` lines with that file's map instead of the whole file.",
   "keywords": [
     "pi-package",
     "pi-extension",
@@ -26,7 +26,8 @@
   "scripts": {
     "check": "tsc --noEmit && node smoke.mjs",
     "typecheck": "tsc --noEmit",
-    "test": "node smoke.mjs"
+    "test": "node smoke.mjs",
+    "test:llm": "node smoke.mjs --llm"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",

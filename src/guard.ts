@@ -10,15 +10,18 @@ import { notifyUser } from "./error.ts";
 import { failureNotice } from "./fallback.ts";
 import { countLinesFrom, looksBinary } from "./hash.ts";
 import { isRegularFile, isUnguardedPath, resolveFilePath } from "./paths.ts";
-import { READ_LINE_LIMIT, renderSummary } from "./render.ts";
-import { readImageAutoResize } from "./settings.ts";
+import { renderSummary, type LineLimit } from "./render.ts";
+import { readImageAutoResize, readSettings } from "./settings.ts";
 import { summarizeFile, type SummarizeOutcome } from "./summarize.ts";
 
 /**
  * A read either returns the lines it asked for, or it returns the file's map. Nothing else.
  *
- * A span of `READ_LINE_LIMIT` lines or fewer is left alone and returns exactly what was read.
+ * A span of at most `trap_limit` lines is left alone and returns exactly what was read.
  * A span of more than that is answered with the map instead, and the read itself never runs.
+ * Both the limit and whether the trap runs at all come from the extension's settings file;
+ * `trap` decides the audience - `none` answers every read, `normal` (the default) only the
+ * model's own, `always` every read including one another tool issued.
  *
  * This is registered as a `read` tool, replacing the built-in one, rather than as a `tool_call`
  * handler that blocks. Blocking cannot express this answer: pi hardcodes `isError: true` for a
@@ -54,9 +57,12 @@ import { summarizeFile, type SummarizeOutcome } from "./summarize.ts";
  * not knowing which range holds a symbol costs a wasted call.
  *
  * A read another tool issued — a codemode script, anything calling `ctx.executeTool()` — is
- * never intercepted. A programmatic caller processes contents, and a map in place of
- * the file silently corrupts its work. The parent id rides only on the `tool_call` event,
- * never on `execute()`'s arguments, so that event is what remembers it.
+ * never intercepted under the default `normal` trap. A programmatic caller processes
+ * contents, and a map in place of the file silently corrupts its work. The parent id rides
+ * only on the `tool_call` event, never on `execute()`'s arguments, so that event is what
+ * remembers it. `always` overrides that: it is the mode for a caller who has decided the
+ * context is worth more than a script's assumptions, and it is opt-in for exactly that
+ * reason.
  */
 export function registerReadTool(pi: ExtensionAPI): void {
 	// Ids of reads issued by another tool, recorded by the `tool_call` hook — the one place
@@ -65,24 +71,39 @@ export function registerReadTool(pi: ExtensionAPI): void {
 	// it matches, so only ids in flight sit here. A call that never reaches `execute` —
 	// blocked, or failing validation in between — leaves its id behind, which the cap bounds:
 	// nested ids embed their caller's id, so a stale entry can never match a model-issued
-	// read, and clearing the set only ever drops entries whose window has already closed.
+	// read, and evicting the oldest only ever drops entries that arrived first.
 	const nestedReads = new Set<string>();
 	pi.on("tool_call", (event) => {
 		if (event.toolName !== "read" || !event.parentToolCallId) return;
-		if (nestedReads.size >= 1024) nestedReads.clear();
+		// Evict oldest-first rather than clearing, so an id still in flight is never dropped:
+		// a dropped id makes a script's read look like the model's own, and under the default
+		// trap that is a map handed to a caller that processes contents.
+		if (nestedReads.size >= 1024) {
+			const oldest = nestedReads.values().next();
+			if (!oldest.done) nestedReads.delete(oldest.value);
+		}
 		nestedReads.add(event.toolCallId);
 	});
 
 	pi.registerTool({
 		...createReadToolDefinition(process.cwd()),
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
-			// Answered as asked: no probes, no summarizing, no model call — a script reading a
-			// 5000-line file pays exactly what a read of it costs.
-			if (nestedReads.delete(toolCallId)) {
+			// Consumed first, before anything that can fail. The id is what tells a nested read
+			// from the model's own, so leaving one behind - because a later step threw - would
+			// misclassify that call for the rest of the session. Arithmetic on a Set, so this
+			// cannot fail on its own.
+			const nested = nestedReads.delete(toolCallId);
+			const settings = readSettings(ctx.cwd);
+
+			// `none` means the trap is off: the call is handed over before anything is stat'ed,
+			// opened or counted, so an install that has turned it off pays nothing to have the
+			// tool registered. The settings themselves are still read - a mode is only knowable
+			// by reading it - but nothing else is.
+			if (settings.trap === "none" || (nested && settings.trap !== "always")) {
 				return delegate(toolCallId, params, signal, onUpdate, ctx);
 			}
 
-			const decision = await decide(ctx, params);
+			const decision = await decide(ctx, params, settings.trapLimit);
 
 			if (decision.kind === "map") {
 				// The model asked for lines and got a map, but nothing it returns says so to the
@@ -93,7 +114,7 @@ export function registerReadTool(pi: ExtensionAPI): void {
 				// free of newlines because it renders as a toast.
 				notifyUser(
 					ctx,
-					`Read of ${params.path} intercepted and replaced with the file's summary (over ${READ_LINE_LIMIT} lines).`,
+					`Read of ${params.path} intercepted and replaced with the file's summary (over ${settings.trapLimit} lines).`,
 					"info",
 				);
 				// A clean read of the built-in reports `details: undefined`, so the shape of a
@@ -115,6 +136,9 @@ export function registerReadTool(pi: ExtensionAPI): void {
 
 /**
  * Run the built-in read, on the built-in's own terms.
+ *
+ * Also the path every read takes when the trap is off, which is why it takes the tool call's
+ * own id and arguments rather than reaching for anything the trap computed.
  *
  * The definition is built fresh per call rather than once: the session may have been replaced
  * or the project switched since this tool was registered, and `autoResizeImages` comes from
@@ -176,7 +200,11 @@ type Decision =
  * Everything here can fail on a file that is being rewritten underneath us, and a `read` must
  * not fail because the *guard* failed to look at it, so the probes are inside one try/catch.
  */
-async function decide(ctx: ExtensionContext, params: ReadInput): Promise<Decision> {
+async function decide(
+	ctx: ExtensionContext,
+	params: ReadInput,
+	trapLimit: LineLimit,
+): Promise<Decision> {
 	const absPath = resolveFilePath(params.path, ctx.cwd);
 	if (isUnguardedPath(absPath)) return { kind: "read" };
 
@@ -214,7 +242,7 @@ async function decide(ctx: ExtensionContext, params: ReadInput): Promise<Decisio
 
 	let remaining: number;
 	try {
-		remaining = await countLinesFrom(absPath, offset, READ_LINE_LIMIT);
+		remaining = await countLinesFrom(absPath, offset, trapLimit);
 	} catch {
 		return { kind: "read" }; // unreadable now: let the built-in read report it
 	}
@@ -223,9 +251,9 @@ async function decide(ctx: ExtensionContext, params: ReadInput): Promise<Decisio
 	// With an explicit limit the call is already bounded; otherwise the whole tail counts
 	// as the span the model is asking for, which is exactly the unbounded read to answer.
 	const span = limit === undefined ? remaining : Math.min(remaining, limit);
-	if (span <= READ_LINE_LIMIT) return { kind: "read" };
+	if (span <= trapLimit) return { kind: "read" };
 
-	const summarized = await ensureSummary(ctx, absPath);
+	const summarized = await ensureSummary(ctx, absPath, trapLimit);
 
 	// No summary, so answering with a map would leave the model with nothing. Let the read
 	// run and say why.
@@ -235,7 +263,7 @@ async function decide(ctx: ExtensionContext, params: ReadInput): Promise<Decisio
 		return { kind: "notice", notice };
 	}
 
-	return { kind: "map", text: renderMapAnswer(offset, summarized.text) };
+	return { kind: "map", text: renderMapAnswer(offset, summarized.text, trapLimit) };
 }
 
 /**
@@ -243,11 +271,11 @@ async function decide(ctx: ExtensionContext, params: ReadInput): Promise<Decisio
  *
  * The map is rendered with its header, so the model still sees the file's size and hash.
  */
-function renderMapAnswer(offset: number, map: string): string {
+function renderMapAnswer(offset: number, map: string, trapLimit: LineLimit): string {
 	const where = offset === 1 ? "this file" : `lines ${offset} onward`;
 	const banner = [
-		`# ${where}: longer than ${READ_LINE_LIMIT} lines; this is the file's map, not its contents.`,
-		`# read one of the ranges below with offset/limit, at most ${READ_LINE_LIMIT} lines per call.`,
+		`# ${where}: longer than ${trapLimit} lines; this is the file's map, not its contents.`,
+		`# read one of the ranges below with offset/limit, at most ${trapLimit} lines per call.`,
 		"",
 	];
 	return [...banner, map].join("\n");
@@ -263,10 +291,14 @@ type Summarized = { ok: true; text: string } | { ok: false; error: unknown };
  * falls through to generating a summary, and a failure to generate is returned so the caller
  * can notify and let the read through.
  */
-async function ensureSummary(ctx: ExtensionContext, absPath: string): Promise<Summarized> {
+async function ensureSummary(
+	ctx: ExtensionContext,
+	absPath: string,
+	trapLimit: LineLimit,
+): Promise<Summarized> {
 	try {
 		const peek = await peekFreshSummary(ctx, absPath);
-		if (peek) return { ok: true, text: renderSummary(peek.entry) };
+		if (peek) return { ok: true, text: renderSummary(peek.entry, trapLimit) };
 	} catch {
 		// Fall through to generating one; an unreadable cache is not fatal.
 	}
@@ -277,5 +309,5 @@ async function ensureSummary(ctx: ExtensionContext, absPath: string): Promise<Su
 	} catch (error) {
 		return { ok: false, error };
 	}
-	return { ok: true, text: renderSummary(outcome.entry) };
+	return { ok: true, text: renderSummary(outcome.entry, trapLimit) };
 }
