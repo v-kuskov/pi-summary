@@ -13,10 +13,12 @@ npm install
 npm run check      # tsc --noEmit && node smoke.mjs — the gate; run it before finishing
 npm run typecheck  # tsc --noEmit
 npm test           # node smoke.mjs
+npm run test:llm   # node smoke.mjs --llm — also calls a real model; needs credentials
 ```
 
 `npm run check` is the only command that must pass. It typechecks the whole project and runs
-the smoke suite.
+the smoke suite. `npm run test:llm` adds the end-to-end cases, which spend real tokens against
+`routerai/deepseek/deepseek-v4.1-flash`; without `--llm` the suite is hermetic.
 
 ## Architecture
 
@@ -24,15 +26,25 @@ the smoke suite.
 
 - `src/tools.ts` — the `summary` tool (one model call per file, at most three), with an
   `outputSchema` whose `structuredContent` is the summary alone.
-- `src/guard.ts` — replaces the built-in `read`; a read issued by another tool passes
-  through untouched, and `decide()` is the single place that decides whether a remaining
-  span is answered with the map or passed through.
+- `src/guard.ts` — replaces the built-in `read`; `trap` decides whether it intercepts at all
+  and whose reads it claims, a read issued by another tool passes through under `normal`, and
+  `decide()` is the single place that decides whether a remaining span is answered with the map
+  or passed through.
 - `src/locator.ts` — appends the changed line numbers to a successful `edit`.
 
 Support: `src/summarize.ts` (the model call, validation, repair loop), `src/prompt.ts`,
 `src/schema.ts` (typebox), `src/store.ts` + `src/cache.ts` (SQLite at
 `<projectRoot>/.pi/summaries.db`), `src/hash.ts` (sha256 freshness), `src/settings.ts`,
 `src/paths.ts`, `src/render.ts`, `src/tui.ts`, `src/fallback.ts`, `src/error.ts`.
+
+## Settings
+
+`pi-summary.json` in `<projectRoot>/.pi/` (project) and `<agentDir>/` (global), merged key by
+key with the project winning. Keys: `model`, `trap` (`none`|`normal`|`always`), `trap_limit`
+(lines). Defaults are the behaviour that shipped before the file existed — session model,
+`normal`, 200 — so an install with no settings file is unchanged. `src/settings.ts` resolves
+every default; nothing else may invent one. pi's own `images.autoResize` is read from pi's
+`settings.json`, because it is pi's setting and not ours.
 
 ## Invariants
 
@@ -49,6 +61,9 @@ reason where the change is made.
 - **The map is derived, not stored.** The database holds the overview and one row per
   region; the `## map` text is rendered from those rows, so prose and line numbers cannot
   drift apart. Gaps are legal; rows must not overlap.
+- **Settings only ever widen or narrow the trap.** No setting may change what a summary *is*,
+  and no default may differ from the behaviour that shipped before the file existed. A read
+  that was a read before is still a read; a map that was served before is still served.
 - **An intercepted read is a successful result.** The guard replaces `read` rather than
   blocking the call, because pi hardcodes an error for a blocked tool call. A failed
   summary lets the read through and reports why — it never withholds the file.
@@ -68,8 +83,10 @@ reason where the change is made.
   schema and renderers; reuse it rather than restating it.
 - `smoke.mjs` is the test suite: it drives the real tools against a temp project with a fake
   `ExtensionAPI` and `ModelRegistry`. Add cases there, under the existing section comments
-  (`units`, `summary tool`, `read guard`). It checks structure and schema, never the map's
-  content — that correctness lives in the prompt.
+  (`units`, `summary tool`, `read guard`, `real model`). It checks structure and schema,
+  never the map's content — that correctness lives in the prompt. Cases in the `real model`
+  section run only under `--llm` and are the one place a model other than the fake is used;
+  they must name `LLM_MODEL` and nothing else.
 
 ## Commits
 

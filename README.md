@@ -4,80 +4,31 @@ A pi extension that stops the agent from reading whole files it does not need.
 
 Two things, working together:
 
-- **`summary` tool** — normally one model call per file, at most three. Returns what the
-  file does and a map of which line ranges hold what. Cached in SQLite; asking again
-  returns the cached result without a model call until the file's contents change.
-- **`read` guard** — a replacement for the built-in `read` tool that answers any `read`
-  longer than 200 lines with the file's summary instead, so the model reads one of the map's
-  ranges rather than the whole file. A read of 200 lines or fewer is returned exactly as
-  asked. A file with no summary yet is summarized on the spot. Prose, notes and extensionless
-  files (`.md`, `.txt`, `Makefile`, `.gitignore`) are never touched — they read whole — and
-neither is a read issued by another tool, such as a codemode script.
+- **`summary`** — a tool that returns what a file does plus a map of which line ranges hold
+  what. The first call on a file runs a model; asking again returns the cached answer with no
+  model call until the file's contents change.
+- **The trap** — a replacement for the built-in `read` that answers a read longer than
+  `trap_limit` lines with the file's map instead, so the agent reads one region rather than the
+  whole file. Shorter reads are returned exactly as asked. A file with no summary yet is
+  summarized on the spot.
 
 ## Install
 
-As a pi package, from a checkout:
-
 ```bash
-pi install git:github.com/v-kuskov/pi-summary    # or npm:pi-summary once published
+pi install git:github.com/v-kuskov/pi-summary
+pi -e /path/to/pi-summary/index.ts   # or load a checkout directly
 ```
 
-The summarizer is a plain completion with **no tools**: it is asked for JSON, the answer is
-validated, and output that is not the agreed shape is sent back to the model with the
-specific violations, up to three attempts in total; an answer that never validates fails the
-call rather than being stored as prose. It never chooses its own next step and is never given
-a tool to call.
+## What the agent sees
 
-Or load a local checkout directly:
-
-```bash
-pi -e /path/to/pi-summary/index.ts
-```
-
-The extension declares its entry point in `package.json` under `pi.extensions`. It has no
-runtime dependencies: `typebox` is supplied by pi to every extension, and is declared as an
-optional peer so the manifest asks for nothing pi does not already provide.
-
-## What the model sees
-
-```
-summary path="src/foo.ts"
-```
+`summary path="src/foo.ts"` returns something like:
 
 ```
 # src/foo.ts  (1420 lines, 48.2KB, sha 9f2c1ab4)
 
 An HTTP client for the internal Orders API. Wraps node fetch with signed requests,
 retry with jitter, and a rate limiter shared per host. Exports FooClient and the
-RetryPolicy type. No top-level side effects. Signing reads process.env.SECRET fresh on
-
-every attempt, so a test that does not set it signs with an empty key.
-
-## map
-   1-  24  import   node/fs, node/path; module constants
-  26- 140  class    FooClient - HTTP transport with retry
- 141- 620  method   FooClient.request() - builds, signs, sends
- 621-1420  method   FooClient.retry() - backoff and jitter
-
-# read src/foo.ts with offset/limit inside one range (max 200 lines per call).
-```
-
-The call also returns `structuredContent` — `{path, lines, overview, sections}` for
-codemode scripts, which receive data instead of the rendered text; a call that fell back
-carries the whole file it fell back to. Cache state, the summarizer model and the attempt
-count are internal bookkeeping: they live in the result's `details`, and reach neither the
-model nor the display.
-
-A later `read path="src/foo.ts"` with no range is answered with the map instead of the
-file's lines, as a normal successful result:
-
-```
-# this file: longer than 200 lines; this is the file's map, not its contents.
-# read one of the ranges below with offset/limit, at most 200 lines per call.
-
-# src/foo.ts  (1420 lines, 48.2KB, sha 9f2c1ab4)
-
-An HTTP client for the internal Orders API. ...
+RetryPolicy type.
 
 ## map
    1-  24  import   node/fs, node/path; module constants
@@ -88,158 +39,59 @@ An HTTP client for the internal Orders API. ...
 # read src/foo.ts with offset/limit inside one range above (max 200 lines per call).
 ```
 
-`read path="src/foo.ts" offset=141 limit=200` passes through untouched.
+A later `read path="src/foo.ts"` with no range is answered with that map instead of 1420 lines
+of file, as an ordinary successful result. `read path="src/foo.ts" offset=141 limit=200` passes
+through untouched. Whenever a read is answered with a map the extension says so in a toast, so
+you can see the swap in the transcript.
 
-A `read` issued by *another tool* — a codemode script, anything calling `ctx.executeTool()` —
-is never intercepted, whatever its size: a script processes contents, and a map in place of
-the file would silently corrupt its work. Only the model's own reads are guarded, so a
-programmatic read of a 5000-line file costs exactly a read and nothing else.
+Prose, notes and extensionless files — `.md`, `.txt`, `Makefile`, `.gitignore` — are never
+touched. They are written to be read in order, and a map of a README says nothing a skim does.
 
-A `read` that already carries a small `limit` is never touched, so the guard does not
-fight a model that is reading properly. `read path="src/foo.ts" limit=2000` returns the
-map the same way a bare `read` does — the span that would come back is what counts, not
-whether `limit` was passed. Every intercepted read also raises a toast —
-`Read of src/foo.ts intercepted and replaced with the file's summary (over 200 lines).` —
-because the result is drawn as ordinary tool output and never says on its own that the
-lines you asked for were not the lines you got. A failed model call fails the `summary` tool
-outright, but on the read side it is only ever the failure reported: with no map to offer, a
-read that could not be summarized hands back the file itself.
+The `summary` tool also returns machine-readable structure for scripts, and it tells the agent
+where each `edit` landed, so an editing session does not have to read a file back to find out.
 
-Until the file is summarized, an oversized `read` costs model calls without you asking
-for them — the one place this extension spends unbounded-by-the-caller, capped at three
-calls per file and cached afterwards.
+## Settings
 
-## After an edit
-
-A successful `edit` gains one line the model would otherwise have no way to learn:
-
-```
-Successfully replaced 1 block(s) in src/foo.ts. Edited line 250; the file now has 253 lines.
-```
-
-When one call lands in several places, each run is named — `Edited lines 6, 40 and 251; the
-file now has 253 lines.` A span from the first run to the last would name the unchanged lines
-between them as edited, which is worse than saying nothing.
-
-pi computes the diff and the first changed line for every edit, but hands them to the TUI
-and the session transcript rather than to the model — `details` is a rendering channel, and
-no provider adapter reads it. So the model was told an edit succeeded and never told where it
-landed, and the only way to find out was to read the file back. When that file is past the
-read limit, every such read-back is intercepted by the guard and pays for a fresh summary:
-measured over one session of 49 edits, a 253-line file was read 25 times and 23 of those reads
-were ranged — cheap, but the whole-file ones are what pay.
-
-The locator answers that question directly, so the re-read has no reason to happen. It is
-appended rather than substituted — the confirmation and its block count are kept — and it is
-empty when it cannot be exact, since a wrong line number is worse than none. The count uses
-`read`'s own convention, so `offset` from it lands where the model expects.
-
-This is model-facing only. The TUI draws an edit result from the diff, so the transcript
-looks the same as it did before.
-
-## Cache
-
-`<projectRoot>/.pi/summaries.db`, where the project root is the nearest ancestor
-containing `.git`. SQLite via `node:sqlite` — no native dependency, Node 24+ only.
-
-Validity is content-addressed (`sha256`). Size is stored as a cheap pre-check: a size
-mismatch is conclusive, so it returns `stale` without reading the file, and the hash
-decides every other case. Nothing cheaper than the hash is trusted — no `mtime`, not even
-stored — because a same-length edit in the same millisecond, a `cp -p`, or a coarse-mtime
-volume all show an unchanged timestamp over changed content, which would serve a stale
-summary for a file you are about to edit. Delete the file to start over.
-
-The database stores the overview prose and one row per mapped region. The `## map` text
-is rendered from those rows on every read, so the prose and the line numbers cannot
-drift apart. If the summarizer returns no usable line map, the entry is stored as a
-**blob** — overview only, zero rows — and says so, rather than inventing a single region
-spanning the file.
-
-Rows may leave gaps: the summarizer is told to skip lines that do nothing, so a blank
-run, a license header, or generated boilerplate is deliberately unmapped rather than
-absorbed into a neighbour or covered by a region invented for the purpose. A gap is a jump
-in the numbers and nothing more — the map shows only what was mapped, so a blank run does
-not get a line of its own. Rows may not overlap — two notes cannot describe the same line.
-Overlaps are trimmed locally, so they never cost a retry.
-
-## Options
-
-| Argument  | Meaning                                                              |
-| --------- | -------------------------------------------------------------------- |
-| `path`    | File to summarize. Relative to cwd, or absolute.                     |
-| `model`   | Summarizer as `provider/model`. Overrides the setting and the session model. |
-| `refresh` | Re-summarize even if the cached summary is still fresh.               |
-
-The guard takes no options: 200 lines is the limit.
-
-## Configuration
-
-The summarizer defaults to the current session model. To pin a cheaper or faster one, add
-it to pi's settings file — project scope wins over global:
+Create `.pi/pi-summary.json` in a project, or `pi-summary.json` in pi's agent directory
+(`~/.pi/agent/`) to set a default everywhere. A project's file wins key by key.
 
 ```json
-{ "summary": { "model": "provider/model" } }
+{
+  "model": "provider/model",
+  "trap": "normal",
+  "trap_limit": 200
+}
 ```
 
-- Global: `<agentDir>/settings.json` (`~/.pi/agent/settings.json`)
-- Project: `<projectRoot>/.pi/settings.json`
+| Key | Values | Default | Meaning |
+| --- | --- | --- | --- |
+| `model` | `"provider/model"` | the current session model | Which model writes summaries. |
+| `trap` | `"none"`, `"normal"`, `"always"` | `"normal"` | Which reads may be answered with a map. |
+| `trap_limit` | lines, e.g. `50` | `200` | How long a read may be before it gets the map. |
 
-A bare string works too: `{ "summary": "provider/model" }`. A setting that is present but
-unusable — malformed, naming an unknown model, or naming one with no credentials — fails
-the summary and reports why, rather than quietly charging a different model. Only an absent
-setting means the session model.
+- **`model`** — absent means the model you are already using. A value that names no model you
+  have credentials for fails the summary and tells you why, rather than quietly billing a
+  different one.
+- **`trap`** — `none` turns the read replacement off entirely: every read is a real read, and
+  nothing is summarized behind your back. `normal`, the default, intercepts only the agent's own
+  reads. `always` also intercepts reads made *by* other tools, such as a codemode script — pick
+  it if you would rather a script saw a map than a 5000-line file.
+- **`trap_limit`** — lower it to spend less context and more `summary` calls; raise it to read
+  more of each file. Any whole number of 1 or more, including values below 50.
 
-## Deliberate non-goals
+## Notes
 
-- **No search across cached summaries.** Removed after being built. Answering "where is
-  X handled?" by scanning every cached file pushes toward summarizing the whole project,
-  which is unbounded model spend driven by a query string.
-- **No project-wide refresh.** Same reason.
-- **No shortened `read` input.** The guard replaces the `read` tool rather than rewriting
-  an oversized call into a bounded one, so what the model asked for is either answered or
-  answered with the map — never silently trimmed.
-
-  Replacing `read` rather than blocking the call is what makes the map a *successful*
-  result. pi hardcodes an error result for a blocked tool call, and skips the `tool_result`
-  hook for it, so a refusal could only ever reach the model as a failed call. Registering
-  under the same name and returning the map as content makes it what it is: an ordinary
-  answer. The built-in renderer, schema, description and prompt guidance are kept, so the
-  swap is invisible apart from the limit.
-
-  `summary` draws its own call and result: collapsing a call shows a
-  one-line outcome, and expanding it shows the map the model received. A call that failed hard
-  enough to throw shows the reason collapsed, rather than nothing.
+- Summaries are cached in `.pi/summaries.db`, at the project root. An edited file is noticed by
+  its contents rather than its timestamp, so a stale map is never served. Delete that file to
+  start over.
+- Reaching for an oversized read before a file has been summarized costs model calls you did not
+  ask for — one per file, three at most, and cached afterwards.
+- The summarizer runs as a plain completion with no tools: it is asked for JSON, the answer is
+  checked, and an answer that does not fit is sent back with the specific problem.
 
 ## Development
 
-```bash
-npm install
-npm run check     # tsc --noEmit && node smoke.mjs
-```
+`npm install`, then `npm run check` for the typecheck and the test suite, or `npm run test:llm`
+for the same suite plus the cases that call a real model. Requires Node 24 or newer.
 
-`smoke.mjs` drives the real tools with a fake `ExtensionAPI` and a
-fake `ModelRegistry`, against a temp project directory. It covers cache hit/miss/stale/
-forced, the hash-over-mtime rule, the blob degradation, the repair loop and its cap,
-the `mtime_ms` migration, settings precedence, and the guard's boundaries —
-including that a cold oversized read summarizes and returns the map, that an intercepted
-read is a successful result, not an error, and that it tells the user it was replaced by a
-summary, that the map carries every row uncut, that
-prose and extensionless files are left outside the limit, that a failing summarizer
-lets the read through and says so, that a failed model call fails `summary` outright rather
-than standing a file in for the answer, and that `summary` draws its call and its result —
-collapsed, expanded, still running, and failed — in a terminal. It also checks that
-`structuredContent` matches the output schema and carries the summary and no generation
-history, and that a read issued by another tool passes through untouched while the model's
-own read stays guarded.
-
-Nothing checks the map's *content*. Structure and schema are validated, and a
-contiguous, well-formed map can still name the wrong lines. The defence is in the prompt
-itself: the excerpt is line-numbered and the model is told to copy numbers out of the
-left column rather than count lines. That was measured, not assumed — given raw
-unnumbered text one model invented a spacing rule and drifted a mean of 24 lines on a
-1396-line file, while another counted accurately.
-
-## License
-
-GNU General Public License, version 3 or any later version. The full text is in
-[`LICENSE`](LICENSE), as published by the Free Software Foundation.
+Licensed under the GNU GPL, version 3 or later.
