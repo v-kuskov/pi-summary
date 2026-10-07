@@ -42,11 +42,12 @@ export function registerSummaryTool(pi: ExtensionAPI): void {
 		name: "summary",
 		label: "Summarize file",
 		description:
-			`Map a code file's line ranges without reading it. Returns what the file does plus every range that holds what, ordered most important first. Call it before reading a source file you have not seen, then read one range instead of the whole file. Pass region to drill into a single range - a name from the map or a line number - which is served from cache alone. Reading the whole file first costs many times the context of one summary, and costs again on every re-read. The first call on a file runs a model; later calls on the same unchanged file are free from cache.`,
-		promptSnippet: "Map a code file's line ranges before reading it",
+			`Map where a file's contents live without reading it: what the file does, and the line ranges that hold what - one row per region in line order with its span, the symbols, data and behaviors it holds, and what to know before editing it. Use it whenever you need to know what a file contains or where one thing is - a definition, a handler, an invariant - then read only the region that answers. Call it before reading a source file you have not seen: the whole file costs many times the context of one summary and costs again on every re-read. Pass region to drill into one row - its name from the map, or a line number inside it (a name match wins) - with no model call. The first call on a file runs a model; later calls on the same unchanged file are free from cache.`,
+		promptSnippet: "Map where a file's contents live before reading it",
 		promptGuidelines: [
-			`Before reading a source file you have not seen, call summary on it first. It returns the line ranges, so you read one region instead of the whole file.`,
-			`To see one region, pass its name or a line number as region; that is served from cache with no model call.`,
+			`To know what a file contains or where something lives - a definition, a handler, an invariant - call summary and read the region that answers, instead of the whole file.`,
+			`Before reading a source file you have not seen, call summary on it first; it returns where every region is, so you read one range instead of the whole file.`,
+			`To read one region, pass its name or a line number as region; that costs no model call.`,
 		],
 		parameters: Type.Object({
 			path: Type.String({
@@ -55,18 +56,19 @@ export function registerSummaryTool(pi: ExtensionAPI): void {
 			region: Type.Optional(
 				Type.String({
 					description:
-						"A region of an already-summarized file: a name from the map, or a line number. Returns that region and its numbered excerpt from cache, with no model call.",
+						"A region of an already-summarized file: a name from the map, or a line number inside it (a name match wins). Returns that region and its numbered excerpt, with no model call.",
 				}),
 			),
 			model: Type.Optional(
 				Type.String({
 					description:
-						'Summarizer as "provider/model". Defaults to the configured summarizer, or the current session model.',
+						'Summarizer as "provider/model". Defaults to the configured summarizer, or the current session model. Ignored when region is given.',
 				}),
 			),
 			refresh: Type.Optional(
 				Type.Boolean({
-					description: "Re-summarize even if the cached summary is still fresh.",
+					description:
+						"Return a new summary even if one already exists. Ignored when region is given.",
 				}),
 			),
 		}),
@@ -208,10 +210,12 @@ async function wholeFileFallback(
 	notifyUser(ctx, notice, "error");
 
 	let body: string;
+	let truncated = false;
 	let details = failedDetails(absPath);
 	try {
 		const file = await loadWholeFile(absPath);
 		body = file.text;
+		truncated = file.truncated;
 		details = { ...details, lines: file.totalLines };
 		if (file.truncated) {
 			body += `\n\n# the file is ${file.totalLines} lines and was cut here; read it in ranges with offset and limit to see the rest.`;
@@ -225,11 +229,19 @@ async function wholeFileFallback(
 
 	return {
 		content: [{ type: "text", text: `# ${notice}\n\n${body}` }],
-		// The failure itself is generation history and stays out of the structured arm; what a
-		// script needs is the file the model also got. Because pi resolves an `outputSchema`
-		// tool to `structuredContent` alone, this field is the only way a script receives the
-		// fallback body at all — leaving it out would hand scripts nothing.
-		structuredContent: { path: absPath, lines: details.lines, content: body },
+		// `kind`, `error` and `truncated` are payload semantics rather than generation history:
+		// pi resolves an `outputSchema` tool to `structuredContent` alone, so this arm is the
+		// only channel that reaches a script, which must be able to tell a fallback from a
+		// summary and see that `content` was cut short. What produced the payload - the spend,
+		// the cache state, the model - still stays in `details`.
+		structuredContent: {
+			kind: "file",
+			path: absPath,
+			lines: details.lines,
+			error: notice,
+			truncated,
+			content: body,
+		},
 		details,
 	};
 }

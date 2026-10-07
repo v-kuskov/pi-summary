@@ -50,8 +50,12 @@ export async function prepareFile(absPath: string): Promise<PreparedFile> {
  * contract, the limits the answer is held to, then the numbered file.
  *
  * There is no tool schema in this request, so this text is the entire contract - but it is
- * held to a goal, a shape, and a few limits, nothing more. Two things carry the weight:
+ * held to a goal, a shape, and a few limits, nothing more. Four things carry the weight:
  *
+ * - The map is a **retrieval index**, not a caption: `name` is asked for as the exact symbol
+ *   a reader would search and copy back to look a region up, never a bare number (a row
+ *   named `42` would shadow line 42 in `findRegion`), and `note` is asked to name the
+ *   behaviors and data a reader would look for - so every row answers "where does X live".
  * - The excerpt is **numbered**, and one line says the numbers are copied from the left
  *   column. That turns a counting task, which models fail at over long files, into a
  *   copying task.
@@ -69,7 +73,7 @@ export async function prepareFile(absPath: string): Promise<PreparedFile> {
  */
 export function buildSummarizePrompt(path: string, file: PreparedFile): string {
 	return [
-		"Index this file so a later model can read the parts it needs instead of the whole file.",
+		"Index this file so a later model can find where any information in it lives and read only that part.",
 		"Reply with one JSON object and nothing else - no prose, no markdown fence.",
 		"",
 		`File: ${path} (${file.totalLines} lines; line ${file.totalLines} is the last).`,
@@ -86,9 +90,9 @@ export function buildSummarizePrompt(path: string, file: PreparedFile): string {
 		"sections: rows in line order. A row is one declaration and its body, or a run of declarations that do the same kind of thing and read as one stripe. No two rows share a line.",
 		"  start_line / end_line: inclusive line numbers copied from the left column.",
 		`  kind: one of ${SECTION_KINDS.join(", ")}.`,
-		"  name: the symbol, or the pattern plus how many when a row covers many; (top level) for loose statements.",
-		"  note: what the region does, plus any side effect or invariant that matters when editing it. At most two sentences, about 200 characters.",
-		"  importance: 3 = main exports, core state, entry points, and the invariants a change must respect; 2 = supporting functions and types that serve the 3s; 1 = incidental - trivial accessors, glue, configuration. Most rows are 2; reserve 3 for the few that matter most.",
+		"  name: the symbol exactly as the file spells it, never a bare number - a reader copies it back to look the region up - or the pattern plus how many when a row covers many; (top level) for loose statements.",
+		"  note: what lives in the region and what it does - name the behaviors, data or cases a reader would look for - plus any side effect or invariant that matters when editing it. At most two sentences, about 200 characters.",
+		"  importance: a tier on every row - 3 = main exports, core state, entry points, and the invariants a change must respect; 2 = supporting functions and types that serve the 3s; 1 = incidental - trivial accessors, glue, configuration. Most rows are 2; reserve 3 for the few that matter most.",
 		"",
 		"Limits:",
 		"  - Copy line numbers from the left column; do not count lines yourself.",
@@ -96,7 +100,7 @@ export function buildSummarizePrompt(path: string, file: PreparedFile): string {
 		"  - Leave gaps where lines do nothing - blank runs and boilerplate.",
 		"  - Say a thing once - a note that only renames the row above extends that row instead.",
 		"",
-		"Now map the file below the same way.",
+		"Now map where everything in the file below lives.",
 		"",
 		"<file>",
 		file.text,

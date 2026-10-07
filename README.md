@@ -59,13 +59,19 @@ summary path="src/foo.ts" region="141"        # a line inside that range works t
 
 A region lookup returns the cached row (kind, name, note, importance, span) plus a
 line-numbered excerpt of just that span, from the current file. It is pure retrieval — no model
-call — so it costs nothing when the map is already cached. A name that matches no row, or a line
+call — so it costs nothing when the map is already cached. Names win over numbers: a `region`
+is matched as a row name first (exactly, then case-insensitively) and read as a line number
+only when no row carries it. A name that matches no row, or a line
 that falls in a gap, is an error naming what the map does hold, never a fresh summarization.
 
 That is three layers of increasing cost: `summary(path)` for the map, `summary(path, region)`
 for one region, plain `read` for the whole text.
 
-The result also carries machine-readable structure for scripts.
+The result also carries machine-readable structure for scripts: one JSON object tagged
+with `kind` — `map` (overview plus the rows), `region` (one row plus its excerpt), or `file`
+(the whole file, returned only when summarization failed, with `error` saying why and
+`truncated` saying whether the content was cut). Branch on `kind` before reading the other
+fields.
 
 A successful `edit` reports where the change landed:
 
@@ -98,6 +104,10 @@ Create `.pi/pi-summary.json` in a project, or `pi-summary.json` in pi's agent di
 - Summaries are cached in `.pi/summaries.db`, at the project root. An edited file is noticed by
   its contents rather than its timestamp, so a stale map is never served. Delete that file to
   start over.
+- The map is a retrieval index, not a caption: every row answers "where does X live". A
+  row's name is the symbol spelled exactly as the file spells it — so it can be passed
+  straight back as `region` — and its note names the behaviors and data a reader would
+  search for.
 - The summarizer runs as a plain completion with no tools: it is asked for JSON, the answer is
   checked, and an answer that does not fit is sent back with the specific problem. It skips
   imports, re-exports and boilerplate — those are what plain `read` is for.

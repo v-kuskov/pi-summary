@@ -193,44 +193,108 @@ export function normalizeSections(raw: unknown, shownLines: number): Section[] |
  * fell back to the whole file has no summary, so the file itself is the payload, and
  * omitting the field would hand scripts nothing where the model got a file.
  *
+ * Every arm carries a `kind` so a script can branch on the shape before reading a field:
+ * `overview` / `region` / `content` alone do distinguish the arms, and TypeScript narrows
+ * on them, but an untyped script reading `overview` from a fallback would silently hold
+ * undefined. The fallback arm also carries `error` and `truncated` - payload semantics,
+ * not generation history: a script must be able to tell a failure payload from a summary
+ * and see whether `content` was cut short, and this arm is its only channel.
+ *
  * Unlike `emitSummarySchema` above, this schema does reach callers: codemode declarations
- * render it for scripts.
+ * render it for scripts, which is why every field carries a one-line description.
  */
 export const summaryOutputSchema = Type.Union([
 	Type.Object({
-		path: Type.String(),
-		lines: Type.Integer(),
-		overview: Type.String(),
+		kind: Type.Literal("map", { description: "Map arm: the file's overview and line map." }),
+		path: Type.String({
+			description:
+				"Project-root-relative path of the file, normalized on Windows; the fallback arm returns an absolute path instead. Re-resolve your own input rather than round-tripping this.",
+		}),
+		lines: Type.Integer({ description: "Total lines in the file." }),
+		overview: Type.String({
+			description:
+				"The file's prose: what it is for, its main exports, and what to know before changing it.",
+		}),
 		sections: Type.Array(
 			Type.Object({
-				startLine: Type.Integer(),
-				endLine: Type.Integer(),
-				kind: Type.String(),
-				name: Type.String(),
-				note: Type.String(),
-				importance: Type.Union([Type.Literal(1), Type.Literal(2), Type.Literal(3)]),
+				startLine: Type.Integer({
+					description: "First line of the region, 1-based and inclusive.",
+				}),
+				endLine: Type.Integer({ description: "Last line of the region, inclusive." }),
+				kind: Type.String({
+					description:
+						"What the region holds: type, class, interface, function, method, const, config, test, comment, or other.",
+				}),
+				name: Type.String({
+					description:
+						"The region's name: the symbol as the file spells it, or a pattern summary. Pass it back as region to drill into the row.",
+				}),
+				note: Type.String({
+					description: "What lives in the region and what to know before editing it.",
+				}),
+				importance: Type.Union([Type.Literal(1), Type.Literal(2), Type.Literal(3)], {
+					description:
+						"1 = incidental, 2 = supporting, 3 = load-bearing. A display tier; the note always holds the full text.",
+				}),
 			}),
+			{
+				description:
+					"Every mapped region, in line order; empty exactly when the file has no line map and region lookups reject.",
+			},
 		),
 	}),
 	// The drill-down arm: one cached region and the numbered excerpt of its span. It has no
 	// `overview`, because a caller that asked for a region already has the file's prose.
 	Type.Object({
-		path: Type.String(),
-		lines: Type.Integer(),
-		region: Type.Object({
-			startLine: Type.Integer(),
-			endLine: Type.Integer(),
-			kind: Type.String(),
-			name: Type.String(),
-			note: Type.String(),
-			importance: Type.Union([Type.Literal(1), Type.Literal(2), Type.Literal(3)]),
+		kind: Type.Literal("region", { description: "Region arm: one cached region and its excerpt." }),
+		path: Type.String({
+			description:
+				"Project-root-relative path of the file, normalized on Windows; the fallback arm returns an absolute path instead.",
 		}),
-		excerpt: Type.String(),
+		lines: Type.Integer({ description: "Total lines in the file." }),
+		region: Type.Object(
+			{
+				startLine: Type.Integer({
+					description: "First line of the region, 1-based and inclusive.",
+				}),
+				endLine: Type.Integer({ description: "Last line of the region, inclusive." }),
+				kind: Type.String({
+					description:
+						"What the region holds: type, class, interface, function, method, const, config, test, comment, or other.",
+				}),
+				name: Type.String({
+					description: "The region's name: the symbol as the file spells it, or a pattern summary.",
+				}),
+				note: Type.String({
+					description: "What lives in the region and what to know before editing it.",
+				}),
+				importance: Type.Union([Type.Literal(1), Type.Literal(2), Type.Literal(3)], {
+					description:
+						"1 = incidental, 2 = supporting, 3 = load-bearing. A display tier; the note always holds the full text.",
+				}),
+			},
+			{ description: "The region asked for: its span, kind, name, note and tier." },
+		),
+		excerpt: Type.String({
+			description: "The region's line-numbered excerpt of the current file.",
+		}),
 	}),
 	Type.Object({
-		path: Type.String(),
-		lines: Type.Integer(),
-		content: Type.String(),
+		kind: Type.Literal("file", {
+			description: "Fallback arm: the whole file, returned only when summarization failed.",
+		}),
+		path: Type.String({
+			description: "Absolute path of the file (the other arms return the project-root-relative path).",
+		}),
+		lines: Type.Integer({
+			description: "Total lines in the file, counted whole even when content was cut short.",
+		}),
+		error: Type.String({ description: "Why the file could not be summarized." }),
+		truncated: Type.Boolean({ description: "True when content was cut short of the file's end." }),
+		content: Type.String({
+			description:
+				"The whole file. When truncated, a trailing '# the file is N lines and was cut here' comment marks the cut.",
+		}),
 	}),
 ]);
 
@@ -246,6 +310,7 @@ export type SummaryOutput = Static<typeof summaryOutputSchema>;
  */
 export function summaryOutputOf(entry: CachedSummary): SummaryOutput {
 	return {
+		kind: "map",
 		path: entry.path,
 		lines: entry.lines,
 		overview: entry.overview,
@@ -262,6 +327,7 @@ export function summaryOutputOf(entry: CachedSummary): SummaryOutput {
 
 /** One region and its excerpt, as the drill-down returns them. */
 export type RegionOutput = {
+	kind: "region";
 	path: string;
 	lines: number;
 	region: {
@@ -288,6 +354,7 @@ export function regionOutputOf(
 	excerpt: string,
 ): RegionOutput {
 	return {
+		kind: "region",
 		path: entry.path,
 		lines: entry.lines,
 		region: {
