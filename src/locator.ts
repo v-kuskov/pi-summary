@@ -14,7 +14,7 @@ import { resolveFilePath } from "./paths.ts";
  *
  * That gap is what makes an editing session re-read files. Measured on one session, a
  * 253-line file was read 61 times and 61 of 61 reads passed no `limit`, so every one was
- * intercepted by the guard and every stale one paid a whole-file model call. The model was
+ * a whole-file read. The model was
  * not checking its spelling - it was looking up line numbers it had no other way to get.
  * Two numbers answer it: where the change is, and how long the file is now.
  *
@@ -34,7 +34,7 @@ import { resolveFilePath } from "./paths.ts";
  * lines. A model told its change is "somewhere in 18-86" has learned nothing it can act on,
  * which is the re-read this exists to prevent.
  *
- * A no-op edit needs no guard of its own here. The built-in tool throws ("The replacement
+ * A no-op edit needs no handling of its own here. The built-in tool throws ("The replacement
  * produced identical content") rather than returning a result, and although pi catches that
  * throw and still runs this hook, it arrives as an error result and is declined by the
  * `isError` check below.
@@ -151,8 +151,7 @@ function nameRuns(runs: [number, number][]): string {
  * `read` reports or the next `offset` lands in the wrong place. `read` computes
  * `text.split("\n").length` - the raw split, with no popping (pi's `core/tools/read.js`,
  * its `totalFileLines`) - so a file of `a\nb\nc\n` is 4 lines and an empty file is 1. That is
- * the same `newlines + 1` rule `fingerprint` states in hash.ts, and the one the guard's
- * boundary arithmetic depends on.
+ * the same `newlines + 1` rule `fingerprint` states in hash.ts.
  *
  * `countLinesFrom` already streams this way and returns exactly `newlines + 1` when it is
  * allowed to run to EOF, so the cap is lifted by asking for more lines than any file has.

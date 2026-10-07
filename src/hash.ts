@@ -18,8 +18,7 @@ export type FileFingerprint = {
  *
  * Line count matches how the built-in `read` tool splits content: `text.split("\n")`,
  * so an empty file is 1 line and a trailing newline produces a final empty element.
- * The read guard compares this number against what `read` would report, so the two
- * must agree exactly.
+ * The edit locator reports this number, so it must agree with what `read` shows the model.
  */
 export async function fingerprint(absPath: string): Promise<FileFingerprint> {
 	const buffer = await readFile(absPath);
@@ -36,7 +35,7 @@ export async function fingerprint(absPath: string): Promise<FileFingerprint> {
  * Count the lines in `absPath` from line `offset` (1-indexed) to the end, stopping as
  * soon as the count is known to exceed `stopAfter` and returning `stopAfter + 1`.
  *
- * This is what lets the read guard answer "are there more than 200 lines here?" without
+ * This lets the edit locator answer "how many lines does this file have now?" without
  * loading a large file: it reads in 64KB chunks and bails out early.
  *
  * The arithmetic relies on `text.split("\n").length === newlineCount + 1` for every
@@ -71,21 +70,6 @@ export async function countLinesFrom(
 
 		const count = newlines - offset + 2;
 		return count > 0 ? count : 0;
-	} finally {
-		await handle.close();
-	}
-}
-
-/**
- * True when the first bytes look binary. A NUL byte is the same heuristic git uses,
- * and it keeps the 200-line rule from being applied to images and archives.
- */
-export async function looksBinary(absPath: string): Promise<boolean> {
-	const handle = await open(absPath, "r");
-	try {
-		const buffer = Buffer.alloc(8000);
-		const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
-		return buffer.subarray(0, bytesRead).includes(0);
 	} finally {
 		await handle.close();
 	}

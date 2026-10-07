@@ -16,7 +16,7 @@ export class SummaryError extends Error {
  *
  * Separate from `SummaryError` because the two callers want opposite things from it.
  * `summary` fails with it - the model asked for a map and must be told it has none - while
- * the guarded `read` swallows it and reads the file directly, because withholding the file
+ * the whole-file fallback returns the file itself, because withholding the file
  * would be a worse answer than a missing summary.
  */
 export class ModelCallError extends SummaryError {}

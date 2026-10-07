@@ -58,6 +58,9 @@ export async function prepareFile(absPath: string): Promise<PreparedFile> {
  * - The `Limits` are what a model cannot infer: the `kind` vocabulary, that gaps are
  *   legal, that numbers come from the column rather than from counting, and the two field
  *   lengths that are cut on the way into storage.
+ * - The **importance** rubric is a ranking the model cannot guess from the shape alone:
+ *   nothing about a file says whether its own author considers a helper load-bearing, so the
+ *   three tiers are stated as examples rather than left to be inferred.
  *
  * A worked example and a bullet per JSON field were both measured and dropped - together
  * about 2400 characters, over half the prompt. Every rule they stated is either stated
@@ -77,7 +80,7 @@ export function buildSummarizePrompt(path: string, file: PreparedFile): string {
 		`     2${GUTTER}the second line`,
 		"",
 		"JSON shape:",
-		'  { "overview": string, "sections": [ { "start_line": number, "end_line": number, "kind": string, "name": string, "note": string } ] }',
+		'  { "overview": string, "sections": [ { "start_line": number, "end_line": number, "kind": string, "name": string, "note": string, "importance": 1|2|3 } ] }',
 		"",
 		"overview: what the file is for, its main exports and how they relate, and anything a reader must know before changing it. Shown without the map when there is no room for both, so it must stand alone. At most ten sentences.",
 		"sections: rows in line order. A row is one declaration and its body, or a run of declarations that do the same kind of thing and read as one stripe. No two rows share a line.",
@@ -85,10 +88,12 @@ export function buildSummarizePrompt(path: string, file: PreparedFile): string {
 		`  kind: one of ${SECTION_KINDS.join(", ")}.`,
 		"  name: the symbol, or the pattern plus how many when a row covers many; (top level) for loose statements.",
 		"  note: what the region does, plus any side effect or invariant that matters when editing it. At most two sentences, about 200 characters.",
+		"  importance: 3 = main exports, core state, entry points, and the invariants a change must respect; 2 = supporting functions and types that serve the 3s; 1 = incidental - trivial accessors, glue, configuration. Most rows are 2; reserve 3 for the few that matter most.",
 		"",
 		"Limits:",
 		"  - Copy line numbers from the left column; do not count lines yourself.",
-		"  - Leave gaps where lines do nothing - blank runs, license headers, boilerplate.",
+		"  - Skip imports, re-exports, license headers and boilerplate - do not give them rows.",
+		"  - Leave gaps where lines do nothing - blank runs and boilerplate.",
 		"  - Say a thing once - a note that only renames the row above extends that row instead.",
 		"",
 		"Now map the file below the same way.",

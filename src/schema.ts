@@ -1,11 +1,22 @@
 import { Type, type Static } from "typebox";
 import { Value } from "typebox/value";
 import { StringEnum } from "@earendil-works/pi-ai";
-import type { CachedSummary, Section } from "./store.ts";
+import {
+	type CachedSummary,
+	type Importance,
+	type Section,
+	normalizeImportance,
+} from "./store.ts";
 
-/** Vocabulary for the `kind` field, shared by the schema, the prompt, and the validator. */
+/**
+ * Vocabulary for the `kind` field, shared by the schema, the prompt, and the validator.
+ *
+ * There is no `import` kind: imports, re-exports and boilerplate carry no line-level meaning
+ * a reader would drill into, so the prompt tells the summarizer to skip them rather than name
+ * them. A cache written before that still holds `import` rows, which is why the renderer and
+ * the output schema take `kind` as a plain string rather than this union.
+ */
 export const SECTION_KINDS = [
-	"import",
 	"type",
 	"class",
 	"interface",
@@ -47,6 +58,7 @@ export const emitSummarySchema = Type.Object({
 			kind: StringEnum(SECTION_KINDS),
 			name: Type.String(),
 			note: Type.String(),
+			importance: Type.Union([Type.Literal(1), Type.Literal(2), Type.Literal(3)]),
 		}),
 	),
 });
@@ -59,6 +71,7 @@ export type EmitSummary = {
 		kind: string;
 		name: string;
 		note: string;
+		importance: 1 | 2 | 3;
 	}>;
 };
 
@@ -144,6 +157,9 @@ export function normalizeSections(raw: unknown, shownLines: number): Section[] |
 			// The prompt asks for two sentences; a note that ignores that is cut so one row
 			// cannot outweigh the rest of the map in the stored entry.
 			note: truncateNote(String(row.note ?? "").trim()),
+			// A row is worth keeping whatever the model said about how much it matters, so an
+			// omitted or nonsensical importance becomes the middle tier rather than a repair call.
+			importance: normalizeImportance(row.importance),
 		});
 	}
 
@@ -192,8 +208,24 @@ export const summaryOutputSchema = Type.Union([
 				kind: Type.String(),
 				name: Type.String(),
 				note: Type.String(),
+				importance: Type.Union([Type.Literal(1), Type.Literal(2), Type.Literal(3)]),
 			}),
 		),
+	}),
+	// The drill-down arm: one cached region and the numbered excerpt of its span. It has no
+	// `overview`, because a caller that asked for a region already has the file's prose.
+	Type.Object({
+		path: Type.String(),
+		lines: Type.Integer(),
+		region: Type.Object({
+			startLine: Type.Integer(),
+			endLine: Type.Integer(),
+			kind: Type.String(),
+			name: Type.String(),
+			note: Type.String(),
+			importance: Type.Union([Type.Literal(1), Type.Literal(2), Type.Literal(3)]),
+		}),
+		excerpt: Type.String(),
 	}),
 	Type.Object({
 		path: Type.String(),
@@ -208,6 +240,9 @@ export type SummaryOutput = Static<typeof summaryOutputSchema>;
  * Project a stored entry into the tool's structured result.
  *
  * `seq` is storage ordering and stays behind this seam; the array order already carries it.
+ * Importance is normalized again here rather than trusted: an entry read from a cache written
+ * before the field existed already reads as 2 by way of `readSummary`, and this keeps the
+ * structured arm — the one a script acts on — on the same default if that ever changes.
  */
 export function summaryOutputOf(entry: CachedSummary): SummaryOutput {
 	return {
@@ -220,6 +255,49 @@ export function summaryOutputOf(entry: CachedSummary): SummaryOutput {
 			kind: section.kind,
 			name: section.name,
 			note: section.note,
+			importance: normalizeImportance(section.importance),
 		})),
+	};
+}
+
+/** One region and its excerpt, as the drill-down returns them. */
+export type RegionOutput = {
+	path: string;
+	lines: number;
+	region: {
+		startLine: number;
+		endLine: number;
+		kind: string;
+		name: string;
+		note: string;
+		importance: Importance;
+	};
+	excerpt: string;
+};
+
+/**
+ * Project one cached region and its excerpt into the drill-down's structured result.
+ *
+ * Only the region asked for is exposed, not the whole map: the caller already chose a layer,
+ * and returning every row would make the drill-down cost the same context as the summary it
+ * was meant to narrow.
+ */
+export function regionOutputOf(
+	entry: CachedSummary,
+	section: Section,
+	excerpt: string,
+): RegionOutput {
+	return {
+		path: entry.path,
+		lines: entry.lines,
+		region: {
+			startLine: section.startLine,
+			endLine: section.endLine,
+			kind: section.kind,
+			name: section.name,
+			note: section.note,
+			importance: normalizeImportance(section.importance),
+		},
+		excerpt,
 	};
 }

@@ -6,11 +6,11 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { ModelCallError, notifyUser, SummaryError } from "./error.ts";
 import { describeFailure, failureNotice, loadWholeFile } from "./fallback.ts";
-import { DEFAULT_TRAP_LIMIT, readSettings, type Settings } from "./settings.ts";
 import { resolveFilePath } from "./paths.ts";
+import { findRegion, regionExcerpt, regionMiss } from "./region.ts";
 import { renderSummary } from "./render.ts";
-import { summaryOutputOf, summaryOutputSchema } from "./schema.ts";
-import { summarizeFile, type SummarizeOutcome } from "./summarize.ts";
+import { regionOutputOf, summaryOutputOf, summaryOutputSchema } from "./schema.ts";
+import { loadCachedSummary, summarizeFile, type SummarizeOutcome } from "./summarize.ts";
 import { summaryRenderers } from "./tui.ts";
 
 export type SummaryDetails = {
@@ -30,47 +30,34 @@ export type SummaryDetails = {
  * The `summary` tool: a cached structural summary of one file, plus the map of which line
  * ranges hold what.
  *
- * The point is to make the guarded `read` usable. `read` is answered with a map once the read
- * passes the configured `trap_limit`, so a model facing a 1400-line file needs to know which
- * range to ask for instead.
+ * The point is to let the model see a file's shape before spending a read on it: one call
+ * returns the ranges, so a model facing a 1400-line file knows which region to ask for.
  *
- * `settings` is the configuration in force when the extension loaded, which is the only one
- * the description can quote: pi takes a description once, at registration, and never asks
- * again. It is passed in rather than read here so this module stays a function of its inputs;
- * see index.ts for where the read happens and what it can and cannot know.
+ * The description is fixed at registration because pi takes one once and never asks again.
+ * That is why nothing here reads the settings: `model` is resolved per call, inside the
+ * summarize, where the project in force at that moment decides it.
  */
-export function registerSummaryTool(pi: ExtensionAPI, settings: Settings): void {
-	// What the description may claim about `read` is a function of the trap, not just of the
-	// limit: with `trap: "none"` no read is ever diverted, whatever the limit says, and telling
-	// the model otherwise would sell it summaries of files it could simply read. The limit is
-	// quoted only in the modes that enforce it, and every number below is derived from the
-	// settings rather than written out - a description that kept 200's arithmetic while the trap
-	// enforced 50 would be wrong the same way an omitted number is, just harder to notice.
-	const { trapLimit, trap } = settings;
-	const readsFor1400 = Math.ceil(1400 / trapLimit);
-	// The example sentence is a fixed one - a 1400-line file - and it was written for the default
-	// limit, where it reads "seven reads". That wording is kept at the default rather than
-	// becoming "7 reads": the description is prompt surface, and an install that has configured
-	// nothing must reach the model exactly as it did before this setting existed. Any other limit
-	// is a deliberate change, and gets its own numeral.
-	const readsWord = trapLimit === DEFAULT_TRAP_LIMIT ? "seven" : String(readsFor1400);
-	const readCost =
-		trap === "none"
-			? "`read` returns whole files here, so summarizing is only worth it when you want the map itself."
-			: `\`read\` returns at most ${trapLimit} lines per call, so a 1400-line file costs ${readsWord} ${readsFor1400 === 1 ? "read" : "reads"} or one summary plus one read.`;
+export function registerSummaryTool(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "summary",
 		label: "Summarize file",
 		description:
-			`Map a code file's line ranges without reading it. Returns what the file does plus every range that holds what. Call it before reading a source file you have not seen, then read one range instead of the whole file. ${readCost} The first call on a file runs a model; later calls on the same unchanged file are free from cache.`,
+			`Map a code file's line ranges without reading it. Returns what the file does plus every range that holds what, ordered most important first. Call it before reading a source file you have not seen, then read one range instead of the whole file. Pass region to drill into a single range - a name from the map or a line number - which is served from cache alone. Reading the whole file first costs many times the context of one summary, and costs again on every re-read. The first call on a file runs a model; later calls on the same unchanged file are free from cache.`,
 		promptSnippet: "Map a code file's line ranges before reading it",
 		promptGuidelines: [
 			`Before reading a source file you have not seen, call summary on it first. It returns the line ranges, so you read one region instead of the whole file.`,
+			`To see one region, pass its name or a line number as region; that is served from cache with no model call.`,
 		],
 		parameters: Type.Object({
 			path: Type.String({
 				description: "File path, relative to the working directory or absolute.",
 			}),
+			region: Type.Optional(
+				Type.String({
+					description:
+						"A region of an already-summarized file: a name from the map, or a line number. Returns that region and its numbered excerpt from cache, with no model call.",
+				}),
+			),
 			model: Type.Optional(
 				Type.String({
 					description:
@@ -92,9 +79,12 @@ export function registerSummaryTool(pi: ExtensionAPI, settings: Settings): void 
 			_onUpdate,
 			ctx,
 		): Promise<AgentToolResult<SummaryDetails>> {
-			// Read once, before the model call, so the result quotes one configuration rather than
-			// a model chosen under one version of the file and a limit read from another.
-			const settings = readSettings(ctx.cwd);
+			// The drill-down is a separate path on purpose: it never touches the summarizer, so a
+			// region lookup can never spend a call and can never be the reason a file gets mapped.
+			if (params.region !== undefined) {
+				return lookupRegion(ctx, params.path, params.region);
+			}
+
 			let outcome: SummarizeOutcome;
 			try {
 				outcome = await summarizeFile(ctx, {
@@ -115,7 +105,7 @@ export function registerSummaryTool(pi: ExtensionAPI, settings: Settings): void 
 				return wholeFileFallback(ctx, params.path, error);
 			}
 			return {
-				content: [{ type: "text", text: renderSummary(outcome.entry, settings.trapLimit) }],
+				content: [{ type: "text", text: renderSummary(outcome.entry) }],
 				structuredContent: summaryOutputOf(outcome.entry),
 				details: summarizeDetails(outcome),
 				usage: outcome.usage,
@@ -135,6 +125,51 @@ function summarizeDetails(outcome: SummarizeOutcome): SummaryDetails {
 		sections: outcome.entry.sections.length,
 		attempts: outcome.attempts,
 		degraded: outcome.degraded,
+	};
+}
+
+/**
+ * Answer `summary(path, region)`: one cached region and its excerpt, with no model call.
+ *
+ * Every miss is an error rather than a fallback to the map or to the model. A region the map
+ * cannot name is a caller mistake with a specific correction - the names that do exist - and
+ * paying for a summarization to answer a typo would be the opposite of the discipline the
+ * budget exists to keep. A file with no cache or a stale one is pointed back at layer one.
+ */
+async function lookupRegion(
+	ctx: ExtensionContext,
+	path: string,
+	region: string,
+): Promise<AgentToolResult<SummaryDetails>> {
+	const entry = await loadCachedSummary(ctx, path);
+	const section = findRegion(entry, region);
+	if (!section) throw regionMiss(entry, region);
+
+	const excerpt = await regionExcerpt(entry.absPath, section);
+	const text = [
+		`# ${entry.path}  ${section.startLine}-${section.endLine}  ${section.kind}  ${section.name}`,
+		section.note.trim(),
+		"",
+		excerpt,
+	]
+		.filter((part) => part !== "")
+		.join("\n");
+
+	return {
+		content: [{ type: "text", text }],
+		structuredContent: regionOutputOf(entry, section, excerpt),
+		// No `usage`: zero model calls were made, and reporting the cached attempt count as if
+		// this call had spent it would misstate what the lookup cost.
+		details: {
+			path: entry.path,
+			status: "region",
+			mode: entry.mode,
+			lines: entry.lines,
+			model: entry.model,
+			sections: 1,
+			attempts: 0,
+			degraded: false,
+		},
 	};
 }
 

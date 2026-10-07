@@ -62,6 +62,52 @@ export type SummarizeOutcome = {
 };
 
 /**
+ * Read a file's cached summary for a region lookup, without ever running a model.
+ *
+ * Progressive disclosure has three layers - `summary(path)` for the map, `summary(path, region)`
+ * for one region, plain `read` for the text - and this is the second one. It is pure retrieval:
+ * a missing cache or a stale one raises, pointing the caller back at the first layer, rather
+ * than quietly spending a call. A stale map is never handed out even here, because naming a
+ * region from a map that no longer matches the file would send the reader to the wrong lines,
+ * which is the one thing the map exists to prevent.
+ */
+export async function loadCachedSummary(
+	ctx: ExtensionContext,
+	path: string,
+): Promise<CachedSummary> {
+	const absPath = resolveFilePath(path, ctx.cwd);
+	if (!isRegularFile(absPath)) {
+		throw new SummaryError(
+			`${path} is not a regular file`,
+			"summary works on files. Use ls to find a path first.",
+		);
+	}
+
+	const root = findProjectRoot(ctx.cwd);
+	const key = cacheKey(absPath, root);
+	const { db } = openDb(ctx.cwd);
+	try {
+		ensureSchema(db);
+		const cached = readSummary(db, key);
+		if (!cached) {
+			throw new SummaryError(
+				`no cached summary for ${path}`,
+				"Call summary on it first; a region lookup reads the cache and never runs a model.",
+			);
+		}
+		if ((await freshnessOf(cached)) !== "fresh") {
+			throw new SummaryError(
+				`the cached summary of ${path} is stale - the file changed since it was mapped`,
+				"Call summary on it again to refresh the map, then look the region up.",
+			);
+		}
+		return cached;
+	} finally {
+		db.close();
+	}
+}
+
+/**
  * Runs already under way, so callers asking for the same file at the same time share one.
  *
  * A cold oversized `read` is the case that matters: the model can issue several reads of the
@@ -192,8 +238,7 @@ type SummaryResult = {
  *   cycle: the summarizer never chooses what to do next, and it is never given tools.
  *
  * When the cap runs out the call fails. Prose stored under the summary's name would claim a
- * map the model never gave, and the caller - unlike the read guard, which reads the file
- * itself - has no other way to learn why it has nothing.
+ * map the model never gave, and the caller has no other way to learn why it has nothing.
  */
 async function requestSummary(
 	ctx: ExtensionContext,
@@ -278,7 +323,7 @@ async function requestSummary(
 	// The budget is spent and nothing validated. Salvaging the prose as a blob would dress a
 	// guess up as the summary that was asked for, so the call fails and says what happened.
 	// The action goes in the message because pi drops `hint` from a thrown tool error, while
-	// the diagnosis goes in the hint, where the read guard's notice can still show it.
+	// the diagnosis goes in the hint, where the fallback's notice can still show it.
 	throw new ModelCallError(
 		`the summarizer never produced a usable answer for ${key} after ${MAX_ATTEMPTS} attempts; name a different one with model=provider/model`,
 		`The last answer was rejected for: ${problems.join("; ") || "it did not match the required shape"}.`,
@@ -289,7 +334,7 @@ async function requestSummary(
  * Cut a runaway overview, keeping whole sentences so the prose still reads cleanly.
  *
  * The prompt allows ten sentences, which is a lot; a model that ignores that could return a
- * page of prose and push the map out of the guard's refusal text entirely.
+ * page of prose and push the map out of the result text entirely.
  */
 function truncateOverview(overview: string): string {
 	if (overview.length <= MAX_OVERVIEW_CHARS) return overview;

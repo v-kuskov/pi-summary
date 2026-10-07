@@ -5,6 +5,28 @@ import { DatabaseSync } from "node:sqlite";
 import { fingerprint, type FileFingerprint } from "./hash.ts";
 import { resolveDbPath } from "./paths.ts";
 
+/**
+ * How much a region matters, 3 being the most.
+ *
+ * The summarizer assigns it in the same call that writes the row, so ordering the map by it
+ * costs nothing extra. It is a small closed set rather than a score because the renderer only
+ * ever asks which band a row is in: three tiers are as much as a reader can act on, and a
+ * continuous value would invite the model to invent distinctions the map does not use.
+ */
+export type Importance = 1 | 2 | 3;
+
+/**
+ * Read an importance as one of the three tiers, defaulting to 2.
+ *
+ * 2 is the middle: a row whose importance the model omitted or wrote as anything other than
+ * 1-3 is still a real region, so dropping it or guessing a tier would cost more than calling
+ * it supporting. This is the single place the default lives, so a row that predates the field
+ * (an existing cache) and a row the model mangled read the same.
+ */
+export function normalizeImportance(value: unknown): Importance {
+	return value === 1 || value === 2 || value === 3 ? value : 2;
+}
+
 /** One mapped region of a file. */
 export type Section = {
 	seq: number;
@@ -13,6 +35,7 @@ export type Section = {
 	kind: string;
 	name: string;
 	note: string;
+	importance: Importance;
 };
 
 export type SummaryMode = "mapped" | "blob";
@@ -66,6 +89,7 @@ CREATE TABLE IF NOT EXISTS file_section (
   kind       TEXT NOT NULL,
   name       TEXT NOT NULL,
   note       TEXT NOT NULL,
+  importance INTEGER NOT NULL DEFAULT 2,
   PRIMARY KEY (path, seq)
 );
 `;
@@ -104,6 +128,18 @@ export function ensureSchema(db: DatabaseSync): void {
 	if (columns.some((c) => c.name === "created_at")) {
 		db.exec("ALTER TABLE file_summary DROP COLUMN created_at");
 	}
+
+	// `importance` is new on the section rows. `CREATE TABLE IF NOT EXISTS` above leaves an
+	// existing `file_section` alone, so a database written before the field existed would never
+	// grow the column - and `readSummary` selects it. The DEFAULT is the whole migration: every
+	// row already stored reads as tier 2, which is exactly how a missing importance is meant to
+	// read, so no UPDATE and no rewriting of live caches.
+	const sectionColumns = db.prepare("PRAGMA table_info(file_section)").all() as Array<{
+		name: string;
+	}>;
+	if (!sectionColumns.some((c) => c.name === "importance")) {
+		db.exec("ALTER TABLE file_section ADD COLUMN importance INTEGER NOT NULL DEFAULT 2");
+	}
 }
 
 /**
@@ -120,7 +156,7 @@ export function readSummary(db: DatabaseSync, path: string): CachedSummary | und
 
 	const sections = db
 		.prepare(
-			"SELECT seq, start_line, end_line, kind, name, note FROM file_section WHERE path = ? ORDER BY seq",
+			"SELECT seq, start_line, end_line, kind, name, note, importance FROM file_section WHERE path = ? ORDER BY seq",
 		)
 		.all(path) as Array<Record<string, unknown>>;
 
@@ -140,6 +176,9 @@ export function readSummary(db: DatabaseSync, path: string): CachedSummary | und
 			kind: String(s.kind),
 			name: String(s.name),
 			note: String(s.note),
+			// Normalized here rather than left to the DEFAULT alone so a NULL that slipped past
+			// the constraint, or a value written by an older handle, still reads as tier 2.
+			importance: normalizeImportance(s.importance),
 		})),
 	};
 }
@@ -207,10 +246,21 @@ export function writeSummary(db: DatabaseSync, input: SummaryInput): void {
 
 		db.prepare("DELETE FROM file_section WHERE path = ?").run(input.path);
 		const insertSection = db.prepare(
-			"INSERT INTO file_section (path, seq, start_line, end_line, kind, name, note) VALUES (?, ?, ?, ?, ?, ?, ?)",
+			"INSERT INTO file_section (path, seq, start_line, end_line, kind, name, note, importance) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
 		);
 		for (const s of input.sections) {
-			insertSection.run(input.path, s.seq, s.startLine, s.endLine, s.kind, s.name, s.note);
+			// Bound through the same default as the read path: a caller that builds a Section by
+			// hand may omit the field, and node:sqlite refuses to bind `undefined` at all.
+			insertSection.run(
+				input.path,
+				s.seq,
+				s.startLine,
+				s.endLine,
+				s.kind,
+				s.name,
+				s.note,
+				normalizeImportance(s.importance),
+			);
 		}
 
 		db.exec("COMMIT");
