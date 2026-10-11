@@ -2115,7 +2115,9 @@ await check("a row stored before importance existed renders as tier 2", async ()
  * These cases close that gap, and they are the reason the suite has a flag at all: they
  * spend real tokens against a real provider.
  */
-const LLM_MODEL = "routerai/deepseek/deepseek-v4.1-flash";
+// Overridable so the end-to-end cases can be pointed at any authenticated model
+// (`LLM_MODEL=provider/model node smoke.mjs --llm`) without touching the suite.
+const LLM_MODEL = process.env.LLM_MODEL ?? "routerai/deepseek/deepseek-v4.1-flash";
 
 /**
  * Run the end-to-end cases only when asked, because they cost money and need credentials.
@@ -2151,7 +2153,9 @@ if (runLlm) {
 	// That is exactly what a session does, which is why the end-to-end cases are a session's
 	// path rather than the fake harness's.
 	const registry = new ModelRegistry(services.modelRuntime);
-	const llmModel = registry.find("routerai", "deepseek/deepseek-v4.1-flash");
+	// Split at the first slash only: a model id may itself contain one (`~z-ai/glm-flash-latest`).
+	const slash = LLM_MODEL.indexOf("/");
+	const llmModel = registry.find(LLM_MODEL.slice(0, slash), LLM_MODEL.slice(slash + 1));
 	if (!llmModel) {
 		console.log(`\nSKIP real-model cases: ${LLM_MODEL} is not in the model catalogue`);
 	}
