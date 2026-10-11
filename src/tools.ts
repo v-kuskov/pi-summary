@@ -20,8 +20,6 @@ export type SummaryDetails = {
 	lines: number;
 	model: string;
 	sections: number;
-	/** Model calls spent on this result, including repairs. 0 on a cache hit. */
-	attempts: number;
 	/** True when the model never returned a usable line map and only prose was stored. */
 	degraded: boolean;
 };
@@ -125,7 +123,6 @@ function summarizeDetails(outcome: SummarizeOutcome): SummaryDetails {
 		lines: outcome.entry.lines,
 		model: outcome.entry.model,
 		sections: outcome.entry.sections.length,
-		attempts: outcome.attempts,
 		degraded: outcome.degraded,
 	};
 }
@@ -160,8 +157,8 @@ async function lookupRegion(
 	return {
 		content: [{ type: "text", text }],
 		structuredContent: regionOutputOf(entry, section, excerpt),
-		// No `usage`: zero model calls were made, and reporting the cached attempt count as if
-		// this call had spent it would misstate what the lookup cost.
+		// No `usage`: zero model calls were made, and reporting the summary's usage as if this
+		// call had spent it would misstate what the lookup cost.
 		details: {
 			path: entry.path,
 			status: "region",
@@ -169,7 +166,6 @@ async function lookupRegion(
 			lines: entry.lines,
 			model: entry.model,
 			sections: 1,
-			attempts: 0,
 			degraded: false,
 		},
 	};
@@ -184,7 +180,6 @@ function failedDetails(absPath: string): SummaryDetails {
 		lines: 0,
 		model: "",
 		sections: 0,
-		attempts: 0,
 		degraded: true,
 	};
 }

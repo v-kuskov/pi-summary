@@ -1,10 +1,9 @@
 import { validateToolArguments } from "@earendil-works/pi-ai";
-import { assistantText, ModelCallError, SummaryError } from "./error.ts";
+import { ModelCallError, SummaryError } from "./error.ts";
 import { fingerprint } from "./hash.ts";
 import { cacheKey, findProjectRoot, isRegularFile, resolveFilePath } from "./paths.ts";
 import {
 	type PreparedFile,
-	buildRepairPrompt,
 	buildSummarizePrompt,
 	modelLabel,
 	prepareFile,
@@ -28,7 +27,6 @@ import {
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type {
 	AssistantMessage,
-	Message,
 	Model,
 	Tool,
 	ToolCall,
@@ -38,15 +36,6 @@ import type {
 import { SETTINGS_FILE, readSettings } from "./settings.ts";
 
 type AnyModel = Model<any>;
-
-/**
- * Total model calls one summarize may spend: the first attempt plus at most two repairs.
- *
- * The cap is the whole reason this loop can exist under the extension's cost filter, which
- * otherwise promises a single call per file. A model that cannot produce the shape in
- * three tries is not going to produce it in ten, and the call fails.
- */
-export const MAX_ATTEMPTS = 3;
 
 export type SummarizeStatus = "fresh" | "stale" | "miss" | "forced";
 
@@ -63,8 +52,6 @@ export type SummarizeOutcome = {
 	usage?: Usage;
 	/** True when the answer carried no usable line map, so only prose was stored. */
 	degraded: boolean;
-	/** Model calls spent, including repairs. */
-	attempts: number;
 };
 
 /**
@@ -187,7 +174,6 @@ async function runSummarize(
 					entry: cached,
 					status: "fresh",
 					degraded: cached.mode === "blob",
-					attempts: 0,
 				};
 			}
 		}
@@ -216,7 +202,6 @@ async function runSummarize(
 			status,
 			usage: result.usage,
 			degraded: result.mode === "blob",
-			attempts: result.attempts,
 		};
 	} finally {
 		db.close();
@@ -228,7 +213,6 @@ type SummaryResult = {
 	sections: Section[];
 	mode: SummaryMode;
 	usage?: Usage;
-	attempts: number;
 };
 
 /**
@@ -248,22 +232,17 @@ const emitSummaryTool: Tool = {
 };
 
 /**
- * Ask the model for a summary and repair the answer until it validates, or give up.
+ * Ask the model for one summary, and take the answer or fail.
  *
  * The answer is a call to `emit_summary`, so the map is schema-constrained where the
- * provider has that and schema-checked before a row is read. One call per loop iteration,
- * so `MAX_ATTEMPTS` is a real ceiling on spend. Two different failures are handled
- * differently:
+ * provider has that and schema-checked before a row is read. There is no repair loop: one
+ * summarization is one call, so a model that answers unusably costs exactly what a working
+ * one does and no second call is spent arguing with it. Prose stored under the summary's
+ * name would claim a map the model never gave, and the caller has no other way to learn why
+ * it has nothing.
  *
- * - A **provider error** is not the model's fault and a retry may not help, so it fails
- *   the call and names the reason.
- * - A missing or invalid **output** is repaired by appending the model's own answer plus
- *   the specific violations and asking again. This is a fix-up loop over one prompt, not
- *   an agentic cycle: the summarizer never chooses what to do next, and its one tool is an
- *   answer channel rather than a capability.
- *
- * When the cap runs out the call fails. Prose stored under the summary's name would claim a
- * map the model never gave, and the caller has no other way to learn why it has nothing.
+ * The action goes in the message because pi drops `hint` from a thrown tool error, while
+ * the diagnosis goes in the hint.
  */
 async function requestSummary(
 	ctx: ExtensionContext,
@@ -272,82 +251,50 @@ async function requestSummary(
 	prepared: PreparedFile,
 	signal: AbortSignal | undefined,
 ): Promise<SummaryResult> {
-	// Messages to resend on the next attempt. Grows only with the model's own answer and
-	// the list of problems, so every retry is a fresh streamSimple() call over one prompt.
-	const messages: Message[] = [userMessage(buildSummarizePrompt(key, prepared))];
-	let problems: string[] = [];
-
-	for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-		const response = await ctx.modelRegistry
-			.streamSimple(
-				model,
-				{ messages, tools: [emitSummaryTool] },
-				{ signal, cacheRetention: "none" },
-			)
-			.result();
-		if (isProviderError(response)) {
-			throw new ModelCallError(
-				`the summarizer call failed for ${key}: ${response.errorMessage ?? response.stopReason}`,
-				"That is the provider's error rather than a summary problem, so retrying may not help.",
-			);
-		}
-
-		const call = emitSummaryCall(response);
-		if (!call) {
-			problems = ["the answer did not call the emit_summary tool"];
-		} else {
-			try {
-				const value = validateToolArguments(emitSummaryTool, call) as EmitSummary;
-				// Overlapping rows are trimmed here rather than reported back to the model. The trim
-				// is deterministic, and spending a model call to fix arithmetic the code already
-				// fixes for free contradicts the cost discipline. Gaps are left alone: they are the
-				// model declining to map dead lines, and the renderer shows them as skipped.
-				const sections = normalizeSections(value.sections, prepared.totalLines);
-				if (sections) {
-					return {
-						overview: truncateOverview(value.overview.trim() || "(no overview provided)"),
-						sections,
-						mode: "mapped",
-						usage: response.usage,
-						attempts: attempt,
-					};
-				}
-
-				// A valid envelope with no usable rows is a blob: there is no map to show, and
-				// inventing a single file-spanning region would be indistinguishable from a real one.
-				// An explicitly empty `sections` is the model's answer that the file has no map, so
-				// accept it rather than spending calls arguing.
-				return {
-					overview: truncateOverview(value.overview.trim() || "(no overview provided)"),
-					sections: [],
-					mode: "blob",
-					usage: response.usage,
-					attempts: attempt,
-				};
-			} catch (error) {
-				problems = validationProblems(error);
-			}
-		}
-
-		if (attempt < MAX_ATTEMPTS) {
-			messages.push(
-				assistantTextMessage(
-					response,
-					call ? JSON.stringify(call.arguments, null, 2) : assistantText(response),
-				),
-			);
-			messages.push(userMessage(buildRepairPrompt(problems)));
-		}
+	const response = await ctx.modelRegistry
+		.streamSimple(
+			model,
+			{ messages: [userMessage(buildSummarizePrompt(key, prepared))], tools: [emitSummaryTool] },
+			{ signal, cacheRetention: "none" },
+		)
+		.result();
+	if (isProviderError(response)) {
+		throw new ModelCallError(
+			`the summarizer call failed for ${key}: ${response.errorMessage ?? response.stopReason}`,
+			"That is the provider's error rather than a summary problem.",
+		);
 	}
 
-	// The budget is spent and nothing validated. Salvaging the prose as a blob would dress a
-	// guess up as the summary that was asked for, so the call fails and says what happened.
-	// The action goes in the message because pi drops `hint` from a thrown tool error, while
-	// the diagnosis goes in the hint, where the fallback's notice can still show it.
-	throw new ModelCallError(
-		`the summarizer never produced a usable answer for ${key} after ${MAX_ATTEMPTS} attempts; name a different one with model=provider/model`,
-		`The last answer was rejected for: ${problems.join("; ") || "it did not match the required shape"}.`,
-	);
+	const call = emitSummaryCall(response);
+	if (!call) {
+		throw new ModelCallError(
+			`the summarizer did not produce a usable answer for ${key}; name a different one with model=provider/model`,
+			"The answer did not call the emit_summary tool.",
+		);
+	}
+
+	let value: EmitSummary;
+	try {
+		value = validateToolArguments(emitSummaryTool, call) as EmitSummary;
+	} catch (error) {
+		throw new ModelCallError(
+			`the summarizer did not produce a usable answer for ${key}; name a different one with model=provider/model`,
+			`The answer was rejected for: ${validationProblems(error).join("; ") || "it did not match the required shape"}.`,
+		);
+	}
+
+	// Overlapping rows are trimmed here rather than reported back to the model: the trim is
+	// deterministic, and fixing arithmetic the code already fixes for free cannot justify a
+	// second call. Gaps are left alone - the model declining to map dead lines - and a valid
+	// envelope with no usable rows is a blob: there is no map to show, and inventing one
+	// file-spanning region would be indistinguishable from a real one.
+	const sections = normalizeSections(value.sections, prepared.totalLines);
+	return {
+		overview: truncateOverview(value.overview.trim() || "(no overview provided)"),
+		sections: sections ?? [],
+		mode: sections ? "mapped" : "blob",
+		usage: response.usage,
+	};
 }
 
 /**
@@ -364,9 +311,8 @@ function truncateOverview(overview: string): string {
 }
 
 /**
- * The validator's complaints for the corrective prompt, without the arguments dump it
- * appends: the repair turn already resends those arguments, and the dump would dwarf the
- * complaint it is sent with.
+ * The validator's complaints for the failure's diagnosis, without the arguments dump it
+ * appends: the caller is told what was wrong, not shown the whole answer again.
  */
 function validationProblems(error: unknown): string[] {
 	const text = error instanceof Error ? error.message : String(error);
@@ -385,17 +331,6 @@ function emitSummaryCall(response: AssistantMessage): ToolCall | undefined {
 
 function userMessage(text: string): UserMessage {
 	return { role: "user", content: [{ type: "text", text }], timestamp: Date.now() };
-}
-
-/**
- * The model's own answer, resent as the assistant turn before the correction.
- *
- * Built from the real response so every field the provider requires is present, with the
- * content replaced by its text. Thinking blocks are dropped: they are not needed to
- * continue a fix-up exchange and would be billed again.
- */
-function assistantTextMessage(response: AssistantMessage, text: string): AssistantMessage {
-	return { ...response, content: [{ type: "text", text }] };
 }
 
 /** True when the provider returned an error instead of an answer. */

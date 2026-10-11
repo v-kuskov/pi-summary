@@ -8,7 +8,6 @@ import assert from "node:assert/strict";
 
 import extensionFactory from "./index.ts";
 import { countLinesFrom } from "./src/hash.ts";
-import { MAX_ATTEMPTS } from "./src/summarize.ts";
 import { ensureSchema, openDb, readSummary, writeSummary } from "./src/store.ts";
 import { readSettings } from "./src/settings.ts";
 import { registerSummaryTool } from "./src/tools.ts";
@@ -70,8 +69,9 @@ const errorResponse = (message) => ({
 	usage: { input: 10, output: 5, totalTokens: 15 },
 });
 // The fake summarizer answers with a map that tiles the excerpt it was given: one row
-// spanning the whole thing. A fixture whose rows leave gaps or overlap would now cost a
-// repair call, so helpers here build tiling answers unless a test wants otherwise.
+// spanning the whole thing. A fixture whose rows leave gaps or overlap would be normalized
+// rather than stored as given, so helpers here build tiling answers unless a test wants
+// otherwise.
 const lastShownLine = (context) => {
 	const prompt = context.messages[0].content[0].text;
 	return Number(prompt.match(/File: .*\((\d+) lines;/)[1]);
@@ -271,7 +271,7 @@ await check("normalizeSections resolves a container row against its contents", a
 
 await check("normalizeSections repairs missing and invalid importance to 2", async () => {
 	// Importance is a free field the model may omit, mistype or fill with a stale number. None
-	// of those is worth a repair call: the row is still a real region, so the reading that keeps
+	// of those is worth rejecting the answer over: the row is still a real region, so the reading that keeps
 	// the most information is the middle tier. Only the three literals survive; everything else,
 	// including a same-looking string, becomes 2.
 	const rows = normalizeSections(
@@ -790,7 +790,7 @@ await check("summary asks for one tool call, and reports nested usage", async ()
 		assert.equal(opts.sessionId, undefined, "a one-off call carries no session affinity");
 		assert.match(context.messages[0].content[0].text, /emit_summary/);
 		assert.equal(result.usage.totalTokens, 15, "nested tokens are surfaced");
-		assert.equal(result.details.attempts, 1);
+		assert.equal(h.calls.length, 1, "exactly one call is spent");
 		assert.equal(result.details.degraded, false);
 	} finally {
 		rmSync(root, { recursive: true, force: true });
@@ -893,7 +893,7 @@ await check("refresh forces a new summary", async () => {
 	}
 });
 
-await check("a prose-only answer is repaired twice, then the call fails", async () => {
+await check("a prose-only answer fails the call, with no repair attempt", async () => {
 	const root = tempProject();
 	try {
 		writeFileSync(join(root, "src", "a.ts"), numbered(400));
@@ -903,76 +903,48 @@ await check("a prose-only answer is repaired twice, then the call fails", async 
 				textResponse("This file implements the sync client and its retry loop."),
 		});
 
-		// The budget is spent and nothing validated: prose stored as a summary would claim a map
-		// the model never gave, so the call fails and says so.
+		// Prose stored as a summary would claim a map the model never gave, so the call fails
+		// and says so. There is no repair loop: one summarize is one call, and an unusable
+		// answer is not argued with.
 		await assert.rejects(
 			() => runTool(h, "summary", { path: "src/a.ts" }),
-			/never produced a usable answer/,
+			/did not produce a usable answer/,
 		);
-		assert.equal(h.calls.length, MAX_ATTEMPTS, "spend is capped, not unbounded");
-
-		// The repair turn carries the model's own answer and the specific complaint.
-		const repair = h.calls[1].context.messages;
-		assert.equal(repair[1].role, "assistant", "the model's answer is resent as its own turn");
-		assert.match(repair[2].content[0].text, /previous answer was rejected/);
-		assert.match(repair[2].content[0].text, /did not call the emit_summary tool/);
+		assert.equal(h.calls.length, 1, "one call, never a repair");
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
 });
 
-await check("a bad first answer is repaired into a good map without degrading", async () => {
+await check("tool arguments that fail the schema fail the call, naming the violations", async () => {
 	const root = tempProject();
 	try {
 		writeFileSync(join(root, "src", "a.ts"), numbered(300));
 		const h = makeHarness({
 			cwd: root,
-			respond: (_context, _opts, n) =>
-				n === 1
-					? textResponse("Here is the summary you asked for!")
-					: tilingAnswer("Sync client.")(_context),
+			respond: () => toolResponse({ overview: "Rows are not rows.", sections: "not an array" }),
 		});
 
-		const result = await runTool(h, "summary", { path: "src/a.ts" });
-		assert.equal(h.calls.length, 2, "one repair, then success");
-		assert.equal(result.details.mode, "mapped");
-		assert.equal(result.details.degraded, false);
-		assert.equal(result.details.attempts, 2);
-		assert.equal(result.details.sections, 1);
+		await assert.rejects(
+			() => runTool(h, "summary", { path: "src/a.ts" }),
+			(error) => {
+				assert.match(error.message, /did not produce a usable answer/);
+				assert.match(`${error.message} ${error.hint ?? ""}`, /sections/, "the failing field is named");
+				return true;
+			},
+		);
+		assert.equal(h.calls.length, 1, "one call, never a repair");
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
 });
 
-await check("tool arguments that fail the schema are repaired with the violations", async () => {
+await check("a valid envelope with unusable rows degrades to a blob", async () => {
 	const root = tempProject();
 	try {
 		writeFileSync(join(root, "src", "a.ts"), numbered(300));
-		const h = makeHarness({
-			cwd: root,
-			respond: (_context, _opts, n) =>
-				n === 1
-					? toolResponse({ overview: "Rows are not rows.", sections: "not an array" })
-					: tilingAnswer("Sync client.")(_context),
-		});
-
-		const result = await runTool(h, "summary", { path: "src/a.ts" });
-		assert.equal(h.calls.length, 2, "one repair, then success");
-		assert.equal(result.details.attempts, 2);
-		const repair = h.calls[1].context.messages;
-		assert.match(repair[2].content[0].text, /sections/, "the failing field is named");
-		assert.match(repair[2].content[0].text, /emit_summary/);
-	} finally {
-		rmSync(root, { recursive: true, force: true });
-	}
-});
-
-await check("a valid envelope with unusable rows degrades instead of repeating the repair", async () => {
-	const root = tempProject();
-	try {
-		writeFileSync(join(root, "src", "a.ts"), numbered(300));
-		// The shape is right, so there is nothing for the model to fix; the rows are simply
-		// absent, which is a blob rather than a reason to call again.
+		// The shape is right and the answer stands as given: the rows are simply absent, which
+		// is a blob rather than an error.
 		const h = makeHarness({
 			cwd: root,
 			respond: () => toolResponse({ overview: "No rows at all.", sections: [] }),
@@ -1024,12 +996,12 @@ await check("an unreadable file is still a real error", async () => {
 	}
 });
 
-await check("a map with a gap is accepted without spending a repair", async () => {
+await check("a map with a gap is accepted as the model gave it", async () => {
 	const root = tempProject();
 	try {
 		writeFileSync(join(root, "src", "a.ts"), numbered(400));
-		// Lines 101-400 are left out. Under the old contract that cost a repair; gaps are now
-		// the model declining to map dead lines, so it is accepted as-is.
+		// Lines 101-400 are left out: the model declining to map dead lines, so the gap is
+		// accepted as-is rather than rejected.
 		const h = makeHarness({
 			cwd: root,
 			respond: () =>
@@ -1043,7 +1015,6 @@ await check("a map with a gap is accepted without spending a repair", async () =
 		assert.equal(h.calls.length, 1, "a gap is not worth a model call");
 		assert.equal(result.details.mode, "mapped");
 		assert.equal(result.details.degraded, false);
-		assert.equal(result.details.attempts, 1);
 		// The unclaimed lines are simply absent from the map.
 		assert.match(result.content[0].text, /1-\s*100\s+function/);
 		assert.doesNotMatch(result.content[0].text, /skipped/, "gaps are not narrated");
@@ -1052,38 +1023,32 @@ await check("a map with a gap is accepted without spending a repair", async () =
 	}
 });
 
-await check("a fenced prose answer is not parsed - it is repaired into a tool call", async () => {
+await check("a fenced prose answer is not parsed - it fails the call", async () => {
 	const root = tempProject();
 	try {
 		writeFileSync(join(root, "src", "a.ts"), numbered(300));
 		// The answer channel is the tool call alone: a model that writes its map as prose -
-		// fenced or not - is told to call the tool, not met halfway.
+		// fenced or not - is not met halfway.
 		const h = makeHarness({
 			cwd: root,
-			respond: (context, _opts, n) =>
-				n === 1
-					? textResponse(
-							"```json\n" +
-								JSON.stringify({
-									overview: "Sync client.",
-									sections: [
-										{ start_line: 1, end_line: lastShownLine(context), kind: "function", name: "connect()", note: "dials" },
-									],
-								}) +
-								"\n```",
-						)
-					: toolResponse({
+			respond: (context) =>
+				textResponse(
+					"```json\n" +
+						JSON.stringify({
 							overview: "Sync client.",
 							sections: [
 								{ start_line: 1, end_line: lastShownLine(context), kind: "function", name: "connect()", note: "dials" },
 							],
-						}),
+						}) +
+						"\n```",
+				),
 		});
 
-		const result = await runTool(h, "summary", { path: "src/a.ts" });
-		assert.equal(h.calls.length, 2, "prose is repaired, not parsed");
-		assert.equal(result.details.mode, "mapped");
-		assert.equal(result.details.sections, 1);
+		await assert.rejects(
+			() => runTool(h, "summary", { path: "src/a.ts" }),
+			/did not produce a usable answer/,
+		);
+		assert.equal(h.calls.length, 1, "one call: prose is neither parsed nor repaired");
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
@@ -1178,7 +1143,7 @@ await check("a runaway note is cut to the stated budget", async () => {
 	assert.equal(short[0].note, "short", "a note inside the budget is untouched");
 });
 
-await check("overlapping rows are trimmed locally, without spending a repair", async () => {
+await check("overlapping rows are trimmed locally, without another call", async () => {
 	const root = tempProject();
 	try {
 		writeFileSync(join(root, "src", "a.ts"), numbered(100));
@@ -1199,7 +1164,6 @@ await check("overlapping rows are trimmed locally, without spending a repair", a
 		const result = await runTool(h, "summary", { path: "src/a.ts" });
 		assert.equal(h.calls.length, 1, "a fixable overlap is not worth a model call");
 		assert.equal(result.details.mode, "mapped");
-		assert.equal(result.details.attempts, 1);
 		// The earlier row is cut to the line before its child begins.
 		assert.match(result.content[0].text, /1-\s*39\s+class/);
 		assert.match(result.content[0].text, /40-\s*101\s+function/);
@@ -1225,7 +1189,7 @@ await check("no stored map can contain overlapping rows, however the model answe
 		});
 
 		const result = await runTool(h, "summary", { path: "src/a.ts" });
-		assert.equal(h.calls.length, 1, "one call: the overlap is not a repair problem");
+		assert.equal(h.calls.length, 1, "one call: the overlap is trimmed, not rejected");
 		assert.equal(result.details.mode, "mapped");
 		assert.equal(result.details.sections, 2);
 		assert.match(result.content[0].text, /1-\s*59\s+class/);
@@ -1978,7 +1942,6 @@ await check("a failed summary is drawn as the whole-file fallback it is", async 
 			lines: 2,
 			model: "",
 			sections: 0,
-			attempts: 0,
 			degraded: true,
 		},
 	};
@@ -2208,14 +2171,9 @@ if (runLlm) {
 
 			const result = await runTool(h, "summary", { path: "src/client.ts" });
 			assert.equal(result.details.status, "miss");
-			// Not "exactly one attempt": whether the first answer validates is the model's business,
-			// and it is not stable run to run. What the extension guarantees is the budget - at most
-			// MAX_ATTEMPTS calls - and that a usable map came back within it.
-			assert.ok(result.details.attempts >= 1, "at least one call was made");
-			assert.ok(
-				result.details.attempts <= MAX_ATTEMPTS,
-				`${MAX_ATTEMPTS} attempts at most, took ${result.details.attempts}`,
-			);
+			// Exactly one call per summarize: the extension never repairs an unusable answer,
+			// so the spend is a constant rather than a budget.
+			assert.equal(h.calls.length, 1, "one model call, and never a repair");
 			assert.equal(result.details.degraded, false, "and it mapped the file rather than degrading");
 			assert.ok(result.details.sections > 0, "there is a map to read");
 			assert.match(result.content[0].text, /## map/);

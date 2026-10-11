@@ -11,8 +11,7 @@ export class SummaryError extends Error {
 }
 
 /**
- * The summarizer's model call failed: the provider errored, or no answer validated within
- * the attempt budget.
+ * The summarizer's model call failed: the provider errored, or the answer did not validate.
  *
  * Separate from `SummaryError` because the two callers want opposite things from it.
  * `summary` fails with it - the model asked for a map and must be told it has none - while

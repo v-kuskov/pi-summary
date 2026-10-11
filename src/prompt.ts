@@ -92,20 +92,6 @@ export function buildSummarizePrompt(path: string, file: PreparedFile): string {
 	].join("\n");
 }
 
-/** Follow-up message listing what was wrong, sent when the previous answer failed validation. */
-export function buildRepairPrompt(problems: string[]): string {
-	return [
-		"Your previous answer was rejected. Reply by calling the emit_summary tool again with the corrected arguments.",
-		"",
-		"Problems found:",
-		...problems.map((problem) => `  - ${problem}`),
-		"",
-		"Re-read the numbers in the left column of the excerpt and copy them, rather than adjusting them by hand.",
-		"Rows may leave gaps for lines that do nothing, and no two rows may share a line.",
-	].join("\n");
-}
-
-
 /** Model id in `provider/model` form for the cache header. */
 export function modelLabel(model: { provider: string; id: string }): string {
 	return `${model.provider}/${model.id}`;
