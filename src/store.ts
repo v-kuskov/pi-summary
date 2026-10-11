@@ -100,13 +100,47 @@ export function openDb(cwd: string): OpenResult {
 	const dbPath = resolveDbPath(cwd);
 	mkdirSync(dirname(dbPath), { recursive: true });
 	const db = new DatabaseSync(dbPath);
-	// busy_timeout FIRST: switching the journal mode requires an exclusive lock, so with the
-	// default zero timeout two processes starting at once make it fail immediately with
-	// SQLITE_BUSY ("database is locked") instead of waiting their turn. Setting the timeout
-	// afterwards leaves the one statement that needs it most unprotected.
+	// busy_timeout FIRST: every later statement - the schema migration and the write
+	// transaction - waits its turn instead of failing immediately with SQLITE_BUSY. Setting
+	// the timeout afterwards would leave those statements unprotected.
 	db.exec("PRAGMA busy_timeout = 3000");
-	db.exec("PRAGMA journal_mode = WAL");
+	switchToWal(db);
 	return { db, dbPath };
+}
+
+/** Patience for one lock, shared by the busy_timeout pragma and the WAL switch's retry. */
+const BUSY_BUDGET_MS = 3000;
+
+/**
+ * Switch the connection to WAL, retrying the one lock race `busy_timeout` does not cover.
+ *
+ * The journal-mode change needs an exclusive lock and is not guarded by the busy handler:
+ * with `busy_timeout` already at 3000 a competing process still failed within 1-5 ms, and
+ * a stress run of 8 concurrent openers lost a writer in 3 of 48 rounds. The switch is
+ * idempotent - once the file is WAL, every later open's switch is a no-op - so a loser only
+ * has to outwait the winner's milliseconds. Sleep and retry within the same budget the
+ * timeout gives any other lock, then let the error through rather than hang.
+ */
+function switchToWal(db: DatabaseSync): void {
+	const deadline = Date.now() + BUSY_BUDGET_MS;
+	for (;;) {
+		try {
+			db.exec("PRAGMA journal_mode = WAL");
+			return;
+		} catch (error) {
+			if (!isLockContention(error) || Date.now() >= deadline) throw error;
+			// Synchronous sleep: openDb is sync and its callers open the db in the middle of
+			// work they would otherwise have to restructure around an async open.
+			Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+		}
+	}
+}
+
+/** SQLITE_BUSY / SQLITE_LOCKED however the host names them. */
+function isLockContention(error: unknown): boolean {
+	if (!(error instanceof Error)) return false;
+	const errcode = (error as { errcode?: number }).errcode;
+	return errcode === 5 || errcode === 6 || /locked/i.test(error.message);
 }
 
 /** Create tables if absent, and drop columns that are no longer used. */
