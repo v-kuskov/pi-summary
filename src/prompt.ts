@@ -1,5 +1,4 @@
 import { readFile } from "node:fs/promises";
-import { SECTION_KINDS } from "./schema.ts";
 
 /** Separator between the line number and the line's text in the numbered excerpt. */
 const GUTTER = "\t";
@@ -46,11 +45,12 @@ export async function prepareFile(absPath: string): Promise<PreparedFile> {
 }
 
 /**
- * The summarization prompt: what the map is for, how the file is laid out, the JSON
- * contract, the limits the answer is held to, then the numbered file.
+ * The summarization prompt: what the map is for, how the file is laid out, the limits the
+ * answer is held to, then the numbered file.
  *
- * There is no tool schema in this request, so this text is the entire contract - but it is
- * held to a goal, a shape, and a few limits, nothing more. Four things carry the weight:
+ * The field-by-field contract is not here: it rides on `emitSummarySchema`, which the model
+ * sees as the parameters of the `emit_summary` tool it must call. What remains is held to a
+ * goal and a few limits, nothing more. Three things carry the weight:
  *
  * - The map is a **retrieval index**, not a caption: `name` is asked for as the exact symbol
  *   a reader would search and copy back to look a region up, never a bare number (a row
@@ -59,22 +59,17 @@ export async function prepareFile(absPath: string): Promise<PreparedFile> {
  * - The excerpt is **numbered**, and one line says the numbers are copied from the left
  *   column. That turns a counting task, which models fail at over long files, into a
  *   copying task.
- * - The `Limits` are what a model cannot infer: the `kind` vocabulary, that gaps are
- *   legal, that numbers come from the column rather than from counting, and the two field
- *   lengths that are cut on the way into storage.
- * - The **importance** rubric is a ranking the model cannot guess from the shape alone:
- *   nothing about a file says whether its own author considers a helper load-bearing, so the
- *   three tiers are stated as examples rather than left to be inferred.
+ * - The `Limits` are what a model cannot infer: that gaps are legal, that numbers come
+ *   from the column rather than from counting, and that boilerplate gets no rows.
  *
- * A worked example and a bullet per JSON field were both measured and dropped - together
- * about 2400 characters, over half the prompt. Every rule they stated is either stated
- * here once, shorter, or enforced locally by `normalizeSections` (overlap and reversed
- * ranges) instead of asked for.
+ * A worked example was measured and dropped - it was over half the prompt, and every rule
+ * it stated is either stated here once, shorter, or enforced locally by `normalizeSections`
+ * (overlap and reversed ranges) instead of asked for.
  */
 export function buildSummarizePrompt(path: string, file: PreparedFile): string {
 	return [
 		"Index this file so a later model can find where any information in it lives and read only that part.",
-		"Reply with one JSON object and nothing else - no prose, no markdown fence.",
+		"Reply by calling the emit_summary tool once, with the whole map as its arguments. No prose.",
 		"",
 		`File: ${path} (${file.totalLines} lines; line ${file.totalLines} is the last).`,
 		"",
@@ -82,17 +77,6 @@ export function buildSummarizePrompt(path: string, file: PreparedFile): string {
 		"",
 		`     1${GUTTER}the first line of the file`,
 		`     2${GUTTER}the second line`,
-		"",
-		"JSON shape:",
-		'  { "overview": string, "sections": [ { "start_line": number, "end_line": number, "kind": string, "name": string, "note": string, "importance": 1|2|3 } ] }',
-		"",
-		"overview: what the file is for, its main exports and how they relate, and anything a reader must know before changing it. Shown without the map when there is no room for both, so it must stand alone. At most ten sentences.",
-		"sections: rows in line order. A row is one declaration and its body, or a run of declarations that do the same kind of thing and read as one stripe. No two rows share a line.",
-		"  start_line / end_line: inclusive line numbers copied from the left column.",
-		`  kind: one of ${SECTION_KINDS.join(", ")}.`,
-		"  name: the symbol exactly as the file spells it, never a bare number - a reader copies it back to look the region up - or the pattern plus how many when a row covers many; (top level) for loose statements.",
-		"  note: what lives in the region and what it does - name the behaviors, data or cases a reader would look for - plus any side effect or invariant that matters when editing it. At most two sentences, about 200 characters.",
-		"  importance: a tier on every row - 3 = main exports, core state, entry points, and the invariants a change must respect; 2 = supporting functions and types that serve the 3s; 1 = incidental - trivial accessors, glue, configuration. Most rows are 2; reserve 3 for the few that matter most.",
 		"",
 		"Limits:",
 		"  - Copy line numbers from the left column; do not count lines yourself.",
@@ -111,50 +95,16 @@ export function buildSummarizePrompt(path: string, file: PreparedFile): string {
 /** Follow-up message listing what was wrong, sent when the previous answer failed validation. */
 export function buildRepairPrompt(problems: string[]): string {
 	return [
-		"Your previous answer was rejected. It must be a single JSON object matching the shape above.",
+		"Your previous answer was rejected. Reply by calling the emit_summary tool again with the corrected arguments.",
 		"",
 		"Problems found:",
 		...problems.map((problem) => `  - ${problem}`),
 		"",
-		"Reply with the corrected JSON object only. No prose, no markdown fence.",
 		"Re-read the numbers in the left column of the excerpt and copy them, rather than adjusting them by hand.",
 		"Rows may leave gaps for lines that do nothing, and no two rows may share a line.",
 	].join("\n");
 }
 
-
-/**
- * Parse an answer that is supposed to be JSON.
- *
- * Tolerates the two slips a model makes most often: a markdown fence around the object,
- * and leading or trailing prose around it. Returns undefined when there is no JSON object
- * to be found at all.
- */
-export function parseJsonAnswer(text: string): unknown | undefined {
-	const cleaned = stripFences(text);
-	const candidates = [cleaned];
-
-	const first = cleaned.indexOf("{");
-	const last = cleaned.lastIndexOf("}");
-	if (first >= 0 && last > first) candidates.push(cleaned.slice(first, last + 1));
-
-	for (const candidate of candidates) {
-		try {
-			return JSON.parse(candidate);
-		} catch {
-			// Try the next candidate.
-		}
-	}
-	return undefined;
-}
-
-/** Drop a leading/trailing ``` fence so an otherwise-valid answer still parses. */
-function stripFences(text: string): string {
-	return text
-		.replace(/^\s*```[a-z]*\s*\n?/i, "")
-		.replace(/\n?```\s*$/i, "")
-		.trim();
-}
 
 /** Model id in `provider/model` form for the cache header. */
 export function modelLabel(model: { provider: string; id: string }): string {

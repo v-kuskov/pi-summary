@@ -1,5 +1,4 @@
 import { Type, type Static } from "typebox";
-import { Value } from "typebox/value";
 import { StringEnum } from "@earendil-works/pi-ai";
 import {
 	type CachedSummary,
@@ -29,37 +28,60 @@ export const SECTION_KINDS = [
 	"other",
 ] as const;
 
-/** Longest a note may be before it is cut. Two sentences, matching the prompt. */
+/** Longest a note may be before it is cut. Two sentences, matching the schema's `note`. */
 export const MAX_NOTE_CHARS = 200;
 
-/** Longest an overview may be before it is cut. Ten sentences, matching the prompt. */
+/** Longest an overview may be before it is cut. Ten sentences, matching the schema's `overview`. */
 export const MAX_OVERVIEW_CHARS = 2400;
 
 /**
- * The shape the model must return, and the shape the database stores.
+ * The shape the model must return: the parameter schema of the `emit_summary` tool it has
+ * to call, and the shape the database stores.
  *
- * This is a plain JSON contract, not a tool schema: the summarizer is asked for JSON in
- * prose and the answer is validated here. A flat `{overview, sections[]}` is deliberate —
- * it keeps every provider's native JSON mode usable, since strict modes reject `$ref`,
- * `allOf`, `oneOf`, and object unions.
+ * A flat `{overview, sections[]}` is deliberate - it keeps schema-constrained decoding
+ * usable everywhere, since strict modes reject `$ref`, `allOf`, `oneOf`, and object unions.
  *
- * The types carry no `description`s on purpose. This schema is never sent to a provider —
- * the request hand-builds `response_format: { type: "json_object" }` — and its only reader
- * is `Value.Errors` below, whose messages are built from the failing keyword rather than
- * from prose. The field-by-field contract lives in `buildSummarizePrompt`, which is the
- * text the model actually sees and the one place a change has to be made.
+ * The descriptions are the field contract, and the model is shown them: this schema is
+ * what it receives as the tool to answer with, so the contract lives here and nowhere
+ * else. `importance` is optional on purpose - `normalizeSections` reads an absent tier as
+ * 2, and turning its absence into a repair call would make a display-only tier cost model
+ * spend.
  */
 export const emitSummarySchema = Type.Object({
-	overview: Type.String(),
+	overview: Type.String({
+		description:
+			"What the file is for, its main exports and how they relate, and anything a reader must know before changing it. Shown without the map when there is no room for both, so it must stand alone. At most ten sentences.",
+	}),
 	sections: Type.Array(
 		Type.Object({
-			start_line: Type.Integer(),
-			end_line: Type.Integer(),
-			kind: StringEnum(SECTION_KINDS),
-			name: Type.String(),
-			note: Type.String(),
-			importance: Type.Union([Type.Literal(1), Type.Literal(2), Type.Literal(3)]),
+			start_line: Type.Integer({
+				description: "Inclusive start line, copied from the left column of the excerpt.",
+			}),
+			end_line: Type.Integer({
+				description: "Inclusive end line, copied from the left column of the excerpt.",
+			}),
+			kind: StringEnum(SECTION_KINDS, {
+				description: "What kind of declaration the region holds.",
+			}),
+			name: Type.String({
+				description:
+					"The symbol exactly as the file spells it, never a bare number - a reader copies it back to look the region up - or the pattern plus how many when a row covers many; (top level) for loose statements.",
+			}),
+			note: Type.String({
+				description:
+					"What lives in the region and what it does - name the behaviors, data or cases a reader would look for - plus any side effect or invariant that matters when editing it. At most two sentences, about 200 characters.",
+			}),
+			importance: Type.Optional(
+				Type.Union([Type.Literal(1), Type.Literal(2), Type.Literal(3)], {
+					description:
+						"A tier on every row - 3 = main exports, core state, entry points, and the invariants a change must respect; 2 = supporting functions and types that serve the 3s; 1 = incidental - trivial accessors, glue, configuration. Most rows are 2; reserve 3 for the few that matter most.",
+				}),
+			),
 		}),
+		{
+			description:
+				"Rows in line order. A row is one declaration and its body, or a run of declarations that do the same kind of thing and read as one stripe. No two rows share a line.",
+		},
 	),
 });
 
@@ -71,33 +93,9 @@ export type EmitSummary = {
 		kind: string;
 		name: string;
 		note: string;
-		importance: 1 | 2 | 3;
+		importance?: 1 | 2 | 3;
 	}>;
 };
-
-/**
- * True when the payload has the two fields the contract requires, at the right types.
- *
- * This is the boundary between "repair it" and "normalize it": a payload that fails here
- * cannot be salvaged locally, so the model is asked again. A payload that passes here is
- * only ever missing or wrong at the row level, which `normalizeSections` fixes for free.
- */
-export function hasTopLevelShape(value: unknown): value is EmitSummary {
-	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-	const record = value as Record<string, unknown>;
-	return typeof record.overview === "string" && Array.isArray(record.sections);
-}
-
-/** Human-readable schema violations, for the corrective prompt. */
-export function describeSchemaErrors(value: unknown): string[] {
-	const errors: string[] = [];
-	for (const error of Value.Errors(emitSummarySchema, value)) {
-		// `instancePath` is a JSON Pointer such as `/sections/0/start_line`.
-		errors.push(`${error.instancePath || "/"} ${error.message}`);
-		if (errors.length >= 8) break;
-	}
-	return errors;
-}
 
 export function truncateNote(note: string): string {
 	const max = MAX_NOTE_CHARS;

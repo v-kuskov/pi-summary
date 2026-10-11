@@ -12,10 +12,8 @@ import { MAX_ATTEMPTS } from "./src/summarize.ts";
 import { ensureSchema, openDb, readSummary, writeSummary } from "./src/store.ts";
 import { readSettings } from "./src/settings.ts";
 import { registerSummaryTool } from "./src/tools.ts";
-import { parseJsonAnswer } from "./src/prompt.ts";
 import { Value } from "typebox/value";
 import {
-	hasTopLevelShape,
 	normalizeSections,
 	MAX_NOTE_CHARS,
 	summaryOutputSchema,
@@ -52,10 +50,11 @@ async function check(name, fn) {
 
 // ------------------------------------------------------------------ fake platform
 
-// The summarizer is a plain completion: its answer is JSON in the text channel.
-const jsonResponse = (payload) => ({
+// The summarizer answers by calling the emit_summary tool; the payload is its arguments.
+const toolResponse = (payload) => ({
 	role: "assistant",
-	content: [{ type: "text", text: JSON.stringify(payload) }],
+	content: [{ type: "toolCall", id: "call_1", name: "emit_summary", arguments: payload }],
+	stopReason: "toolUse",
 	usage: { input: 10, output: 5, totalTokens: 15 },
 });
 const textResponse = (text) => ({
@@ -79,7 +78,7 @@ const lastShownLine = (context) => {
 };
 const tilingAnswer = (overview, kind = "function", name = "run()", note = "does it") =>
 	(context) =>
-		jsonResponse({
+		toolResponse({
 			overview,
 			sections: [{ start_line: 1, end_line: lastShownLine(context), kind, name, note }],
 		});
@@ -107,9 +106,9 @@ function makeHarness(options = {}) {
 		modelRegistry: {
 			find: (p, id) => (p === "test" && id === "test-model" ? model : undefined),
 			hasConfiguredAuth: () => true,
-			complete: async (m, context, opts) => {
+			streamSimple: (m, context, opts) => {
 				calls.push({ model: m, context, opts });
-				return respond(context, opts, calls.length);
+				return { result: async () => respond(context, opts, calls.length) };
 			},
 		},
 	};
@@ -291,24 +290,6 @@ await check("normalizeSections repairs missing and invalid importance to 2", asy
 		[2, 3, 1, 2, 2, 2],
 		"a valid tier survives; a missing or nonsensical one is 2",
 	);
-});
-
-await check("hasTopLevelShape separates repairable shape from repairable rows", async () => {
-	assert.equal(hasTopLevelShape({ overview: "x", sections: [] }), true);
-	assert.equal(hasTopLevelShape({ overview: "x", sections: "nope" }), false);
-	assert.equal(hasTopLevelShape({ overview: 42, sections: [] }), false);
-	assert.equal(hasTopLevelShape({ sections: [] }), false);
-	assert.equal(hasTopLevelShape(null), false);
-	assert.equal(hasTopLevelShape([]), false);
-});
-
-await check("parseJsonAnswer tolerates a fence and surrounding prose", async () => {
-	const payload = { overview: "x", sections: [] };
-	assert.deepEqual(parseJsonAnswer(JSON.stringify(payload)), payload);
-	assert.deepEqual(parseJsonAnswer("```json\n" + JSON.stringify(payload) + "\n```"), payload);
-	assert.deepEqual(parseJsonAnswer("Sure!\n" + JSON.stringify(payload) + "\nHope that helps."), payload);
-	assert.equal(parseJsonAnswer("not json at all"), undefined);
-	assert.equal(parseJsonAnswer(""), undefined);
 });
 
 await check("the settings file is read from the project, then the agent dir", async () => {
@@ -673,7 +654,7 @@ await check("summary lines carry importance, and a missing one reads as 2", asyn
 		const h = makeHarness({
 			cwd: root,
 			respond: (context) =>
-				jsonResponse({
+				toolResponse({
 					overview: "Two regions.",
 					sections: [
 						{ start_line: 1, end_line: 200, kind: "class", name: "A", note: "core", importance: 3 },
@@ -704,7 +685,7 @@ await check("summary(path, region) returns the row and its numbered excerpt with
 		const h = makeHarness({
 			cwd: root,
 			respond: (context) =>
-				jsonResponse({
+				toolResponse({
 					overview: "Two regions.",
 					sections: [
 						{ start_line: 1, end_line: 10, kind: "class", name: "Widget", note: "holds state.", importance: 3 },
@@ -751,7 +732,7 @@ await check("an unknown region errors with the names that exist, and spends no c
 		const h = makeHarness({
 			cwd: root,
 			respond: (context) =>
-				jsonResponse({
+				toolResponse({
 					overview: "Two regions.",
 					sections: [
 						{ start_line: 1, end_line: 10, kind: "class", name: "Widget", note: "", importance: 3 },
@@ -794,7 +775,7 @@ await check("an unknown region errors with the names that exist, and spends no c
 	}
 });
 
-await check("summary asks for JSON only, with no tools, and reports nested usage", async () => {
+await check("summary asks for one tool call, and reports nested usage", async () => {
 	const root = tempProject();
 	try {
 		writeFileSync(join(root, "src", "a.ts"), numbered(10));
@@ -802,10 +783,12 @@ await check("summary asks for JSON only, with no tools, and reports nested usage
 
 		const result = await runTool(h, "summary", { path: "src/a.ts" });
 		const { context, opts } = h.calls[0];
-		assert.equal(context.tools, undefined, "no tool schema is sent to the summarizer");
-		assert.deepEqual(opts.samplingParams, { response_format: { type: "json_object" } });
+		assert.equal(context.tools.length, 1, "exactly one tool schema is sent to the summarizer");
+		assert.equal(context.tools[0].name, "emit_summary");
+		assert.deepEqual(context.tools[0].constrainedSampling, { type: "json_schema", strict: "prefer" });
 		assert.equal(opts.cacheRetention, "none");
-		assert.match(context.messages[0].content[0].text, /one JSON object and nothing else/);
+		assert.equal(opts.sessionId, undefined, "a one-off call carries no session affinity");
+		assert.match(context.messages[0].content[0].text, /emit_summary/);
 		assert.equal(result.usage.totalTokens, 15, "nested tokens are surfaced");
 		assert.equal(result.details.attempts, 1);
 		assert.equal(result.details.degraded, false);
@@ -932,7 +915,7 @@ await check("a prose-only answer is repaired twice, then the call fails", async 
 		const repair = h.calls[1].context.messages;
 		assert.equal(repair[1].role, "assistant", "the model's answer is resent as its own turn");
 		assert.match(repair[2].content[0].text, /previous answer was rejected/);
-		assert.match(repair[2].content[0].text, /not parseable as a JSON object/);
+		assert.match(repair[2].content[0].text, /did not call the emit_summary tool/);
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
@@ -961,6 +944,29 @@ await check("a bad first answer is repaired into a good map without degrading", 
 	}
 });
 
+await check("tool arguments that fail the schema are repaired with the violations", async () => {
+	const root = tempProject();
+	try {
+		writeFileSync(join(root, "src", "a.ts"), numbered(300));
+		const h = makeHarness({
+			cwd: root,
+			respond: (_context, _opts, n) =>
+				n === 1
+					? toolResponse({ overview: "Rows are not rows.", sections: "not an array" })
+					: tilingAnswer("Sync client.")(_context),
+		});
+
+		const result = await runTool(h, "summary", { path: "src/a.ts" });
+		assert.equal(h.calls.length, 2, "one repair, then success");
+		assert.equal(result.details.attempts, 2);
+		const repair = h.calls[1].context.messages;
+		assert.match(repair[2].content[0].text, /sections/, "the failing field is named");
+		assert.match(repair[2].content[0].text, /emit_summary/);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
 await check("a valid envelope with unusable rows degrades instead of repeating the repair", async () => {
 	const root = tempProject();
 	try {
@@ -969,7 +975,7 @@ await check("a valid envelope with unusable rows degrades instead of repeating t
 		// absent, which is a blob rather than a reason to call again.
 		const h = makeHarness({
 			cwd: root,
-			respond: () => jsonResponse({ overview: "No rows at all.", sections: [] }),
+			respond: () => toolResponse({ overview: "No rows at all.", sections: [] }),
 		});
 
 		const result = await runTool(h, "summary", { path: "src/a.ts" });
@@ -982,29 +988,7 @@ await check("a valid envelope with unusable rows degrades instead of repeating t
 	}
 });
 
-await check("a rejected JSON mode is retried without it, and stays within the cap", async () => {
-	const root = tempProject();
-	try {
-		writeFileSync(join(root, "src", "a.ts"), numbered(10));
-		const h = makeHarness({
-			cwd: root,
-			// An OpenAI-compatible provider that rejects response_format but answers fine without it.
-			respond: (_context, opts) =>
-				opts?.samplingParams ? errorResponse("response_format is not supported") : defaultAnswer(_context, opts),
-		});
-
-		const result = await runTool(h, "summary", { path: "src/a.ts" });
-		assert.equal(h.calls.length, 2, "one rejected attempt, one clean attempt");
-		assert.ok(h.calls[0].opts.samplingParams, "first call tried JSON mode");
-		assert.equal(h.calls[1].opts.samplingParams, undefined, "retry drops the override");
-		assert.equal(result.details.mode, "mapped");
-		assert.equal(result.details.attempts, 2);
-	} finally {
-		rmSync(root, { recursive: true, force: true });
-	}
-});
-
-await check("a provider that fails every time fails the call and names the reason", async () => {
+await check("a provider error fails the call and names the reason", async () => {
 	const root = tempProject();
 	try {
 		const file = join(root, "src", "a.ts");
@@ -1015,12 +999,13 @@ await check("a provider that fails every time fails the call and names the reaso
 		});
 
 		// A failed model call is the tool's failure: the model asked for a summary and gets the
-		// reason, not a file standing in for one.
+		// reason, not a file standing in for one. A provider error is not the model's fault and
+		// a retry may not help, so it is not retried.
 		await assert.rejects(
 			() => runTool(h, "summary", { path: "src/a.ts" }),
 			/upstream exploded/,
 		);
-		assert.equal(h.calls.length, 2, "JSON mode is retried once, then it fails");
+		assert.equal(h.calls.length, 1, "a provider error is not retried");
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
@@ -1048,7 +1033,7 @@ await check("a map with a gap is accepted without spending a repair", async () =
 		const h = makeHarness({
 			cwd: root,
 			respond: () =>
-				jsonResponse({
+				toolResponse({
 					overview: "Skips the generated tail.",
 					sections: [{ start_line: 1, end_line: 100, kind: "function", name: "a()", note: "" }],
 				}),
@@ -1067,27 +1052,36 @@ await check("a map with a gap is accepted without spending a repair", async () =
 	}
 });
 
-await check("a fenced answer parses without spending a repair", async () => {
+await check("a fenced prose answer is not parsed - it is repaired into a tool call", async () => {
 	const root = tempProject();
 	try {
 		writeFileSync(join(root, "src", "a.ts"), numbered(300));
+		// The answer channel is the tool call alone: a model that writes its map as prose -
+		// fenced or not - is told to call the tool, not met halfway.
 		const h = makeHarness({
 			cwd: root,
-			respond: (context) =>
-				textResponse(
-					"```json\n" +
-						JSON.stringify({
+			respond: (context, _opts, n) =>
+				n === 1
+					? textResponse(
+							"```json\n" +
+								JSON.stringify({
+									overview: "Sync client.",
+									sections: [
+										{ start_line: 1, end_line: lastShownLine(context), kind: "function", name: "connect()", note: "dials" },
+									],
+								}) +
+								"\n```",
+						)
+					: toolResponse({
 							overview: "Sync client.",
 							sections: [
 								{ start_line: 1, end_line: lastShownLine(context), kind: "function", name: "connect()", note: "dials" },
 							],
-						}) +
-						"\n```",
-				),
+						}),
 		});
 
 		const result = await runTool(h, "summary", { path: "src/a.ts" });
-		assert.equal(h.calls.length, 1, "a fence is not worth a model call to fix");
+		assert.equal(h.calls.length, 2, "prose is repaired, not parsed");
 		assert.equal(result.details.mode, "mapped");
 		assert.equal(result.details.sections, 1);
 	} finally {
@@ -1193,10 +1187,10 @@ await check("overlapping rows are trimmed locally, without spending a repair", a
 		const h = makeHarness({
 			cwd: root,
 			respond: () =>
-				jsonResponse({
+				toolResponse({
 					overview: "Overlapped.",
 					sections: [
-						{ start_line: 1, end_line: 60, kind: "class", name: "a" },
+						{ start_line: 1, end_line: 60, kind: "class", name: "a", note: "" },
 						{ start_line: 40, end_line: 101, kind: "function", name: "b", note: "" },
 					],
 				}),
@@ -1221,11 +1215,11 @@ await check("no stored map can contain overlapping rows, however the model answe
 		const h = makeHarness({
 			cwd: root,
 			respond: () =>
-				jsonResponse({
+				toolResponse({
 					overview: "Always overlaps.",
 					sections: [
-						{ start_line: 1, end_line: 100, kind: "class", name: "A" },
-						{ start_line: 60, end_line: 200, kind: "function", name: "B" },
+						{ start_line: 1, end_line: 100, kind: "class", name: "A", note: "" },
+						{ start_line: 60, end_line: 200, kind: "function", name: "B", note: "" },
 					],
 				}),
 		});
@@ -1331,7 +1325,7 @@ await check("concurrent cold calls for one file share a single summarization", a
 			cwd: root,
 			respond: (context) => {
 				summarizerCalls++;
-				return jsonResponse({
+				return toolResponse({
 					overview: "One client.",
 					sections: [
 						{ start_line: 1, end_line: lastShownLine(context), kind: "class", name: "Client", note: "" },
@@ -1406,7 +1400,7 @@ await check("a refresh neither joins nor is joined by a run in flight", async ()
 					firstCall = false;
 					await held;
 				}
-				return jsonResponse({
+				return toolResponse({
 					overview: "One client.",
 					sections: [
 						{ start_line: 1, end_line: lastShownLine(context), kind: "class", name: "Client", note: "" },
@@ -2152,7 +2146,7 @@ if (runLlm) {
 		process.env.PI_CODING_AGENT_DIR = previousAgentDir;
 	}
 
-	// The extension talks to a `ModelRegistry` - `find`, `hasConfiguredAuth`, `complete` - and
+	// The extension talks to a `ModelRegistry` - `find`, `hasConfiguredAuth`, `streamSimple` - and
 	// the services hand back the `ModelRuntime` underneath it, so the facade is rebuilt here.
 	// That is exactly what a session does, which is why the end-to-end cases are a session's
 	// path rather than the fake harness's.
@@ -2176,10 +2170,10 @@ if (runLlm) {
 		const calls = [];
 		const registryWithCalls = new Proxy(registry, {
 			get(target, property, receiver) {
-				if (property === "complete") {
-					return async (model, context, opts) => {
+				if (property === "streamSimple") {
+					return (model, context, opts) => {
 						calls.push({ model, context, opts });
-						return target.complete(model, context, opts);
+						return target.streamSimple(model, context, opts);
 					};
 				}
 				const value = Reflect.get(target, property, receiver);

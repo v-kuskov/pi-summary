@@ -1,4 +1,4 @@
-import { uuidv7 } from "@earendil-works/pi-ai";
+import { validateToolArguments } from "@earendil-works/pi-ai";
 import { assistantText, ModelCallError, SummaryError } from "./error.ts";
 import { fingerprint } from "./hash.ts";
 import { cacheKey, findProjectRoot, isRegularFile, resolveFilePath } from "./paths.ts";
@@ -7,13 +7,11 @@ import {
 	buildRepairPrompt,
 	buildSummarizePrompt,
 	modelLabel,
-	parseJsonAnswer,
 	prepareFile,
 } from "./prompt.ts";
 import {
 	type EmitSummary,
-	describeSchemaErrors,
-	hasTopLevelShape,
+	emitSummarySchema,
 	MAX_OVERVIEW_CHARS,
 	normalizeSections,
 } from "./schema.ts";
@@ -28,7 +26,15 @@ import {
 	writeSummary,
 } from "./store.ts";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { AssistantMessage, Model, Usage } from "@earendil-works/pi-ai";
+import type {
+	AssistantMessage,
+	Message,
+	Model,
+	Tool,
+	ToolCall,
+	Usage,
+	UserMessage,
+} from "@earendil-works/pi-ai";
 import { SETTINGS_FILE, readSettings } from "./settings.ts";
 
 type AnyModel = Model<any>;
@@ -226,16 +232,35 @@ type SummaryResult = {
 };
 
 /**
+ * The one channel the summarizer answers through: a tool whose parameters are the map's
+ * schema. Asking for a call rather than for JSON prose is what makes the answer enforced
+ * and checked before anything here reads it - providers map `constrainedSampling` to their
+ * schema-constrained decoding where they have it (`prefer` degrades silently where they
+ * do not), and `validateToolArguments` checks the returned arguments against this very
+ * schema before a row is read. The field contract therefore lives in the schema's
+ * descriptions, which is what the model is shown.
+ */
+const emitSummaryTool: Tool = {
+	name: "emit_summary",
+	description: "Submit the finished file map. Call once, with the whole map as the arguments.",
+	parameters: emitSummarySchema,
+	constrainedSampling: { type: "json_schema", strict: "prefer" },
+};
+
+/**
  * Ask the model for a summary and repair the answer until it validates, or give up.
  *
- * One call per loop iteration, so `MAX_ATTEMPTS` is a real ceiling on spend. Two different
- * failures are handled differently:
+ * The answer is a call to `emit_summary`, so the map is schema-constrained where the
+ * provider has that and schema-checked before a row is read. One call per loop iteration,
+ * so `MAX_ATTEMPTS` is a real ceiling on spend. Two different failures are handled
+ * differently:
  *
- * - A **provider error** is not the model's fault, so a rejected `response_format` is
- *   retried once without it. That retry consumes an attempt, keeping the total bounded.
- * - Invalid **output** is repaired by appending the model's own answer plus the specific
- *   violations and asking again. This is a fix-up loop over one prompt, not an agentic
- *   cycle: the summarizer never chooses what to do next, and it is never given tools.
+ * - A **provider error** is not the model's fault and a retry may not help, so it fails
+ *   the call and names the reason.
+ * - A missing or invalid **output** is repaired by appending the model's own answer plus
+ *   the specific violations and asking again. This is a fix-up loop over one prompt, not
+ *   an agentic cycle: the summarizer never chooses what to do next, and its one tool is an
+ *   answer channel rather than a capability.
  *
  * When the cap runs out the call fails. Prose stored under the summary's name would claim a
  * map the model never gave, and the caller has no other way to learn why it has nothing.
@@ -248,74 +273,69 @@ async function requestSummary(
 	signal: AbortSignal | undefined,
 ): Promise<SummaryResult> {
 	// Messages to resend on the next attempt. Grows only with the model's own answer and
-	// the list of problems, so every retry is a fresh complete() call over one prompt.
-	const messages: Array<Record<string, unknown>> = [
-		userMessage(buildSummarizePrompt(key, prepared)),
-	];
-	const base = { signal, cacheRetention: "none" as const, sessionId: uuidv7() };
-
-	// JSON mode is best effort: providers that support it return valid JSON, and providers
-	// that reject the parameter get the same prompt without it.
-	let jsonMode = true;
-	let lastText = "";
+	// the list of problems, so every retry is a fresh streamSimple() call over one prompt.
+	const messages: Message[] = [userMessage(buildSummarizePrompt(key, prepared))];
 	let problems: string[] = [];
 
 	for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-		const response = await ctx.modelRegistry.complete(
-			model,
-			{ messages: messages as never },
-			jsonMode ? { ...base, samplingParams: { response_format: { type: "json_object" } } } : base,
-		);
+		const response = await ctx.modelRegistry
+			.streamSimple(
+				model,
+				{ messages, tools: [emitSummaryTool] },
+				{ signal, cacheRetention: "none" },
+			)
+			.result();
 		if (isProviderError(response)) {
-			if (jsonMode) {
-				// Drop the override and try this same step again. Counted as an attempt so the
-				// ceiling holds even when the provider rejects JSON mode every time.
-				jsonMode = false;
-				continue;
-			}
 			throw new ModelCallError(
 				`the summarizer call failed for ${key}: ${response.errorMessage ?? response.stopReason}`,
 				"That is the provider's error rather than a summary problem, so retrying may not help.",
 			);
 		}
 
-		lastText = assistantText(response);
+		const call = emitSummaryCall(response);
+		if (!call) {
+			problems = ["the answer did not call the emit_summary tool"];
+		} else {
+			try {
+				const value = validateToolArguments(emitSummaryTool, call) as EmitSummary;
+				// Overlapping rows are trimmed here rather than reported back to the model. The trim
+				// is deterministic, and spending a model call to fix arithmetic the code already
+				// fixes for free contradicts the cost discipline. Gaps are left alone: they are the
+				// model declining to map dead lines, and the renderer shows them as skipped.
+				const sections = normalizeSections(value.sections, prepared.totalLines);
+				if (sections) {
+					return {
+						overview: truncateOverview(value.overview.trim() || "(no overview provided)"),
+						sections,
+						mode: "mapped",
+						usage: response.usage,
+						attempts: attempt,
+					};
+				}
 
-		const parsed = parseJsonAnswer(lastText);
-		if (parsed !== undefined && hasTopLevelShape(parsed)) {
-			const value = parsed as EmitSummary;
-			// Overlapping rows are trimmed here rather than reported back to the model. The trim
-			// is deterministic, and spending a model call to fix arithmetic the code already
-			// fixes for free contradicts the cost discipline. Gaps are left alone: they are the
-			// model declining to map dead lines, and the renderer shows them as skipped.
-			const sections = normalizeSections(value.sections, prepared.totalLines);
-			if (sections) {
+				// A valid envelope with no usable rows is a blob: there is no map to show, and
+				// inventing a single file-spanning region would be indistinguishable from a real one.
+				// An explicitly empty `sections` is the model's answer that the file has no map, so
+				// accept it rather than spending calls arguing.
 				return {
 					overview: truncateOverview(value.overview.trim() || "(no overview provided)"),
-					sections,
-					mode: "mapped",
+					sections: [],
+					mode: "blob",
 					usage: response.usage,
 					attempts: attempt,
 				};
+			} catch (error) {
+				problems = validationProblems(error);
 			}
-
-			// A valid envelope with no usable rows is a blob: there is no map to show, and
-			// inventing a single file-spanning region would be indistinguishable from a real one.
-			// An explicitly empty `sections` is the model's answer that the file has no map, so
-			// accept it rather than spending calls arguing.
-			return {
-				overview: truncateOverview(value.overview.trim() || "(no overview provided)"),
-				sections: [],
-				mode: "blob",
-				usage: response.usage,
-				attempts: attempt,
-			};
 		}
 
-		problems = describeProblems(parsed);
-
 		if (attempt < MAX_ATTEMPTS) {
-			messages.push(assistantTextMessage(response, lastText));
+			messages.push(
+				assistantTextMessage(
+					response,
+					call ? JSON.stringify(call.arguments, null, 2) : assistantText(response),
+				),
+			);
 			messages.push(userMessage(buildRepairPrompt(problems)));
 		}
 	}
@@ -343,18 +363,27 @@ function truncateOverview(overview: string): string {
 	return `${lastStop > 0 ? cut.slice(0, lastStop + 1) : cut} …`;
 }
 
-/** What to tell the model was wrong: the schema violations, or an unparseable answer. */
-function describeProblems(parsed: unknown): string[] {
-	if (parsed === undefined) {
-		return ["the answer was not parseable as a JSON object"];
-	}
-	// `hasTopLevelShape` has already failed for this payload, and every way it can fail is a
-	// type or required-property violation the schema reports, so there is always at least one
-	// error to name. Nothing here needs a fallback message of its own.
-	return describeSchemaErrors(parsed);
+/**
+ * The validator's complaints for the corrective prompt, without the arguments dump it
+ * appends: the repair turn already resends those arguments, and the dump would dwarf the
+ * complaint it is sent with.
+ */
+function validationProblems(error: unknown): string[] {
+	const text = error instanceof Error ? error.message : String(error);
+	const head = text.split("\n\nReceived arguments:")[0] ?? text;
+	const [, ...violations] = head.split("\n");
+	return violations.map((line) => line.trim().replace(/^- /, "")).filter((line) => line.length > 0);
 }
 
-function userMessage(text: string): Record<string, unknown> {
+/** The model's `emit_summary` call, or undefined when it answered some other way. */
+function emitSummaryCall(response: AssistantMessage): ToolCall | undefined {
+	return response.content.find(
+		(block): block is ToolCall =>
+			block.type === "toolCall" && block.name === emitSummaryTool.name,
+	);
+}
+
+function userMessage(text: string): UserMessage {
 	return { role: "user", content: [{ type: "text", text }], timestamp: Date.now() };
 }
 
@@ -365,7 +394,7 @@ function userMessage(text: string): Record<string, unknown> {
  * content replaced by its text. Thinking blocks are dropped: they are not needed to
  * continue a fix-up exchange and would be billed again.
  */
-function assistantTextMessage(response: AssistantMessage, text: string): Record<string, unknown> {
+function assistantTextMessage(response: AssistantMessage, text: string): AssistantMessage {
 	return { ...response, content: [{ type: "text", text }] };
 }
 
