@@ -25,8 +25,7 @@ export type SummaryDetails = {
 };
 
 /**
- * The `summary` tool: a cached structural summary of one file, plus the map of which line
- * ranges hold what.
+ * The `map` tool: what a file does and which line ranges hold what, cached per file.
  *
  * The point is to let the model see a file's shape before spending a read on it: one call
  * returns the ranges, so a model facing a 1400-line file knows which region to ask for.
@@ -37,14 +36,14 @@ export type SummaryDetails = {
  */
 export function registerSummaryTool(pi: ExtensionAPI): void {
 	pi.registerTool({
-		name: "summary",
+		name: "map",
 		label: "Summarize file",
 		description:
-			`Map where a file's contents live without reading it: what the file does, and the line ranges that hold what - one row per region in line order with its span, the symbols, data and behaviors it holds, and what to know before editing it. Use it whenever you need to know what a file contains or where one thing is - a definition, a handler, an invariant - then read only the region that answers. Call it before reading a source file you have not seen: the whole file costs many times the context of one summary and costs again on every re-read. Pass region to drill into one row - its name from the map, or a line number inside it (a name match wins) - with no model call. The first call on a file runs a model; later calls on the same unchanged file are free from cache.`,
+			`Map where a file's contents live without reading it: what the file does, and the line ranges that hold what - one row per region in line order with its span, the symbols, data and behaviors it holds, and what to know before editing it. Use it whenever you need to know what a file contains or where one thing is - a definition, a handler, an invariant - then read only the region that answers. Call it before reading a source file you have not seen: the whole file costs many times the context of one map and costs again on every re-read. Pass region to drill into one row - its name from the map, or a line number inside it (a name match wins) - with no model call. The first call on a file runs a model; later calls on the same unchanged file are free from cache.`,
 		promptSnippet: "Map where a file's contents live before reading it",
 		promptGuidelines: [
-			`To know what a file contains or where something lives - a definition, a handler, an invariant - call summary and read the region that answers, instead of the whole file.`,
-			`Before reading a source file you have not seen, call summary on it first; it returns where every region is, so you read one range instead of the whole file.`,
+			`To know what a file contains or where something lives - a definition, a handler, an invariant - call map and read the region that answers, instead of the whole file.`,
+			`Before reading a source file you have not seen, call map on it first; it returns where every region is, so you read one range instead of the whole file.`,
 			`To read one region, pass its name or a line number as region; that costs no model call.`,
 		],
 		parameters: Type.Object({
@@ -54,7 +53,7 @@ export function registerSummaryTool(pi: ExtensionAPI): void {
 			region: Type.Optional(
 				Type.String({
 					description:
-						"A region of an already-summarized file: a name from the map, or a line number inside it (a name match wins). Returns that region and its numbered excerpt, with no model call.",
+						"A region of an already-mapped file: a name from the map, or a line number inside it (a name match wins). Returns that region and its numbered excerpt, with no model call.",
 				}),
 			),
 			model: Type.Optional(
@@ -66,7 +65,7 @@ export function registerSummaryTool(pi: ExtensionAPI): void {
 			refresh: Type.Optional(
 				Type.Boolean({
 					description:
-						"Return a new summary even if one already exists. Ignored when region is given.",
+						"Return a new map even if one already exists. Ignored when region is given.",
 				}),
 			),
 		}),
@@ -94,7 +93,7 @@ export function registerSummaryTool(pi: ExtensionAPI): void {
 					signal,
 				});
 			} catch (error) {
-				// A failed model call is the tool's failure. The model asked for a summary and must
+				// A failed model call is the tool's failure. The model asked for a map and must
 				// see why it has none, rather than receive a substitute dressed as an answer.
 				if (error instanceof ModelCallError) throw error;
 
@@ -128,7 +127,7 @@ function summarizeDetails(outcome: SummarizeOutcome): SummaryDetails {
 }
 
 /**
- * Answer `summary(path, region)`: one cached region and its excerpt, with no model call.
+ * Answer `map(path, region)`: one cached region and its excerpt, with no model call.
  *
  * Every miss is an error rather than a fallback to the map or to the model. A region the map
  * cannot name is a caller mistake with a specific correction - the names that do exist - and
@@ -157,7 +156,7 @@ async function lookupRegion(
 	return {
 		content: [{ type: "text", text }],
 		structuredContent: regionOutputOf(entry, section, excerpt),
-		// No `usage`: zero model calls were made, and reporting the summary's usage as if this
+		// No `usage`: zero model calls were made, and reporting the map's usage as if this
 		// call had spent it would misstate what the lookup cost.
 		details: {
 			path: entry.path,
@@ -185,7 +184,7 @@ function failedDetails(absPath: string): SummaryDetails {
 }
 
 /**
- * Fallback for a `summary` call that failed without a model answer to show: return the file
+ * Fallback for a `map` call that failed without a model answer to show: return the file
  * whole, with the error in a notice.
  *
  * Only failures where no call happened or the answer could not be stored reach here - a failed
@@ -201,7 +200,7 @@ async function wholeFileFallback(
 	error: unknown,
 ): Promise<AgentToolResult<SummaryDetails>> {
 	const absPath = resolveFilePath(path, ctx.cwd);
-	const notice = failureNotice("summary", error, "Returning the whole file instead.");
+	const notice = failureNotice("map", error, "Returning the whole file instead.");
 	notifyUser(ctx, notice, "error");
 
 	let body: string;
@@ -227,7 +226,7 @@ async function wholeFileFallback(
 		// `kind`, `error` and `truncated` are payload semantics rather than generation history:
 		// pi resolves an `outputSchema` tool to `structuredContent` alone, so this arm is the
 		// only channel that reaches a script, which must be able to tell a fallback from a
-		// summary and see that `content` was cut short. What produced the payload - the spend,
+		// map and see that `content` was cut short. What produced the payload - the spend,
 		// the cache state, the model - still stays in `details`.
 		structuredContent: {
 			kind: "file",

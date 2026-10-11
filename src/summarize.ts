@@ -5,12 +5,13 @@ import { cacheKey, findProjectRoot, isRegularFile, resolveFilePath } from "./pat
 import {
 	type PreparedFile,
 	buildSummarizePrompt,
+	CONTINUATION_PROMPT,
 	modelLabel,
 	prepareFile,
 } from "./prompt.ts";
 import {
-	type EmitSummary,
-	emitSummarySchema,
+	type EmitMap,
+	emitMapSchema,
 	MAX_OVERVIEW_CHARS,
 	normalizeSections,
 } from "./schema.ts";
@@ -24,15 +25,13 @@ import {
 	type SummaryMode,
 	writeSummary,
 } from "./store.ts";
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type {
-	AssistantMessage,
-	Model,
-	Tool,
-	ToolCall,
-	Usage,
-	UserMessage,
-} from "@earendil-works/pi-ai";
+import {
+	createAgentSession,
+	defineTool,
+	type ExtensionContext,
+	SessionManager,
+} from "@earendil-works/pi-coding-agent";
+import type { Model, Tool, ToolCall, Usage } from "@earendil-works/pi-ai";
 import { SETTINGS_FILE, readSettings } from "./settings.ts";
 
 type AnyModel = Model<any>;
@@ -57,7 +56,7 @@ export type SummarizeOutcome = {
 /**
  * Read a file's cached summary for a region lookup, without ever running a model.
  *
- * Progressive disclosure has three layers - `summary(path)` for the map, `summary(path, region)`
+ * Progressive disclosure has three layers - `map(path)` for the map, `map(path, region)`
  * for one region, plain `read` for the text - and this is the second one. It is pure retrieval:
  * a missing cache or a stale one raises, pointing the caller back at the first layer, rather
  * than quietly spending a call. A stale map is never handed out even here, because naming a
@@ -72,7 +71,7 @@ export async function loadCachedSummary(
 	if (!isRegularFile(absPath)) {
 		throw new SummaryError(
 			`${path} is not a regular file`,
-			"summary works on files. Use ls to find a path first.",
+			"map works on files. Use ls to find a path first.",
 		);
 	}
 
@@ -84,14 +83,14 @@ export async function loadCachedSummary(
 		const cached = readSummary(db, key);
 		if (!cached) {
 			throw new SummaryError(
-				`no cached summary for ${path}`,
-				"Call summary on it first; a region lookup reads the cache and never runs a model.",
+				`no cached map for ${path}`,
+				"Call map on it first; a region lookup reads the cache and never runs a model.",
 			);
 		}
 		if ((await freshnessOf(cached)) !== "fresh") {
 			throw new SummaryError(
-				`the cached summary of ${path} is stale - the file changed since it was mapped`,
-				"Call summary on it again to refresh the map, then look the region up.",
+				`the cached map of ${path} is stale - the file changed since it was mapped`,
+				"Call map on it again to refresh it, then look the region up.",
 			);
 		}
 		return cached;
@@ -157,7 +156,7 @@ async function runSummarize(
 	if (!isRegularFile(absPath)) {
 		throw new SummaryError(
 			`${options.path} is not a regular file`,
-			"summary works on files. Use ls to find a path first.",
+			"map works on files. Use ls to find a path first.",
 		);
 	}
 
@@ -196,7 +195,7 @@ async function runSummarize(
 		});
 
 		const stored = readSummary(db, key);
-		if (!stored) throw new SummaryError(`failed to store the summary for ${key}`);
+		if (!stored) throw new SummaryError(`failed to store the map for ${key}`);
 		return {
 			entry: stored,
 			status,
@@ -224,25 +223,75 @@ type SummaryResult = {
  * schema before a row is read. The field contract therefore lives in the schema's
  * descriptions, which is what the model is shown.
  */
-const emitSummaryTool: Tool = {
-	name: "emit_summary",
+const emitMapTool: Tool = {
+	name: "emit_map",
 	description: "Submit the finished file map. Call once, with the whole map as the arguments.",
-	parameters: emitSummarySchema,
+	parameters: emitMapSchema,
 	constrainedSampling: { type: "json_schema", strict: "prefer" },
 };
 
 /**
- * Ask the model for one summary, and take the answer or fail.
+ * How many turns the summarizer session may spend: the first prompt plus one continuation
+ * per turn that ended without a usable call. Bounded because a summarize is a tool call with
+ * a cost contract, not a conversation.
+ */
+export const MAX_TURNS = 3;
+
+/**
+ * The declaration above as the child session's tool, with the two pieces of enforcement.
+ * `prepareArguments` runs the same validator the old single-call path ran and turns a
+ * failure into the tool error the model corrects against - the violations plus a corrective
+ * line; the schema itself is not re-printed because it rides along in the declaration on
+ * every turn. `execute` is the collector: the first valid call wins, and `terminate` ends
+ * the turn right there, so a captured summary costs exactly one model call.
+ */
+function collectorTool(capture: { value?: EmitMap }) {
+	return defineTool({
+		...emitMapTool,
+		label: "emit_map",
+		prepareArguments(args: unknown) {
+			try {
+				return validateToolArguments(emitMapTool, {
+					name: emitMapTool.name,
+					arguments: args,
+				} as ToolCall) as EmitMap;
+			} catch (error) {
+				const problems = validationProblems(error);
+				throw new Error(
+					[
+						"The arguments were rejected for:",
+						...problems.map((problem) => `  - ${problem}`),
+						"",
+						"Correct your output and call the emit_map tool again.",
+					].join("\n"),
+				);
+			}
+		},
+		async execute(_toolCallId, params) {
+			if (capture.value === undefined) capture.value = params as EmitMap;
+			return {
+				content: [{ type: "text", text: "Map collected." }],
+				details: undefined,
+				terminate: true,
+			};
+		},
+	});
+}
+
+/**
+ * Summarize through a child pi session: one tool, a turn limit, and no other way to answer.
  *
- * The answer is a call to `emit_summary`, so the map is schema-constrained where the
- * provider has that and schema-checked before a row is read. There is no repair loop: one
- * summarization is one call, so a model that answers unusably costs exactly what a working
- * one does and no second call is spent arguing with it. Prose stored under the summary's
- * name would claim a map the model never gave, and the caller has no other way to learn why
- * it has nothing.
+ * The enforcement is goose's, in its two layers. Tool usage: the only way to answer is a
+ * call to `emit_map`, and arguments that fail the schema go back to the model as a tool
+ * error. Turn level: a turn that ended without the call gets a user message that continuation
+ * is needed, and the session keeps asking until a valid call arrives or `MAX_TURNS` is spent.
+ * Prose is never accepted - stored as the answer it would claim a map the model
+ * never gave, and the caller has no other way to learn why it has nothing.
  *
- * The action goes in the message because pi drops `hint` from a thrown tool error, while
- * the diagnosis goes in the hint.
+ * The child session streams through the extension's own model registry, so model choice,
+ * auth and dispatch are exactly what the old single call used; the session contributes the
+ * agent loop, the tool pipeline that routes the errors back, and the transcript that carries
+ * them. It is in-memory, so the generation stays internal.
  */
 async function requestSummary(
 	ctx: ExtensionContext,
@@ -251,38 +300,49 @@ async function requestSummary(
 	prepared: PreparedFile,
 	signal: AbortSignal | undefined,
 ): Promise<SummaryResult> {
-	const response = await ctx.modelRegistry
-		.streamSimple(
-			model,
-			{ messages: [userMessage(buildSummarizePrompt(key, prepared))], tools: [emitSummaryTool] },
-			{ signal, cacheRetention: "none" },
-		)
-		.result();
-	if (isProviderError(response)) {
-		throw new ModelCallError(
-			`the summarizer call failed for ${key}: ${response.errorMessage ?? response.stopReason}`,
-			"That is the provider's error rather than a summary problem.",
+	const capture: { value?: EmitMap } = {};
+	const { session } = await createAgentSession({
+		cwd: ctx.cwd,
+		model,
+		tools: [emitMapTool.name],
+		customTools: [collectorTool(capture)],
+		sessionManager: SessionManager.inMemory(ctx.cwd),
+		thinkingLevel: "minimal",
+	});
+	session.agent.streamFunction = (m, c, o) => ctx.modelRegistry.streamSimple(m, c, o);
+	signal?.addEventListener("abort", () => session.agent.abort(), { once: true });
+
+	// The turns are driven at the agent level rather than through AgentSession.prompt(): that
+	// entry point insists the session's own freshly built runtime has the model's auth
+	// configured, but auth is the registry's job here - it resolves credentials per request,
+	// exactly as the single call did - and the parent's runtime and a fresh one can disagree
+	// about where the credentials live. The session still owns the loop, the tool pipeline
+	// that routes the errors back, and the transcript that carries them.
+	for (let turn = 1; ; turn++) {
+		await session.agent.prompt(
+			turn === 1 ? buildSummarizePrompt(key, prepared) : CONTINUATION_PROMPT,
 		);
+		await session.agent.waitForIdle();
+		if (capture.value !== undefined) break;
+
+		// A provider error is not the model's fault and another turn may not help, so the call
+		// fails at once and names the reason instead of spending the turn budget on it.
+		const last = lastAssistant(session.messages);
+		if (last?.stopReason === "error" || last?.stopReason === "aborted") {
+			throw new ModelCallError(
+				`the summarizer call failed for ${key}: ${last.errorMessage ?? last.stopReason}`,
+				"That is the provider's error rather than a problem with the map.",
+			);
+		}
+		if (turn >= MAX_TURNS) {
+			throw new ModelCallError(
+				`the summarizer did not produce a usable answer for ${key} after ${MAX_TURNS} turns; name a different one with model=provider/model`,
+				"No turn answered with a valid emit_map call.",
+			);
+		}
 	}
 
-	const call = emitSummaryCall(response);
-	if (!call) {
-		throw new ModelCallError(
-			`the summarizer did not produce a usable answer for ${key}; name a different one with model=provider/model`,
-			"The answer did not call the emit_summary tool.",
-		);
-	}
-
-	let value: EmitSummary;
-	try {
-		value = validateToolArguments(emitSummaryTool, call) as EmitSummary;
-	} catch (error) {
-		throw new ModelCallError(
-			`the summarizer did not produce a usable answer for ${key}; name a different one with model=provider/model`,
-			`The answer was rejected for: ${validationProblems(error).join("; ") || "it did not match the required shape"}.`,
-		);
-	}
-
+	const value = capture.value!;
 	// Overlapping rows are trimmed here rather than reported back to the model: the trim is
 	// deterministic, and fixing arithmetic the code already fixes for free cannot justify a
 	// second call. Gaps are left alone - the model declining to map dead lines - and a valid
@@ -293,7 +353,7 @@ async function requestSummary(
 		overview: truncateOverview(value.overview.trim() || "(no overview provided)"),
 		sections: sections ?? [],
 		mode: sections ? "mapped" : "blob",
-		usage: response.usage,
+		usage: sumUsage(session.messages),
 	};
 }
 
@@ -311,8 +371,8 @@ function truncateOverview(overview: string): string {
 }
 
 /**
- * The validator's complaints for the failure's diagnosis, without the arguments dump it
- * appends: the caller is told what was wrong, not shown the whole answer again.
+ * The validator's complaints for the corrective tool error, without the arguments dump it
+ * appends: the model is told what was wrong, not shown its own answer again.
  */
 function validationProblems(error: unknown): string[] {
 	const text = error instanceof Error ? error.message : String(error);
@@ -321,21 +381,53 @@ function validationProblems(error: unknown): string[] {
 	return violations.map((line) => line.trim().replace(/^- /, "")).filter((line) => line.length > 0);
 }
 
-/** The model's `emit_summary` call, or undefined when it answered some other way. */
-function emitSummaryCall(response: AssistantMessage): ToolCall | undefined {
-	return response.content.find(
-		(block): block is ToolCall =>
-			block.type === "toolCall" && block.name === emitSummaryTool.name,
-	);
+/** All the driver reads from a transcript message; the real type lives in the agent core. */
+type TranscriptMessage = {
+	role: string;
+	usage?: Usage;
+	stopReason?: string;
+	errorMessage?: string;
+};
+
+/**
+ * The transcript's last assistant message, which carries the stop reason of the turn that
+ * just ended.
+ */
+function lastAssistant(
+	messages: readonly TranscriptMessage[],
+): TranscriptMessage | undefined {
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const message = messages[i];
+		if (message?.role === "assistant") return message;
+	}
+	return undefined;
 }
 
-function userMessage(text: string): UserMessage {
-	return { role: "user", content: [{ type: "text", text }], timestamp: Date.now() };
-}
-
-/** True when the provider returned an error instead of an answer. */
-function isProviderError(response: AssistantMessage): boolean {
-	return response.stopReason === "error";
+/** The whole session's usage - every turn's response - as one call's bill. */
+function sumUsage(messages: readonly TranscriptMessage[]): Usage {
+	const total: Usage = {
+		input: 0,
+		output: 0,
+		cacheRead: 0,
+		cacheWrite: 0,
+		totalTokens: 0,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+	};
+	for (const message of messages) {
+		const usage = message.usage;
+		if (!usage) continue;
+		total.input += usage.input;
+		total.output += usage.output;
+		total.cacheRead += usage.cacheRead;
+		total.cacheWrite += usage.cacheWrite;
+		total.totalTokens += usage.totalTokens;
+		total.cost.input += usage.cost.input;
+		total.cost.output += usage.cost.output;
+		total.cost.cacheRead += usage.cost.cacheRead;
+		total.cost.cacheWrite += usage.cost.cacheWrite;
+		total.cost.total += usage.cost.total;
+	}
+	return total;
 }
 
 /**

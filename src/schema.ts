@@ -35,7 +35,7 @@ export const MAX_NOTE_CHARS = 200;
 export const MAX_OVERVIEW_CHARS = 2400;
 
 /**
- * The shape the model must return: the parameter schema of the `emit_summary` tool it has
+ * The shape the model must return: the parameter schema of the `emit_map` tool it has
  * to call, and the shape the database stores.
  *
  * A flat `{overview, sections[]}` is deliberate - it keeps schema-constrained decoding
@@ -44,10 +44,10 @@ export const MAX_OVERVIEW_CHARS = 2400;
  * The descriptions are the field contract, and the model is shown them: this schema is
  * what it receives as the tool to answer with, so the contract lives here and nowhere
  * else. `importance` is optional on purpose - `normalizeSections` reads an absent tier as
- * 2, and turning its absence into a repair call would make a display-only tier cost model
+ * 2, and turning its absence into a rejection would make a display-only tier cost model
  * spend.
  */
-export const emitSummarySchema = Type.Object({
+export const emitMapSchema = Type.Object({
 	overview: Type.String({
 		description:
 			"What the file is for, its main exports and how they relate, and anything a reader must know before changing it. Shown without the map when there is no room for both, so it must stand alone. At most ten sentences.",
@@ -85,7 +85,7 @@ export const emitSummarySchema = Type.Object({
 	),
 });
 
-export type EmitSummary = {
+export type EmitMap = {
 	overview: string;
 	sections: Array<{
 		start_line: number;
@@ -182,9 +182,9 @@ export function normalizeSections(raw: unknown, shownLines: number): Section[] |
 }
 
 /**
- * The `summary` tool's `outputSchema`: the summary and nothing else.
+ * The `map` tool's `outputSchema`: the map and nothing else.
  *
- * Cache state, the summarizer model, the attempt count and the degradation flag are
+ * Cache state, the summarizer model and the degradation flag are
  * generation history — they stay in the result's `details`, for diagnosis, and are not part
  * of what a caller came for. The second arm exists because pi resolves a tool that
  * declares an `outputSchema` to its `structuredContent` *instead of* the text: a call that
@@ -198,7 +198,7 @@ export function normalizeSections(raw: unknown, shownLines: number): Section[] |
  * not generation history: a script must be able to tell a failure payload from a summary
  * and see whether `content` was cut short, and this arm is its only channel.
  *
- * Unlike `emitSummarySchema` above, this schema does reach callers: codemode declarations
+ * Unlike `emitMapSchema` above, this schema does reach callers: codemode declarations
  * render it for scripts, which is why every field carries a one-line description.
  */
 export const summaryOutputSchema = Type.Union([
@@ -225,7 +225,7 @@ export const summaryOutputSchema = Type.Union([
 				}),
 				name: Type.String({
 					description:
-						"The region's name: the symbol as the file spells it, or a pattern summary. Pass it back as region to drill into the row.",
+						"The region's name: the symbol as the file spells it, or the pattern with its count. Pass it back as region to drill into the row.",
 				}),
 				note: Type.String({
 					description: "What lives in the region and what to know before editing it.",
@@ -261,7 +261,7 @@ export const summaryOutputSchema = Type.Union([
 						"What the region holds: type, class, interface, function, method, const, config, test, comment, or other.",
 				}),
 				name: Type.String({
-					description: "The region's name: the symbol as the file spells it, or a pattern summary.",
+					description: "The region's name: the symbol as the file spells it, or the pattern with its count.",
 				}),
 				note: Type.String({
 					description: "What lives in the region and what to know before editing it.",

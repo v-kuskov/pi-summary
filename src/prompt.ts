@@ -48,8 +48,8 @@ export async function prepareFile(absPath: string): Promise<PreparedFile> {
  * The summarization prompt: what the map is for, how the file is laid out, the limits the
  * answer is held to, then the numbered file.
  *
- * The field-by-field contract is not here: it rides on `emitSummarySchema`, which the model
- * sees as the parameters of the `emit_summary` tool it must call. What remains is held to a
+ * The field-by-field contract is not here: it rides on `emitMapSchema`, which the model
+ * sees as the parameters of the `emit_map` tool it must call. What remains is held to a
  * goal and a few limits, nothing more. Three things carry the weight:
  *
  * - The map is a **retrieval index**, not a caption: `name` is asked for as the exact symbol
@@ -64,12 +64,12 @@ export async function prepareFile(absPath: string): Promise<PreparedFile> {
  *
  * A worked example was measured and dropped - it was over half the prompt, and every rule
  * it stated is either stated here once, shorter, or enforced locally by `normalizeSections`
- * (overlap and reversed ranges) instead of asked for.
+ * (overlap and reversed ranges) as well as asked for.
  */
 export function buildSummarizePrompt(path: string, file: PreparedFile): string {
 	return [
 		"Index this file so a later model can find where any information in it lives and read only that part.",
-		"Reply by calling the emit_summary tool once, with the whole map as its arguments. No prose.",
+		"Reply only by calling the emit_map tool.",
 		"",
 		`File: ${path} (${file.totalLines} lines; line ${file.totalLines} is the last).`,
 		"",
@@ -79,8 +79,8 @@ export function buildSummarizePrompt(path: string, file: PreparedFile): string {
 		`     2${GUTTER}the second line`,
 		"",
 		"Limits:",
-		"  - Copy line numbers from the left column; do not count lines yourself.",
-		"  - Skip imports, re-exports, license headers and boilerplate - do not give them rows.",
+		"  - Copy line numbers from the left column; counting them yourself drifts over long files.",
+		"  - Skip imports, re-exports, license headers and boilerplate: they get no rows.",
 		"  - Leave gaps where lines do nothing - blank runs and boilerplate.",
 		"  - Say a thing once - a note that only renames the row above extends that row instead.",
 		"",
@@ -91,6 +91,13 @@ export function buildSummarizePrompt(path: string, file: PreparedFile): string {
 		"</file>",
 	].join("\n");
 }
+
+/**
+ * The turn-level nudge: a turn that ended without an `emit_map` call is not an ending,
+ * it is a turn that still owes its answer.
+ */
+export const CONTINUATION_PROMPT =
+	"You MUST call the `emit_map` tool NOW with the map for this file.";
 
 /** Model id in `provider/model` form for the cache header. */
 export function modelLabel(model: { provider: string; id: string }): string {

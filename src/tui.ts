@@ -6,7 +6,7 @@ import { resolveFilePath } from "./paths.ts";
 import type { SummaryDetails } from "./tools.ts";
 
 /**
- * Presentation for the `summary` tool.
+ * Presentation for the `map` tool.
  *
  * Shaped like the built-in `read` renderer, because the two answer the same question: a
  * `read` that was intercepted is drawn by read's renderer, and reading the file directly
@@ -71,7 +71,7 @@ function textSlot(previous: Component | undefined): ReusableText {
 
 /** How a call is labelled. */
 function formatCall(args: CallArgs, theme: Theme, cwd: string): string {
-	const label = theme.fg("toolTitle", theme.bold("summary"));
+	const label = theme.fg("toolTitle", theme.bold("map"));
 	const refresh = args?.refresh === true ? theme.fg("warning", " (refresh)") : "";
 	return `${label} ${styledPath(args?.path, theme, cwd)}${refresh}`;
 }
@@ -144,7 +144,7 @@ function formatOutcome(
 	// as one.
 	if (details.status === "failed") {
 		return withHint(
-			[theme.fg("warning", "no summary - the whole file was returned instead")],
+			[theme.fg("warning", "no map - the whole file was returned instead")],
 			theme,
 		);
 	}

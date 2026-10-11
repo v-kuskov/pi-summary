@@ -39,7 +39,7 @@ function normalizeKey(value: string): string {
 	return process.platform === "win32" ? slashed.toLowerCase() : slashed;
 }
 
-/** Resolve a `read`/`summary` path argument against cwd, stripping a leading `@`. */
+/** Resolve a `read`/`map` path argument against cwd, stripping a leading `@`. */
 export function resolveFilePath(input: string, cwd: string): string {
 	const stripped = input.startsWith("@") ? input.slice(1) : input;
 	return resolve(cwd, stripped);

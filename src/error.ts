@@ -11,12 +11,12 @@ export class SummaryError extends Error {
 }
 
 /**
- * The summarizer's model call failed: the provider errored, or the answer did not validate.
+ * The summarizer session failed: the provider errored, or no turn delivered a usable answer.
  *
  * Separate from `SummaryError` because the two callers want opposite things from it.
- * `summary` fails with it - the model asked for a map and must be told it has none - while
+ * `map` fails with it - the model asked for a map and must be told it has none - while
  * the whole-file fallback returns the file itself, because withholding the file
- * would be a worse answer than a missing summary.
+ * would be a worse answer than a missing map.
  */
 export class ModelCallError extends SummaryError {}
 

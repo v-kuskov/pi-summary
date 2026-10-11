@@ -18,6 +18,9 @@ import {
 	summaryOutputSchema,
 } from "./src/schema.ts";
 import { renderMap } from "./src/render.ts";
+import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
+import { CONTINUATION_PROMPT } from "./src/prompt.ts";
+import { MAX_TURNS } from "./src/summarize.ts";
 
 /**
  * Isolation from the developer's own pi install.
@@ -49,31 +52,47 @@ async function check(name, fn) {
 
 // ------------------------------------------------------------------ fake platform
 
-// The summarizer answers by calling the emit_summary tool; the payload is its arguments.
+// The summarizer answers by calling the emit_map tool; the payload is its arguments.
+// Usage is always the full shape: the driver sums every turn's usage field by field, so a
+// partial one would leak NaN into the totals instead of failing loudly.
+const fakeUsage = {
+	input: 10,
+	output: 5,
+	cacheRead: 0,
+	cacheWrite: 0,
+	totalTokens: 15,
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+};
 const toolResponse = (payload) => ({
 	role: "assistant",
-	content: [{ type: "toolCall", id: "call_1", name: "emit_summary", arguments: payload }],
+	content: [{ type: "toolCall", id: "call_1", name: "emit_map", arguments: payload }],
 	stopReason: "toolUse",
-	usage: { input: 10, output: 5, totalTokens: 15 },
+	usage: fakeUsage,
 });
 const textResponse = (text) => ({
 	role: "assistant",
 	content: [{ type: "text", text }],
-	usage: { input: 10, output: 5, totalTokens: 15 },
+	usage: fakeUsage,
 });
 const errorResponse = (message) => ({
 	role: "assistant",
 	content: [],
 	stopReason: "error",
 	errorMessage: message,
-	usage: { input: 10, output: 5, totalTokens: 15 },
+	usage: fakeUsage,
 });
 // The fake summarizer answers with a map that tiles the excerpt it was given: one row
 // spanning the whole thing. A fixture whose rows leave gaps or overlap would be normalized
 // rather than stored as given, so helpers here build tiling answers unless a test wants
 // otherwise.
+// A request carries pi's system prompt first, then the file prompt as the first user
+// message, then - on turns after one that ended without the call - the continuation nudge.
+const userTexts = (context) =>
+	context.messages
+		.filter((m) => m.role === "user")
+		.map((m) => (typeof m.content === "string" ? m.content : m.content[0].text));
 const lastShownLine = (context) => {
-	const prompt = context.messages[0].content[0].text;
+	const prompt = userTexts(context)[0];
 	return Number(prompt.match(/File: .*\((\d+) lines;/)[1]);
 };
 const tilingAnswer = (overview, kind = "function", name = "run()", note = "does it") =>
@@ -108,7 +127,24 @@ function makeHarness(options = {}) {
 			hasConfiguredAuth: () => true,
 			streamSimple: (m, context, opts) => {
 				calls.push({ model: m, context, opts });
-				return { result: async () => respond(context, opts, calls.length) };
+				const message = respond(context, opts, calls.length);
+				// The agent loop consumes the pi event protocol and takes the final message
+				// from result(), so the fake emits the same shape a real provider does.
+				const stream = createAssistantMessageEventStream();
+				queueMicrotask(() => {
+					if (message.stopReason === "error" || message.stopReason === "aborted") {
+						stream.push({ type: "error", reason: message.stopReason, error: message });
+						stream.end(message);
+						return;
+					}
+					stream.push({
+						type: "start",
+						partial: { ...message, content: [], stopReason: "pending" },
+					});
+					stream.push({ type: "done", reason: message.stopReason ?? "stop", message });
+					stream.end(message);
+				});
+				return stream;
 			},
 		},
 	};
@@ -366,7 +402,7 @@ await check("the model setting picks the summarizer, and model= overrides it", a
 		writeFileSync(join(root, "src", "a.ts"), numbered(10));
 		const h = makeHarness({ cwd: root });
 
-		const result = await runTool(h, "summary", { path: "src/a.ts" });
+		const result = await runTool(h, "map", { path: "src/a.ts" });
 		assert.equal(result.details.model, "test/test-model", "the configured model was used");
 
 		// A present setting that names no known model is an error, not a silent substitution:
@@ -377,7 +413,7 @@ await check("the model setting picks the summarizer, and model= overrides it", a
 		h.ctx.hasUI = true;
 		h.ctx.ui = { notify: (message, type) => h.notices.push({ message, type }) };
 
-		const bad = await runTool(h, "summary", { path: "src/a.ts", refresh: true });
+		const bad = await runTool(h, "map", { path: "src/a.ts", refresh: true });
 		assert.equal(bad.details.status, "failed", "a bad setting does not summarize");
 		assert.match(bad.content[0].text, /nope\/missing/, "the offending value is named");
 		assert.match(bad.content[0].text, /names no known model/);
@@ -387,13 +423,13 @@ await check("the model setting picks the summarizer, and model= overrides it", a
 
 		// Meaningful on every call, because it is a failure rather than a note about which
 		// of two working models was picked.
-		await runTool(h, "summary", { path: "src/a.ts", refresh: true });
+		await runTool(h, "map", { path: "src/a.ts", refresh: true });
 		assert.equal(h.notices.length, 2, "the failure is reported each time");
 
 		// Only an absent setting means the session model. That is the documented default, not
 		// a fallback, so it is not announced.
 		writeFileSync(join(agent, "pi-summary.json"), JSON.stringify({}));
-		const unset = await runTool(h, "summary", { path: "src/a.ts", refresh: true });
+		const unset = await runTool(h, "map", { path: "src/a.ts", refresh: true });
 		assert.equal(unset.details.model, "test/test-model", "the session model is the default");
 		assert.equal(h.notices.length, 2, "the default needs no announcement");
 	} finally {
@@ -588,15 +624,15 @@ await check("countLinesFrom matches split semantics and the 200-line threshold",
 	}
 });
 
-// ------------------------------------------------------------------ summary tool
+// ------------------------------------------------------------------ map tool
 
-await check("summary calls the model once, then serves the cache", async () => {
+await check("map calls the model once, then serves the cache", async () => {
 	const root = tempProject();
 	try {
 		writeFileSync(join(root, "src", "a.ts"), numbered(400));
 		const h = makeHarness({ cwd: root });
 
-		const first = await runTool(h, "summary", { path: "src/a.ts" });
+		const first = await runTool(h, "map", { path: "src/a.ts" });
 		assert.equal(h.calls.length, 1, "one model call");
 		assert.equal(first.details.status, "miss");
 		assert.doesNotMatch(first.content[0].text, /cache:/, "cache state is internal, not model-facing");
@@ -604,7 +640,7 @@ await check("summary calls the model once, then serves the cache", async () => {
 		assert.match(first.content[0].text, /run\(\)/);
 		assert.match(first.content[0].text, /401 lines/);
 
-		const second = await runTool(h, "summary", { path: "src/a.ts" });
+		const second = await runTool(h, "map", { path: "src/a.ts" });
 		assert.equal(h.calls.length, 1, "no second model call");
 		assert.equal(second.details.status, "fresh");
 		assert.doesNotMatch(second.content[0].text, /cache:/, "and a served cache says no more than a fresh one");
@@ -613,7 +649,7 @@ await check("summary calls the model once, then serves the cache", async () => {
 	}
 });
 
-await check("the structured result carries the summary and nothing else", async () => {
+await check("the structured result carries the map and nothing else", async () => {
 	// Scripts receive structuredContent instead of the text, so this is their whole view of
 	// the tool: the file, its prose and its map. Generation history — model, cache state,
 	// attempts, degradation — is internal and must not appear.
@@ -622,10 +658,10 @@ await check("the structured result carries the summary and nothing else", async 
 		writeFileSync(join(root, "src", "a.ts"), numbered(400));
 		const h = makeHarness({ cwd: root });
 
-		const first = await runTool(h, "summary", { path: "src/a.ts" });
+		const first = await runTool(h, "map", { path: "src/a.ts" });
 		assert.ok(Value.Check(summaryOutputSchema, first.structuredContent), "matches the schema");
 		const out = first.structuredContent;
-		assert.equal(out.path, "src/a.ts", "the summary names the file");
+		assert.equal(out.path, "src/a.ts", "the map names the file");
 		assert.equal(out.lines, first.details.lines, "and its length");
 		assert.equal(out.overview, "Does a thing.", "the prose is there");
 		assert.equal(out.sections.length, 1, "and the map rows");
@@ -644,7 +680,7 @@ await check("the structured result carries the summary and nothing else", async 
 	}
 });
 
-await check("summary lines carry importance, and a missing one reads as 2", async () => {
+await check("map lines carry importance, and a missing one reads as 2", async () => {
 	const root = tempProject();
 	try {
 		writeFileSync(join(root, "src", "a.ts"), numbered(400));
@@ -663,7 +699,7 @@ await check("summary lines carry importance, and a missing one reads as 2", asyn
 				}),
 		});
 
-		const result = await runTool(h, "summary", { path: "src/a.ts" });
+		const result = await runTool(h, "map", { path: "src/a.ts" });
 		assert.ok(Value.Check(summaryOutputSchema, result.structuredContent), "matches the schema");
 		assert.deepEqual(
 			result.structuredContent.sections.map((s) => s.importance),
@@ -678,7 +714,7 @@ await check("summary lines carry importance, and a missing one reads as 2", asyn
 	}
 });
 
-await check("summary(path, region) returns the row and its numbered excerpt with no model call", async () => {
+await check("map(path, region) returns the row and its numbered excerpt with no model call", async () => {
 	const root = tempProject();
 	try {
 		writeFileSync(join(root, "src", "a.ts"), numbered(400));
@@ -695,10 +731,10 @@ await check("summary(path, region) returns the row and its numbered excerpt with
 		});
 
 		// Layer 1 first, so there is a cache to drill into.
-		await runTool(h, "summary", { path: "src/a.ts" });
+		await runTool(h, "map", { path: "src/a.ts" });
 		assert.equal(h.calls.length, 1, "the map cost one call");
 
-		const byName = await runTool(h, "summary", { path: "src/a.ts", region: "Widget" });
+		const byName = await runTool(h, "map", { path: "src/a.ts", region: "Widget" });
 		assert.equal(h.calls.length, 1, "the drill-down is served from cache, never a model call");
 		assert.ok(Value.Check(summaryOutputSchema, byName.structuredContent), "matches the schema");
 		assert.equal(byName.structuredContent.region.name, "Widget");
@@ -713,12 +749,12 @@ await check("summary(path, region) returns the row and its numbered excerpt with
 
 		// A line number inside another row's span finds that row, so a reader with a line in hand
 		// does not have to find the name first.
-		const byLine = await runTool(h, "summary", { path: "src/a.ts", region: "25" });
+		const byLine = await runTool(h, "map", { path: "src/a.ts", region: "25" });
 		assert.equal(h.calls.length, 1, "still no model call");
 		assert.equal(byLine.structuredContent.region.name, "run()", "a line resolves to its containing row");
 
 		// A name is matched case-insensitively, which is how a reader who typed it by eye lands.
-		const byCase = await runTool(h, "summary", { path: "src/a.ts", region: "widget" });
+		const byCase = await runTool(h, "map", { path: "src/a.ts", region: "widget" });
 		assert.equal(byCase.structuredContent.region.name, "Widget");
 	} finally {
 		rmSync(root, { recursive: true, force: true });
@@ -740,13 +776,13 @@ await check("an unknown region errors with the names that exist, and spends no c
 					],
 				}),
 		});
-		await runTool(h, "summary", { path: "src/a.ts" });
+		await runTool(h, "map", { path: "src/a.ts" });
 		assert.equal(h.calls.length, 1);
 
 		// An unknown name, and a line in the gap between the two rows, are both misses.
 		for (const region of ["Nope", "15"]) {
 			await assert.rejects(
-				() => runTool(h, "summary", { path: "src/a.ts", region }),
+				() => runTool(h, "map", { path: "src/a.ts", region }),
 				/new region|no region/i,
 				`region ${region} is a miss`,
 			);
@@ -755,7 +791,7 @@ await check("an unknown region errors with the names that exist, and spends no c
 
 		// The error names what does exist, so the caller can pick a real region instead of guessing.
 		try {
-			await runTool(h, "summary", { path: "src/a.ts", region: "Nope" });
+			await runTool(h, "map", { path: "src/a.ts", region: "Nope" });
 			assert.fail("an unknown region must reject");
 		} catch (error) {
 			assert.match(error.message, /Widget/);
@@ -766,8 +802,8 @@ await check("an unknown region errors with the names that exist, and spends no c
 		// than summarizing on the caller's behalf.
 		writeFileSync(join(root, "src", "b.ts"), numbered(10));
 		await assert.rejects(
-			() => runTool(h, "summary", { path: "src/b.ts", region: "anything" }),
-			/no cached summary/,
+			() => runTool(h, "map", { path: "src/b.ts", region: "anything" }),
+			/no cached map/,
 		);
 		assert.equal(h.calls.length, 1, "an uncached region lookup costs nothing");
 	} finally {
@@ -775,20 +811,20 @@ await check("an unknown region errors with the names that exist, and spends no c
 	}
 });
 
-await check("summary asks for one tool call, and reports nested usage", async () => {
+await check("map asks for one tool call, and reports nested usage", async () => {
 	const root = tempProject();
 	try {
 		writeFileSync(join(root, "src", "a.ts"), numbered(10));
 		const h = makeHarness({ cwd: root });
 
-		const result = await runTool(h, "summary", { path: "src/a.ts" });
+		const result = await runTool(h, "map", { path: "src/a.ts" });
 		const { context, opts } = h.calls[0];
-		assert.equal(context.tools.length, 1, "exactly one tool schema is sent to the summarizer");
-		assert.equal(context.tools[0].name, "emit_summary");
-		assert.deepEqual(context.tools[0].constrainedSampling, { type: "json_schema", strict: "prefer" });
-		assert.equal(opts.cacheRetention, "none");
-		assert.equal(opts.sessionId, undefined, "a one-off call carries no session affinity");
-		assert.match(context.messages[0].content[0].text, /emit_summary/);
+		// The tool declaration reaches the model in the system message of every request.
+		const system = context.messages.find((m) => m.role === "system");
+		assert.equal(system.toolsAdded.length, 1, "exactly one tool schema is sent to the summarizer");
+		assert.equal(system.toolsAdded[0].name, "emit_map");
+		assert.deepEqual(system.toolsAdded[0].constrainedSampling, { type: "json_schema", strict: "prefer" });
+		assert.match(userTexts(context)[0], /emit_map/);
 		assert.equal(result.usage.totalTokens, 15, "nested tokens are surfaced");
 		assert.equal(h.calls.length, 1, "exactly one call is spent");
 		assert.equal(result.details.degraded, false);
@@ -804,11 +840,11 @@ await check("a changed file is re-summarized", async () => {
 		writeFileSync(file, numbered(50));
 		const h = makeHarness({ cwd: root });
 
-		await runTool(h, "summary", { path: "src/a.ts" });
+		await runTool(h, "map", { path: "src/a.ts" });
 		assert.equal(h.calls.length, 1);
 
 		writeFileSync(file, numbered(50) + "extra\n");
-		const after = await runTool(h, "summary", { path: "src/a.ts" });
+		const after = await runTool(h, "map", { path: "src/a.ts" });
 		assert.equal(h.calls.length, 2, "re-summarized");
 		assert.equal(after.details.status, "stale");
 		assert.equal(after.details.lines, 52);
@@ -824,7 +860,7 @@ await check("an mtime-only touch does not re-summarize", async () => {
 		writeFileSync(file, numbered(50));
 		const h = makeHarness({ cwd: root });
 
-		await runTool(h, "summary", { path: "src/a.ts" });
+		await runTool(h, "map", { path: "src/a.ts" });
 		assert.equal(h.calls.length, 1);
 
 		// Same bytes, new mtime: only the hash decides, and it matches.
@@ -832,7 +868,7 @@ await check("an mtime-only touch does not re-summarize", async () => {
 		const later = new Date(Date.now() + 5000);
 		utimesSync(file, later, later);
 
-		const again = await runTool(h, "summary", { path: "src/a.ts" });
+		const again = await runTool(h, "map", { path: "src/a.ts" });
 		assert.equal(h.calls.length, 1, "hash matched, so no model call");
 		assert.equal(again.details.status, "fresh");
 	} finally {
@@ -852,7 +888,7 @@ await check("a same-size rewrite with a matching mtime is still detected as stal
 		writeFileSync(file, original);
 		const h = makeHarness({ cwd: root });
 
-		const first = await runTool(h, "summary", { path: "src/a.ts" });
+		const first = await runTool(h, "map", { path: "src/a.ts" });
 		assert.equal(h.calls.length, 1);
 		const firstHash = first.content[0].text.match(/sha (\w+)/)[1];
 		const stored = statSync(file);
@@ -869,7 +905,7 @@ await check("a same-size rewrite with a matching mtime is still detected as stal
 			"mtime matches what was stored - the shortcut would say 'fresh'",
 		);
 
-		const again = await runTool(h, "summary", { path: "src/a.ts" });
+		const again = await runTool(h, "map", { path: "src/a.ts" });
 		assert.equal(h.calls.length, 2, "content changed, so it must re-summarize");
 		const againHash = again.content[0].text.match(/sha (\w+)/)[1];
 		assert.notEqual(againHash, firstHash, "and store the new hash");
@@ -878,14 +914,14 @@ await check("a same-size rewrite with a matching mtime is still detected as stal
 	}
 });
 
-await check("refresh forces a new summary", async () => {
+await check("refresh forces a new map", async () => {
 	const root = tempProject();
 	try {
 		writeFileSync(join(root, "src", "a.ts"), numbered(50));
 		const h = makeHarness({ cwd: root });
 
-		await runTool(h, "summary", { path: "src/a.ts" });
-		const forced = await runTool(h, "summary", { path: "src/a.ts", refresh: true });
+		await runTool(h, "map", { path: "src/a.ts" });
+		const forced = await runTool(h, "map", { path: "src/a.ts", refresh: true });
 		assert.equal(h.calls.length, 2);
 		assert.equal(forced.details.status, "forced");
 	} finally {
@@ -893,7 +929,7 @@ await check("refresh forces a new summary", async () => {
 	}
 });
 
-await check("a prose-only answer fails the call, with no repair attempt", async () => {
+await check("a prose-only answer is asked for again until the turns run out", async () => {
 	const root = tempProject();
 	try {
 		writeFileSync(join(root, "src", "a.ts"), numbered(400));
@@ -903,37 +939,49 @@ await check("a prose-only answer fails the call, with no repair attempt", async 
 				textResponse("This file implements the sync client and its retry loop."),
 		});
 
-		// Prose stored as a summary would claim a map the model never gave, so the call fails
-		// and says so. There is no repair loop: one summarize is one call, and an unusable
-		// answer is not argued with.
+		// Prose stored as a summary would claim a map the model never gave. Turn-level
+		// enforcement: every turn that ended without the call is answered with the
+		// continuation nudge, and the turn limit bounds the spend - after it the call fails
+		// and says so.
 		await assert.rejects(
-			() => runTool(h, "summary", { path: "src/a.ts" }),
+			() => runTool(h, "map", { path: "src/a.ts" }),
 			/did not produce a usable answer/,
 		);
-		assert.equal(h.calls.length, 1, "one call, never a repair");
+		assert.equal(h.calls.length, MAX_TURNS, "the turn limit bounds the spend");
+		assert.deepEqual(
+			userTexts(h.calls[h.calls.length - 1].context).slice(1),
+			[CONTINUATION_PROMPT, CONTINUATION_PROMPT],
+			"every turn that ended without the call was nudged",
+		);
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
 });
 
-await check("tool arguments that fail the schema fail the call, naming the violations", async () => {
+await check("tool arguments that fail the schema come back as a tool error", async () => {
 	const root = tempProject();
 	try {
 		writeFileSync(join(root, "src", "a.ts"), numbered(300));
 		const h = makeHarness({
 			cwd: root,
-			respond: () => toolResponse({ overview: "Rows are not rows.", sections: "not an array" }),
+			respond: (context, _opts, n) =>
+				n === 1
+					? toolResponse({ overview: "Rows are not rows.", sections: "not an array" })
+					: tilingAnswer("Does a thing.")(context),
 		});
 
-		await assert.rejects(
-			() => runTool(h, "summary", { path: "src/a.ts" }),
-			(error) => {
-				assert.match(error.message, /did not produce a usable answer/);
-				assert.match(`${error.message} ${error.hint ?? ""}`, /sections/, "the failing field is named");
-				return true;
-			},
+		// Tool-usage enforcement: the violation is not a failed call but a tool error naming
+		// the problem, and the correction rides the loop's own transcript back to the model.
+		const result = await runTool(h, "map", { path: "src/a.ts" });
+		assert.equal(h.calls.length, 2, "the correction happens inside the same turn");
+		assert.equal(result.details.sections, 1);
+		const correction = h.calls[1].context.messages.find((m) => m.role === "toolResult");
+		assert.equal(correction.isError, true);
+		assert.match(correction.content[0].text, /sections/, "the failing field is named");
+		assert.match(
+			correction.content[0].text,
+			/Correct your output and call the emit_map tool again/,
 		);
-		assert.equal(h.calls.length, 1, "one call, never a repair");
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
@@ -950,7 +998,7 @@ await check("a valid envelope with unusable rows degrades to a blob", async () =
 			respond: () => toolResponse({ overview: "No rows at all.", sections: [] }),
 		});
 
-		const result = await runTool(h, "summary", { path: "src/a.ts" });
+		const result = await runTool(h, "map", { path: "src/a.ts" });
 		assert.equal(h.calls.length, 1, "a well shaped answer is accepted immediately");
 		assert.equal(result.details.mode, "blob");
 		assert.equal(result.details.degraded, true);
@@ -974,7 +1022,7 @@ await check("a provider error fails the call and names the reason", async () => 
 		// reason, not a file standing in for one. A provider error is not the model's fault and
 		// a retry may not help, so it is not retried.
 		await assert.rejects(
-			() => runTool(h, "summary", { path: "src/a.ts" }),
+			() => runTool(h, "map", { path: "src/a.ts" }),
 			/upstream exploded/,
 		);
 		assert.equal(h.calls.length, 1, "a provider error is not retried");
@@ -988,7 +1036,7 @@ await check("an unreadable file is still a real error", async () => {
 	try {
 		const h = makeHarness({ cwd: root, respond: () => defaultAnswer() });
 		await assert.rejects(
-			() => runTool(h, "summary", { path: "src/missing.ts" }),
+			() => runTool(h, "map", { path: "src/missing.ts" }),
 			/not a regular file/,
 		);
 	} finally {
@@ -1011,7 +1059,7 @@ await check("a map with a gap is accepted as the model gave it", async () => {
 				}),
 		});
 
-		const result = await runTool(h, "summary", { path: "src/a.ts" });
+		const result = await runTool(h, "map", { path: "src/a.ts" });
 		assert.equal(h.calls.length, 1, "a gap is not worth a model call");
 		assert.equal(result.details.mode, "mapped");
 		assert.equal(result.details.degraded, false);
@@ -1023,32 +1071,64 @@ await check("a map with a gap is accepted as the model gave it", async () => {
 	}
 });
 
-await check("a fenced prose answer is not parsed - it fails the call", async () => {
+await check("a fenced prose answer is never parsed - the map comes from the tool call", async () => {
 	const root = tempProject();
 	try {
 		writeFileSync(join(root, "src", "a.ts"), numbered(300));
 		// The answer channel is the tool call alone: a model that writes its map as prose -
-		// fenced or not - is not met halfway.
+		// fenced or not - is nudged to call the tool, and the fence is never parsed.
 		const h = makeHarness({
 			cwd: root,
-			respond: (context) =>
-				textResponse(
-					"```json\n" +
-						JSON.stringify({
-							overview: "Sync client.",
+			respond: (context, _opts, n) =>
+				n === 1
+					? textResponse(
+							"```json\n" +
+								JSON.stringify({
+									overview: "From the fence.",
+									sections: [
+										{ start_line: 1, end_line: lastShownLine(context), kind: "function", name: "connect()", note: "dials" },
+									],
+								}) +
+								"\n```",
+						)
+					: toolResponse({
+							overview: "From the call.",
 							sections: [
 								{ start_line: 1, end_line: lastShownLine(context), kind: "function", name: "connect()", note: "dials" },
 							],
-						}) +
-						"\n```",
-				),
+						}),
 		});
 
-		await assert.rejects(
-			() => runTool(h, "summary", { path: "src/a.ts" }),
-			/did not produce a usable answer/,
-		);
-		assert.equal(h.calls.length, 1, "one call: prose is neither parsed nor repaired");
+		const result = await runTool(h, "map", { path: "src/a.ts" });
+		assert.equal(h.calls.length, 2, "prose is nudged, not parsed");
+		assert.match(result.content[0].text, /From the call\./);
+		assert.doesNotMatch(result.content[0].text, /From the fence\./, "the fence never becomes the map");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+await check("the first emit_map call in a turn is the answer", async () => {
+	const root = tempProject();
+	try {
+		writeFileSync(join(root, "src", "a.ts"), numbered(100));
+		const h = makeHarness({
+			cwd: root,
+			respond: (context) => ({
+				role: "assistant",
+				content: [
+					{ type: "toolCall", id: "call_1", name: "emit_map", arguments: { overview: "First.", sections: [{ start_line: 1, end_line: lastShownLine(context), kind: "function", name: "a()", note: "" }] } },
+					{ type: "toolCall", id: "call_2", name: "emit_map", arguments: { overview: "Second.", sections: [] } },
+				],
+				stopReason: "toolUse",
+				usage: fakeUsage,
+			}),
+		});
+
+		const result = await runTool(h, "map", { path: "src/a.ts" });
+		assert.equal(h.calls.length, 1, "the turn ends at the batch");
+		assert.match(result.content[0].text, /First\./);
+		assert.doesNotMatch(result.content[0].text, /Second\./, "a second call in the batch cannot override the answer");
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
@@ -1060,9 +1140,9 @@ await check("a whole file is sent, with no cap and no truncation language", asyn
 		// Well past the old 4000-line cap: every line must still go in.
 		writeFileSync(join(root, "src", "huge.ts"), numbered(5000));
 		const h = makeHarness({ cwd: root });
-		await runTool(h, "summary", { path: "src/huge.ts" });
+		await runTool(h, "map", { path: "src/huge.ts" });
 
-		const prompt = h.calls[0].context.messages[0].content[0].text;
+		const prompt = userTexts(h.calls[0].context)[0];
 		// numbered(5000) is 5000 lines plus a trailing newline, so 5001 by read's counting.
 		assert.match(prompt, /File: src\/huge\.ts \(5001 lines; line 5001 is the last\)/);
 		assert.doesNotMatch(prompt, /continues past/, "nothing is held back");
@@ -1084,14 +1164,14 @@ await check("the excerpt is numbered so rows can be copied rather than counted",
 	try {
 		writeFileSync(join(root, "src", "a.ts"), numbered(12));
 		const h = makeHarness({ cwd: root });
-		await runTool(h, "summary", { path: "src/a.ts" });
+		await runTool(h, "map", { path: "src/a.ts" });
 
-		const prompt = h.calls[0].context.messages[0].content[0].text;
+		const prompt = userTexts(h.calls[0].context)[0];
 		const excerpt = prompt.slice(prompt.indexOf("<file>"), prompt.indexOf("</file>"));
 		// Numbered, tab-separated, starting at 1 - not raw text.
 		assert.match(excerpt, /^<file>\n 1\tline 1\n 2\tline 2/m, "lines carry their numbers");
 		assert.match(prompt, /Copy line numbers from the left column/i);
-		assert.match(prompt, /do not count lines yourself/i);
+		assert.match(prompt, /counting them yourself drifts/i);
 
 		// The whole file is here, and the prompt says so.
 		assert.match(prompt, /File: src\/a\.ts \(13 lines; line 13 is the last\)/);
@@ -1161,7 +1241,7 @@ await check("overlapping rows are trimmed locally, without another call", async 
 				}),
 		});
 
-		const result = await runTool(h, "summary", { path: "src/a.ts" });
+		const result = await runTool(h, "map", { path: "src/a.ts" });
 		assert.equal(h.calls.length, 1, "a fixable overlap is not worth a model call");
 		assert.equal(result.details.mode, "mapped");
 		// The earlier row is cut to the line before its child begins.
@@ -1188,7 +1268,7 @@ await check("no stored map can contain overlapping rows, however the model answe
 				}),
 		});
 
-		const result = await runTool(h, "summary", { path: "src/a.ts" });
+		const result = await runTool(h, "map", { path: "src/a.ts" });
 		assert.equal(h.calls.length, 1, "one call: the overlap is trimmed, not rejected");
 		assert.equal(result.details.mode, "mapped");
 		assert.equal(result.details.sections, 2);
@@ -1209,16 +1289,16 @@ await check("a bad model argument falls back to the file, with the reason in the
 		// A model the registry does not know, and a model not in provider/model form, are
 		// both caller mistakes. The file is still readable, so the model gets the file and
 		// the mistake is shown rather than thrown - the caller can correct it from there.
-		const unknown = await runTool(h, "summary", { path: "src/a.ts", model: "nope/missing" });
+		const unknown = await runTool(h, "map", { path: "src/a.ts", model: "nope/missing" });
 		assert.equal(unknown.details.status, "failed");
 		assert.match(unknown.content[0].text, /unknown model/);
 		assert.match(unknown.content[0].text, /line 1/, "the file body still follows");
 
-		const malformed = await runTool(h, "summary", { path: "src/a.ts", model: "justmodel" });
+		const malformed = await runTool(h, "map", { path: "src/a.ts", model: "justmodel" });
 		assert.match(malformed.content[0].text, /provider\/model/);
 
 		h.ctx.modelRegistry.hasConfiguredAuth = () => false;
-		const noAuth = await runTool(h, "summary", { path: "src/a.ts" });
+		const noAuth = await runTool(h, "map", { path: "src/a.ts" });
 		assert.match(noAuth.content[0].text, /no credentials configured/);
 	} finally {
 		rmSync(root, { recursive: true, force: true });
@@ -1233,9 +1313,9 @@ await check("an unreadable path is still an error, not a fallback", async () => 
 
 		// Nothing to fall back to: a directory and a missing file cannot be read either, so
 		// these stay hard errors rather than returning an empty body.
-		await assert.rejects(() => runTool(h, "summary", { path: "src" }), /is not a regular file/);
+		await assert.rejects(() => runTool(h, "map", { path: "src" }), /is not a regular file/);
 		await assert.rejects(
-			() => runTool(h, "summary", { path: "src/gone.ts" }),
+			() => runTool(h, "map", { path: "src/gone.ts" }),
 			/is not a regular file/,
 		);
 	} finally {
@@ -1249,7 +1329,7 @@ await check("the cache lives in the project's .pi dir and is keyed from the root
 		writeFileSync(join(root, "src", "a.ts"), numbered(10));
 		const h = makeHarness({ cwd: join(root, "src") });
 
-		const result = await runTool(h, "summary", { path: "a.ts" });
+		const result = await runTool(h, "map", { path: "a.ts" });
 		// The cache file is an implementation detail of this extension, so its path is not part
 		// of the result at all - not in `details`, and not worth a line of context to the model.
 		assert.doesNotMatch(result.content[0].text, /summaries\.db/, "no cache path in the text");
@@ -1265,7 +1345,7 @@ await check("a file outside the project root is still cached", async () => {
 	try {
 		writeFileSync(join(outside, "x.ts"), numbered(10));
 		const h = makeHarness({ cwd: root });
-		const result = await runTool(h, "summary", { path: join(outside, "x.ts") });
+		const result = await runTool(h, "map", { path: join(outside, "x.ts") });
 		assert.equal(result.details.status, "miss");
 		assert.equal(result.details.path.includes("x.ts"), true);
 	} finally {
@@ -1301,7 +1381,7 @@ await check("concurrent cold calls for one file share a single summarization", a
 		// Deliberately not awaited one at a time: all five are in flight together, which is
 		// the window the cache cannot cover.
 		const results = await Promise.all(
-			Array.from({ length: 5 }, () => runTool(h, "summary", { path: "src/a.ts" })),
+			Array.from({ length: 5 }, () => runTool(h, "map", { path: "src/a.ts" })),
 		);
 
 		assert.equal(summarizerCalls, 1, "five concurrent cold calls share one summarization");
@@ -1319,13 +1399,13 @@ await check("concurrent cold calls for one file share a single summarization", a
 	}
 });
 
-await check("the summary description carries no trap wording", async () => {
+await check("the map description carries no trap wording", async () => {
 	// The description is prompt surface: a model reads it and decides whether to spend a call.
 	// It used to promise that an oversized `read` would be answered with the map. That read
 	// replacement is gone, so any such claim would be a lie about what the tool does.
 	const registered = new Map();
 	registerSummaryTool({ registerTool: (def) => registered.set(def.name, def) });
-	const description = registered.get("summary").description;
+	const description = registered.get("map").description;
 
 	for (const word of ["trap", "intercept", "guard", "lines per call"]) {
 		assert.doesNotMatch(description, new RegExp(word, "i"), `the description does not claim "${word}"`);
@@ -1373,8 +1453,8 @@ await check("a refresh neither joins nor is joined by a run in flight", async ()
 			},
 		});
 
-		const ordinary = runTool(h, "summary", { path: "src/a.ts" });
-		const forced = runTool(h, "summary", { path: "src/a.ts", refresh: true });
+		const ordinary = runTool(h, "map", { path: "src/a.ts" });
+		const forced = runTool(h, "map", { path: "src/a.ts", refresh: true });
 		release();
 		await Promise.all([ordinary, forced]);
 
@@ -1778,25 +1858,25 @@ function renderRows(component, width = 120) {
 		.join("\n");
 }
 
-await check("the summary tool draws itself, and reuses the slot the TUI gives it", async () => {
-	// Without renderers a summary call is drawn generically, so the call that produced the map
+await check("the map tool draws itself, and reuses the slot the TUI gives it", async () => {
+	// Without renderers a map call is drawn generically, so the call that produced the map
 	// is the one line of the transcript that says nothing about what happened.
 	const h = makeHarness({ cwd: tempProject() });
-	const summary = h.tools.get("summary");
+	const summary = h.tools.get("map");
 
-	assert.equal(typeof summary.renderCall, "function", "summary has a call renderer");
-	assert.equal(typeof summary.renderResult, "function", "summary has a result renderer");
+	assert.equal(typeof summary.renderCall, "function", "the map tool has a call renderer");
+	assert.equal(typeof summary.renderResult, "function", "the map tool has a result renderer");
 
 	const called = renderRows(
 		summary.renderCall({ path: "src/big.ts" }, stubTheme, renderContext()),
 	);
-	assert.match(called, /summary/, "the call names the tool");
+	assert.match(called, /map/, "the call names the tool");
 	assert.match(called, /src\/big\.ts/, "and the file it is about");
 
 	// Arguments arrive a field at a time while the model is still writing the call, so a path
 	// that is not a string yet is the normal first frame, not a malformed call.
 	const streaming = renderRows(summary.renderCall({}, stubTheme, renderContext()));
-	assert.match(streaming, /summary/, "a call still streaming its arguments still renders");
+	assert.match(streaming, /map/, "a call still streaming its arguments still renders");
 	assert.match(streaming, /\.\.\./, "with a placeholder where the path will be");
 
 	// A present argument of the wrong type is not a call still streaming, and read says so
@@ -1832,7 +1912,7 @@ await check("the call links to the real file, not to the path as it is displayed
 		setCapabilities({ images: null, trueColor: false, hyperlinks: true });
 
 		const h = makeHarness({ cwd: root });
-		const summary = h.tools.get("summary");
+		const summary = h.tools.get("map");
 		const linked = (rawPath, cwd = root) =>
 			summary.renderCall({ path: rawPath }, stubTheme, renderContext({ cwd })).render(200).join("");
 
@@ -1880,13 +1960,13 @@ await check("the call links to the real file, not to the path as it is displayed
 	}
 });
 
-await check("a summary result renders its outcome collapsed and its text expanded", async () => {
+await check("a map result renders its outcome collapsed and its text expanded", async () => {
 	const root = tempProject();
 	try {
 		writeFileSync(join(root, "src", "a.ts"), numbered(500));
 		const h = makeHarness({ cwd: root });
-		const summary = h.tools.get("summary");
-		const result = await runTool(h, "summary", { path: "src/a.ts" });
+		const summary = h.tools.get("map");
+		const result = await runTool(h, "map", { path: "src/a.ts" });
 
 		const collapsed = renderRows(
 			summary.renderResult(result, { expanded: false, isPartial: false }, stubTheme, renderContext()),
@@ -1928,13 +2008,13 @@ await check("a summary result renders its outcome collapsed and its text expande
 	}
 });
 
-await check("a failed summary is drawn as the whole-file fallback it is", async () => {
+await check("a failed map is drawn as the whole-file fallback it is", async () => {
 	// The fallback returns the file's lines, not a map. A display that showed the usual outcome
-	// line would let a failure read as a summary.
+	// line would let a failure read as a map.
 	const h = makeHarness({ cwd: tempProject() });
-	const summary = h.tools.get("summary");
+	const summary = h.tools.get("map");
 	const fallback = {
-		content: [{ type: "text", text: "# summary failed: no credentials\n\nline 1\nline 2" }],
+		content: [{ type: "text", text: "# map failed: no credentials\n\nline 1\nline 2" }],
 		details: {
 			path: "src/a.ts",
 			status: "failed",
@@ -1949,7 +2029,7 @@ await check("a failed summary is drawn as the whole-file fallback it is", async 
 	const collapsed = renderRows(
 		summary.renderResult(fallback, { expanded: false, isPartial: false }, stubTheme, renderContext()),
 	);
-	assert.match(collapsed, /no summary/, "the collapsed line says no summary was made");
+	assert.match(collapsed, /no map/, "the collapsed line says no map was made");
 	assert.doesNotMatch(collapsed, /cache:/, "and does not report a cache state it never reached");
 
 	const expanded = renderRows(
@@ -1962,7 +2042,7 @@ await check("a failed summary is drawn as the whole-file fallback it is", async 
 	// collapsed, because an error the caller has to expand to read is an error nobody reads.
 	// This tool throws when the model call failed, or when the file could not be read either.
 	const failed = {
-		content: [{ type: "text", text: "summary failed: ENOENT: no such file or directory" }],
+		content: [{ type: "text", text: "map failed: ENOENT: no such file or directory" }],
 	};
 	const asError = renderRows(
 		summary.renderResult(failed, { expanded: false, isPartial: false }, stubTheme, renderContext({ isError: true })),
@@ -2169,11 +2249,11 @@ if (runLlm) {
 			writeFileSync(join(root, "src", "client.ts"), realClientSource(360));
 			const h = makeLlmHarness({ cwd: root });
 
-			const result = await runTool(h, "summary", { path: "src/client.ts" });
+			const result = await runTool(h, "map", { path: "src/client.ts" });
 			assert.equal(result.details.status, "miss");
-			// Exactly one call per summarize: the extension never repairs an unusable answer,
-			// so the spend is a constant rather than a budget.
-			assert.equal(h.calls.length, 1, "one model call, and never a repair");
+			// The enforcement loop may ask again within its budget; what is guaranteed is the
+			// bound and that a usable map came back within it.
+			assert.ok(h.calls.length <= MAX_TURNS, `${MAX_TURNS} turns at most, took ${h.calls.length}`);
 			assert.equal(result.details.degraded, false, "and it mapped the file rather than degrading");
 			assert.ok(result.details.sections > 0, "there is a map to read");
 			assert.match(result.content[0].text, /## map/);
@@ -2223,7 +2303,7 @@ if (runLlm) {
 			// No settings file at all: the documented default is the model the session is using,
 			// which is the one this harness hands the context.
 			assert.equal(readSettings(root).model, undefined);
-			const result = await runTool(h, "summary", { path: "src/client.ts" });
+			const result = await runTool(h, "map", { path: "src/client.ts" });
 			assert.equal(result.details.model, LLM_MODEL, "the session model was used");
 			assert.ok(h.calls.length >= 1, "and it was really called");
 		} finally {
@@ -2239,7 +2319,7 @@ if (runLlm) {
 			writeSettings(join(root, ".pi"), { model: "routerai/definitely-not-a-model" });
 			const h = makeLlmHarness({ cwd: root });
 
-			const result = await runTool(h, "summary", { path: "src/client.ts" });
+			const result = await runTool(h, "map", { path: "src/client.ts" });
 			assert.equal(result.details.status, "failed");
 			assert.match(result.content[0].text, /definitely-not-a-model/);
 			assert.match(result.content[0].text, /names no known model/);
