@@ -1,5 +1,5 @@
 {
-  "name": "pi-summary",
+  "name": "summary",
   "version": "0.1.0",
   "description": "Pi Coding Agent extension — summarizes a file once with a model and caches the result in local SQLite, so later calls are free until the file's contents change.",
   "keywords": [
