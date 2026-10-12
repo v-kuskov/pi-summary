@@ -7,10 +7,9 @@ import type {
 import { ModelCallError, notifyUser, SummaryError } from "./error.ts";
 import { describeFailure, failureNotice, loadWholeFile } from "./fallback.ts";
 import { resolveFilePath } from "./paths.ts";
-import { findRegion, regionExcerpt, regionMiss } from "./region.ts";
 import { renderSummary } from "./render.ts";
-import { regionOutputOf, summaryOutputOf, summaryOutputSchema } from "./schema.ts";
-import { loadCachedSummary, summarizeFile, type SummarizeOutcome } from "./summarize.ts";
+import { summaryOutputOf, summaryOutputSchema } from "./schema.ts";
+import { summarizeFile, type SummarizeOutcome } from "./summarize.ts";
 import { summaryRenderers } from "./tui.ts";
 
 export type SummaryDetails = {
@@ -39,33 +38,26 @@ export function registerSummaryTool(pi: ExtensionAPI): void {
 		name: "map",
 		label: "Summarize file",
 		description:
-			`Map where a file's contents live without reading it: what the file does, and the line ranges that hold what - one row per region in line order with its span, the symbols, data and behaviors it holds, and what to know before editing it. Use it whenever you need to know what a file contains or where one thing is - a definition, a handler, an invariant - then read only the region that answers. Call it before reading a source file you have not seen: the whole file costs many times the context of one map and costs again on every re-read. Pass region to drill into one row - its name from the map, or a line number inside it (a name match wins) - with no model call. The first call on a file runs a model; later calls on the same unchanged file are free from cache.`,
+			`Map where a file's contents live without reading it: what the file does, and the line ranges that hold what - one row per region in line order with its span, the symbols, data and behaviors it holds, and what to know before editing it. Use it whenever you need to know what a file contains or where one thing is - a definition, a handler, an invariant - then read only the region that answers. Call it before reading a source file you have not seen: the whole file costs many times the context of one map and costs again on every re-read. The first call on a file runs a model; later calls on the same unchanged file are free from cache.`,
 		promptSnippet: "Map where a file's contents live before reading it",
 		promptGuidelines: [
 			`To know what a file contains or where something lives - a definition, a handler, an invariant - call map and read the region that answers, instead of the whole file.`,
 			`Before reading a source file you have not seen, call map on it first; it returns where every region is, so you read one range instead of the whole file.`,
-			`To read one region, pass its name or a line number as region; that costs no model call.`,
 		],
 		parameters: Type.Object({
 			path: Type.String({
 				description: "File path, relative to the working directory or absolute.",
 			}),
-			region: Type.Optional(
-				Type.String({
-					description:
-						"A region of an already-mapped file: a name from the map, or a line number inside it (a name match wins). Returns that region and its numbered excerpt, with no model call.",
-				}),
-			),
 			model: Type.Optional(
 				Type.String({
 					description:
-						'Summarizer as "provider/model". Defaults to the configured summarizer, or the current session model. Ignored when region is given.',
+						'Summarizer as "provider/model". Defaults to the configured summarizer, or the current session model.',
 				}),
 			),
 			refresh: Type.Optional(
 				Type.Boolean({
 					description:
-						"Return a new map even if one already exists. Ignored when region is given.",
+						"Return a new map even if one already exists.",
 				}),
 			),
 		}),
@@ -78,12 +70,6 @@ export function registerSummaryTool(pi: ExtensionAPI): void {
 			_onUpdate,
 			ctx,
 		): Promise<AgentToolResult<SummaryDetails>> {
-			// The drill-down is a separate path on purpose: it never touches the summarizer, so a
-			// region lookup can never spend a call and can never be the reason a file gets mapped.
-			if (params.region !== undefined) {
-				return lookupRegion(ctx, params.path, params.region);
-			}
-
 			let outcome: SummarizeOutcome;
 			try {
 				outcome = await summarizeFile(ctx, {
@@ -123,50 +109,6 @@ function summarizeDetails(outcome: SummarizeOutcome): SummaryDetails {
 		model: outcome.entry.model,
 		sections: outcome.entry.sections.length,
 		degraded: outcome.degraded,
-	};
-}
-
-/**
- * Answer `map(path, region)`: one cached region and its excerpt, with no model call.
- *
- * Every miss is an error rather than a fallback to the map or to the model. A region the map
- * cannot name is a caller mistake with a specific correction - the names that do exist - and
- * paying for a summarization to answer a typo would be the opposite of the discipline the
- * budget exists to keep. A file with no cache or a stale one is pointed back at layer one.
- */
-async function lookupRegion(
-	ctx: ExtensionContext,
-	path: string,
-	region: string,
-): Promise<AgentToolResult<SummaryDetails>> {
-	const entry = await loadCachedSummary(ctx, path);
-	const section = findRegion(entry, region);
-	if (!section) throw regionMiss(entry, region);
-
-	const excerpt = await regionExcerpt(entry.absPath, section);
-	const text = [
-		`# ${entry.path}  ${section.startLine}-${section.endLine}  ${section.kind}  ${section.name}`,
-		section.note.trim(),
-		"",
-		excerpt,
-	]
-		.filter((part) => part !== "")
-		.join("\n");
-
-	return {
-		content: [{ type: "text", text }],
-		structuredContent: regionOutputOf(entry, section, excerpt),
-		// No `usage`: zero model calls were made, and reporting the map's usage as if this
-		// call had spent it would misstate what the lookup cost.
-		details: {
-			path: entry.path,
-			status: "region",
-			mode: entry.mode,
-			lines: entry.lines,
-			model: entry.model,
-			sections: 1,
-			degraded: false,
-		},
 	};
 }
 

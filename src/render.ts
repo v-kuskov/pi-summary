@@ -53,7 +53,7 @@ function firstSentence(note: string): string {
  * - **1** - span and name only.
  *
  * That is a display rule and nothing more. The stored row is always the whole note, so the
- * limit costs nothing to reverse and a drill-down still reads the full text.
+ * limit costs nothing to reverse.
  *
  * Only mapped rows appear. The summarizer is told to skip lines that do nothing, so a gap
  * in the numbers is its answer, not a missing entry, and saying so on every blank run, else

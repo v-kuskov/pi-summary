@@ -1,11 +1,6 @@
 import { Type, type Static } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
-import {
-	type CachedSummary,
-	type Importance,
-	type Section,
-	normalizeImportance,
-} from "./store.ts";
+import { type CachedSummary, type Section, normalizeImportance } from "./store.ts";
 
 /**
  * Vocabulary for the `kind` field, shared by the schema, the prompt, and the validator.
@@ -192,7 +187,7 @@ export function normalizeSections(raw: unknown, shownLines: number): Section[] |
  * omitting the field would hand scripts nothing where the model got a file.
  *
  * Every arm carries a `kind` so a script can branch on the shape before reading a field:
- * `overview` / `region` / `content` alone do distinguish the arms, and TypeScript narrows
+ * `overview` / `content` alone do distinguish the arms, and TypeScript narrows
  * on them, but an untyped script reading `overview` from a fallback would silently hold
  * undefined. The fallback arm also carries `error` and `truncated` - payload semantics,
  * not generation history: a script must be able to tell a failure payload from a summary
@@ -225,7 +220,7 @@ export const summaryOutputSchema = Type.Union([
 				}),
 				name: Type.String({
 					description:
-						"The region's name: the symbol as the file spells it, or the pattern with its count. Pass it back as region to drill into the row.",
+						"The region's name: the symbol as the file spells it, or the pattern with its count.",
 				}),
 				note: Type.String({
 					description: "What lives in the region and what to know before editing it.",
@@ -237,45 +232,9 @@ export const summaryOutputSchema = Type.Union([
 			}),
 			{
 				description:
-					"Every mapped region, in line order; empty exactly when the file has no line map and region lookups reject.",
+					"Every mapped region, in line order; empty exactly when the summarizer produced no line detail.",
 			},
 		),
-	}),
-	// The drill-down arm: one cached region and the numbered excerpt of its span. It has no
-	// `overview`, because a caller that asked for a region already has the file's prose.
-	Type.Object({
-		kind: Type.Literal("region", { description: "Region arm: one cached region and its excerpt." }),
-		path: Type.String({
-			description:
-				"Project-root-relative path of the file, normalized on Windows; the fallback arm returns an absolute path instead.",
-		}),
-		lines: Type.Integer({ description: "Total lines in the file." }),
-		region: Type.Object(
-			{
-				startLine: Type.Integer({
-					description: "First line of the region, 1-based and inclusive.",
-				}),
-				endLine: Type.Integer({ description: "Last line of the region, inclusive." }),
-				kind: Type.String({
-					description:
-						"What the region holds: type, class, interface, function, method, const, config, test, comment, or other.",
-				}),
-				name: Type.String({
-					description: "The region's name: the symbol as the file spells it, or the pattern with its count.",
-				}),
-				note: Type.String({
-					description: "What lives in the region and what to know before editing it.",
-				}),
-				importance: Type.Union([Type.Literal(1), Type.Literal(2), Type.Literal(3)], {
-					description:
-						"1 = incidental, 2 = supporting, 3 = load-bearing. A display tier; the note always holds the full text.",
-				}),
-			},
-			{ description: "The region asked for: its span, kind, name, note and tier." },
-		),
-		excerpt: Type.String({
-			description: "The region's line-numbered excerpt of the current file.",
-		}),
 	}),
 	Type.Object({
 		kind: Type.Literal("file", {
@@ -320,49 +279,5 @@ export function summaryOutputOf(entry: CachedSummary): SummaryOutput {
 			note: section.note,
 			importance: normalizeImportance(section.importance),
 		})),
-	};
-}
-
-/** One region and its excerpt, as the drill-down returns them. */
-export type RegionOutput = {
-	kind: "region";
-	path: string;
-	lines: number;
-	region: {
-		startLine: number;
-		endLine: number;
-		kind: string;
-		name: string;
-		note: string;
-		importance: Importance;
-	};
-	excerpt: string;
-};
-
-/**
- * Project one cached region and its excerpt into the drill-down's structured result.
- *
- * Only the region asked for is exposed, not the whole map: the caller already chose a layer,
- * and returning every row would make the drill-down cost the same context as the summary it
- * was meant to narrow.
- */
-export function regionOutputOf(
-	entry: CachedSummary,
-	section: Section,
-	excerpt: string,
-): RegionOutput {
-	return {
-		kind: "region",
-		path: entry.path,
-		lines: entry.lines,
-		region: {
-			startLine: section.startLine,
-			endLine: section.endLine,
-			kind: section.kind,
-			name: section.name,
-			note: section.note,
-			importance: normalizeImportance(section.importance),
-		},
-		excerpt,
 	};
 }

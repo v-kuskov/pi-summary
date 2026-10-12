@@ -53,8 +53,7 @@ export async function prepareFile(absPath: string): Promise<PreparedFile> {
  * goal and a few limits, nothing more. Three things carry the weight:
  *
  * - The map is a **retrieval index**, not a caption: `name` is asked for as the exact symbol
- *   a reader would search and copy back to look a region up, never a bare number (a row
- *   named `42` would shadow line 42 in `findRegion`), and `note` is asked to name the
+ *   as the file spells it, never a bare number, and `note` is asked to name the
  *   behaviors and data a reader would look for - so every row answers "where does X live".
  * - The excerpt is **numbered**, and one line says the numbers are copied from the left
  *   column. That turns a counting task, which models fail at over long files, into a

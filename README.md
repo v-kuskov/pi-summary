@@ -6,8 +6,7 @@ Two things, working together:
 
 - **`map`** — a tool that returns what a file does plus a map of which line ranges hold
   what, ordered most important first. The first call on a file runs a model; asking again
-  returns the cached answer with no model call until the file's contents change. Ask for one
-  range by name or line number and it is served from cache alone.
+  returns the cached answer with no model call until the file's contents change.
 - **The edit locator** — a note appended to every successful `edit` naming the lines it
   changed and the file's new length, so the agent does not read a file back to find out
   where its edit landed.
@@ -50,25 +49,10 @@ Rows lead with the 3s and end with the 1s; within a tier they stay in line order
 a display choice and nothing more: the full note is always stored.
 
 The agent calls `map` before reading a source file it has not seen, then reads only the
-range it needs — or asks for it directly:
-
-```
-map path="src/foo.ts" region="FooClient.request()"
-map path="src/foo.ts" region="141"        # a line inside that range works too
-```
-
-A region lookup returns the cached row (kind, name, note, importance, span) plus a
-line-numbered excerpt of just that span, from the current file. It is pure retrieval — no model
-call — so it costs nothing when the map is already cached. Names win over numbers: a `region`
-is matched as a row name first (exactly, then case-insensitively) and read as a line number
-only when no row carries it. A name that matches no row, or a line
-that falls in a gap, is an error naming what the map does hold, never a fresh summarization.
-
-That is three layers of increasing cost: `map(path)` for the map, `map(path, region)`
-for one region, plain `read` for the whole text.
+range it needs.
 
 The result also carries machine-readable structure for scripts: one JSON object tagged
-with `kind` — `map` (overview plus the rows), `region` (one row plus its excerpt), or `file`
+with `kind` — `map` (overview plus the rows) or `file`
 (the whole file, returned only when summarization failed, with `error` saying why and
 `truncated` saying whether the content was cut). Branch on `kind` before reading the other
 fields.
@@ -105,9 +89,8 @@ Create `.pi/pi-summary.json` in a project, or `pi-summary.json` in pi's agent di
   its contents rather than its timestamp, so a stale map is never served. Delete that file to
   start over.
 - The map is a retrieval index, not a caption: every row answers "where does X live". A
-  row's name is the symbol spelled exactly as the file spells it — so it can be passed
-  straight back as `region` — and its note names the behaviors and data a reader would
-  search for.
+  row's name is the symbol spelled exactly as the file spells it, and its note names the
+  behaviors and data a reader would search for.
 - The summarizer runs as its own pi session with exactly one tool, `emit_map`, and a turn
   limit: the answer must be a tool call checked against the map's schema, arguments that
   do not fit are returned to the model as a tool error, and a turn that ends without the call

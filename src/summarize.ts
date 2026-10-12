@@ -54,52 +54,6 @@ export type SummarizeOutcome = {
 };
 
 /**
- * Read a file's cached summary for a region lookup, without ever running a model.
- *
- * Progressive disclosure has three layers - `map(path)` for the map, `map(path, region)`
- * for one region, plain `read` for the text - and this is the second one. It is pure retrieval:
- * a missing cache or a stale one raises, pointing the caller back at the first layer, rather
- * than quietly spending a call. A stale map is never handed out even here, because naming a
- * region from a map that no longer matches the file would send the reader to the wrong lines,
- * which is the one thing the map exists to prevent.
- */
-export async function loadCachedSummary(
-	ctx: ExtensionContext,
-	path: string,
-): Promise<CachedSummary> {
-	const absPath = resolveFilePath(path, ctx.cwd);
-	if (!isRegularFile(absPath)) {
-		throw new SummaryError(
-			`${path} is not a regular file`,
-			"map works on files. Use ls to find a path first.",
-		);
-	}
-
-	const root = findProjectRoot(ctx.cwd);
-	const key = cacheKey(absPath, root);
-	const { db } = openDb(ctx.cwd);
-	try {
-		ensureSchema(db);
-		const cached = readSummary(db, key);
-		if (!cached) {
-			throw new SummaryError(
-				`no cached map for ${path}`,
-				"Call map on it first; a region lookup reads the cache and never runs a model.",
-			);
-		}
-		if ((await freshnessOf(cached)) !== "fresh") {
-			throw new SummaryError(
-				`the cached map of ${path} is stale - the file changed since it was mapped`,
-				"Call map on it again to refresh it, then look the region up.",
-			);
-		}
-		return cached;
-	} finally {
-		db.close();
-	}
-}
-
-/**
  * Runs already under way, so callers asking for the same file at the same time share one.
  *
  * A cold oversized `read` is the case that matters: the model can issue several reads of the

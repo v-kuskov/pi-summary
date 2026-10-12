@@ -25,14 +25,12 @@ the smoke suite. `npm run test:llm` adds the end-to-end cases, which spend real 
 `index.ts` is the pi entry point: it registers two things and opens nothing at load time.
 
 - `src/tools.ts` — the `map` tool (one summarizer session per file), with an
-  `outputSchema` whose `structuredContent` is the map alone. It also answers
-  `map(path, region)`: a zero-model-call drill-down into one cached region, resolved by
-  `src/region.ts`.
+  `outputSchema` whose `structuredContent` is the map alone.
 - `src/locator.ts` — appends the changed line numbers to a successful `edit`.
 
-Support: `src/summarize.ts` (the summarizer session, validation, and the cache-only
-lookup the drill-down uses), `src/prompt.ts`, `src/schema.ts` (typebox), `src/store.ts`
-(SQLite at `<projectRoot>/.pi/summaries.db`), `src/region.ts` (region resolution and excerpt),
+Support: `src/summarize.ts` (the summarizer session and validation), `src/prompt.ts`,
+`src/schema.ts` (typebox), `src/store.ts`
+(SQLite at `<projectRoot>/.pi/summaries.db`),
 `src/hash.ts` (sha256 freshness), `src/settings.ts`, `src/paths.ts`, `src/render.ts`,
 `src/tui.ts`, `src/fallback.ts`, `src/error.ts`.
 
@@ -53,8 +51,9 @@ reason where the change is made.
   fail the schema, a continuation user message for a turn that ended without the call — and
   never accepts prose in the map's place. (Goose's tool-usage + turn-level enforcement,
   adopted by direction; it replaces the earlier single-call rule.) No project-wide refresh,
-  no search across maps. The `region` drill-down is a cache read
-  and costs zero calls; a region that cannot be resolved errors rather than summarizing.
+  no search across maps. (The `region` drill-down was removed: a region request could name
+  a symbol the summarizer never wrote a row for, which errored over a correct map; the tool
+  now returns the index only.)
 - **Freshness is the content hash, never mtime.** A size mismatch may short-circuit to
   stale; every other case goes through sha256.
 - **Generation history stays internal.** Cache state, the summarizer model and the
@@ -65,7 +64,7 @@ reason where the change is made.
   drift apart. Gaps are legal; rows must not overlap.
 - **Importance is display-only, and its absence is legal.** A row stores the full note; the
   tier (1|2|3, assigned by the model in the same call) decides only how much of that note the
-  map shows, while the drill-down always returns the whole row. A row written before the field
+  map shows. A row written before the field
   existed reads as tier 2 on load, so no cache migration rewrites it — only the column default
   is added.
 - **Settings only ever choose the summarizer.** No setting may change what a map *is*.
